@@ -1,0 +1,8 @@
+environment: development
+http:
+  port: 8080
+jwt:
+  secret: "change-me"
+  access_token_ttl: "15m"
+
+
