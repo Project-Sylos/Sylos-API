@@ -136,6 +136,8 @@ Important notes:
 | POST | `/api/migrate/start` | Legacy alias |
 | GET | `/api/migrations/{migrationID}` | Fetch migration status/result summary |
 | GET | `/api/migrate/status/{migrationID}` | Legacy alias |
+| GET | `/api/migrations/{migrationID}/stream` | Server-Sent Events (SSE) stream of progress events |
+| GET | `/api/migrate/status/{migrationID}/stream` | Legacy alias for the SSE stream |
 
 ### Route packages
 
@@ -156,6 +158,17 @@ Select responses are backed by the types exported from `internal/corebridge`:
 - `Migration`: `id`, `sourceId`, `destinationId`, `startedAt`, `status`.
 - `Status`: extends `Migration` with `completedAt`, `error`, and `result`.
 - `Result`: includes `rootSummary`, `runtime` queue stats, and `verification` report from the Migration Engine SDK.
+- `ProgressEvent` (SSE stream):
+  ```json
+  {
+    "event": "running",
+    "timestamp": "2025-01-03T10:15:30Z",
+    "migration": { ...Status object... },
+    "source": { "round": 1, "pending": 5, "inProgress": 2, "totalTracked": 12, "workers": 10 },
+    "destination": { "round": 0, "pending": 3, "inProgress": 1, "totalTracked": 6, "workers": 10 }
+  }
+  ```
+  Events you may see: `snapshot` (initial state), `started`, `running` (heartbeat), `completed`, `failed`, and `close`.
 
 All error responses follow `{ "error": "message" }`.
 
@@ -166,6 +179,7 @@ All error responses follow `{ "error": "message" }`.
 - Every HTTP request is logged via Chi middleware (method, path, status, bytes, duration).
 - The core bridge logs migration lifecycle, including successes/failures, and can forward logs to the Migration Engine’s UDP listener if configured.
 - Enable UDP listener for local development via `runtime.log_address` and `runtime.skip_log_listener=false`; logs also persist in the migration database via the SDK.
+- Progress streams are delivered over SSE. Heartbeats (`: heartbeat`) are sent every 30 seconds to keep connections alive; reconnect on network drops to continue receiving updates.
 
 ---
 
