@@ -139,19 +139,37 @@ type VerificationView struct {
 	DstNotOnSrc int `json:"dstNotOnSrc"`
 }
 
+type QueueStatsSnapshot struct {
+	Round        int `json:"round"`
+	Pending      int `json:"pending"`
+	InProgress   int `json:"inProgress"`
+	TotalTracked int `json:"totalTracked"`
+	Workers      int `json:"workers"`
+}
+
+type ProgressEvent struct {
+	Event       string             `json:"event"`
+	Timestamp   time.Time          `json:"timestamp"`
+	Migration   Status             `json:"migration"`
+	Source      QueueStatsSnapshot `json:"source"`
+	Destination QueueStatsSnapshot `json:"destination"`
+}
+
 type Bridge interface {
 	ListSources(ctx context.Context) ([]Source, error)
 	ListChildren(ctx context.Context, req ListChildrenRequest) (fsservices.ListResult, error)
 	StartMigration(ctx context.Context, req StartMigrationRequest) (Migration, error)
 	GetMigrationStatus(ctx context.Context, id string) (Status, error)
+	SubscribeProgress(ctx context.Context, id string) (<-chan ProgressEvent, func(), error)
 }
 
 type Manager struct {
-	logger     zerolog.Logger
-	cfg        config.Config
-	services   map[string]serviceDefinition
-	migrations map[string]*migrationRecord
-	mu         sync.RWMutex
+	logger      zerolog.Logger
+	cfg         config.Config
+	services    map[string]serviceDefinition
+	migrations  map[string]*migrationRecord
+	subscribers map[string]map[string]chan ProgressEvent
+	mu          sync.RWMutex
 }
 
 type serviceDefinition struct {
@@ -181,10 +199,11 @@ const (
 
 func NewManager(logger zerolog.Logger, cfg config.Config) (*Manager, error) {
 	manager := &Manager{
-		logger:     logger,
-		cfg:        cfg,
-		services:   make(map[string]serviceDefinition),
-		migrations: make(map[string]*migrationRecord),
+		logger:      logger,
+		cfg:         cfg,
+		services:    make(map[string]serviceDefinition),
+		migrations:  make(map[string]*migrationRecord),
+		subscribers: make(map[string]map[string]chan ProgressEvent),
 	}
 
 	if err := manager.loadServices(); err != nil {
@@ -350,7 +369,12 @@ func (m *Manager) StartMigration(ctx context.Context, req StartMigrationRequest)
 		return Migration{}, fmt.Errorf("migration %s already exists", migrationID)
 	}
 	m.migrations[migrationID] = record
+	if _, ok := m.subscribers[migrationID]; !ok {
+		m.subscribers[migrationID] = make(map[string]chan ProgressEvent)
+	}
 	m.mu.Unlock()
+
+	m.publishProgress(record.ID, "started", nil, nil)
 
 	go m.runMigration(record, srcDef, dstDef, srcFolder, dstFolder, req.Options)
 
@@ -375,6 +399,43 @@ func (m *Manager) GetMigrationStatus(ctx context.Context, id string) (Status, er
 	return record.toStatus(), nil
 }
 
+func (m *Manager) SubscribeProgress(ctx context.Context, id string) (<-chan ProgressEvent, func(), error) {
+	m.mu.Lock()
+	record, ok := m.migrations[id]
+	if !ok {
+		m.mu.Unlock()
+		return nil, nil, ErrMigrationNotFound
+	}
+
+	ch := make(chan ProgressEvent, 16)
+	subID := xid.New().String()
+	if _, exists := m.subscribers[id]; !exists {
+		m.subscribers[id] = make(map[string]chan ProgressEvent)
+	}
+	m.subscribers[id][subID] = ch
+	snapshot := record.toStatus()
+	m.mu.Unlock()
+
+	ch <- ProgressEvent{
+		Event:     "snapshot",
+		Timestamp: time.Now().UTC(),
+		Migration: snapshot,
+	}
+
+	cancel := func() {
+		m.removeSubscriber(id, subID)
+	}
+
+	if ctx != nil {
+		go func() {
+			<-ctx.Done()
+			cancel()
+		}()
+	}
+
+	return ch, cancel, nil
+}
+
 func (m *Manager) runMigration(record *migrationRecord, srcDef, dstDef serviceDefinition, srcFolder, dstFolder fsservices.Folder, opts MigrationOptions) {
 	m.logger.Info().
 		Str("migration_id", record.ID).
@@ -382,30 +443,57 @@ func (m *Manager) runMigration(record *migrationRecord, srcDef, dstDef serviceDe
 		Str("destination", dstDef.ID).
 		Msg("starting migration")
 
-	result, err := m.executeMigration(record.ID, srcDef, dstDef, srcFolder, dstFolder, opts)
+	heartbeat := time.NewTicker(5 * time.Second)
+	done := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-heartbeat.C:
+				m.publishProgress(record.ID, "running", nil, nil)
+			case <-done:
+				heartbeat.Stop()
+				return
+			}
+		}
+	}()
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	result, err := m.executeMigration(record.ID, srcDef, dstDef, srcFolder, dstFolder, opts)
+	close(done)
 
 	if err != nil {
+		m.mu.Lock()
 		record.Status = migrationStatusFailed
 		record.Error = err.Error()
 		finished := time.Now().UTC()
 		record.CompletedAt = &finished
+		m.mu.Unlock()
+
 		m.logger.Error().
 			Err(err).
 			Str("migration_id", record.ID).
 			Msg("migration failed")
+
+		m.publishProgress(record.ID, "failed", nil, nil)
+		m.closeSubscribers(record.ID)
 		return
 	}
 
 	finished := time.Now().UTC()
+
+	m.mu.Lock()
 	record.Status = migrationStatusCompleted
 	record.CompletedAt = &finished
 	record.Result = result
+	m.mu.Unlock()
+
 	m.logger.Info().
 		Str("migration_id", record.ID).
 		Msg("migration completed successfully")
+
+	srcStats := result.Runtime.Src
+	dstStats := result.Runtime.Dst
+	m.publishProgress(record.ID, "completed", &srcStats, &dstStats)
+	m.closeSubscribers(record.ID)
 }
 
 func (m *Manager) executeMigration(migrationID string, srcDef, dstDef serviceDefinition, srcFolder, dstFolder fsservices.Folder, opts MigrationOptions) (*migration.Result, error) {
@@ -737,6 +825,89 @@ func queueStatsToView(stats queue.QueueStats) QueueStatsView {
 		InProgress:   stats.InProgress,
 		TotalTracked: stats.TotalTracked,
 		Workers:      stats.Workers,
+	}
+}
+
+func queueStatsSnapshotFrom(stats queue.QueueStats) QueueStatsSnapshot {
+	return QueueStatsSnapshot{
+		Round:        stats.Round,
+		Pending:      stats.Pending,
+		InProgress:   stats.InProgress,
+		TotalTracked: stats.TotalTracked,
+		Workers:      stats.Workers,
+	}
+}
+
+func (m *Manager) publishProgress(id, event string, srcStats, dstStats *queue.QueueStats) {
+	m.mu.RLock()
+	record, ok := m.migrations[id]
+	if !ok {
+		m.mu.RUnlock()
+		return
+	}
+
+	status := record.toStatus()
+	subscribers := m.subscribers[id]
+	channels := make([]chan ProgressEvent, 0, len(subscribers))
+	for _, ch := range subscribers {
+		channels = append(channels, ch)
+	}
+	m.mu.RUnlock()
+
+	if len(channels) == 0 {
+		return
+	}
+
+	update := ProgressEvent{
+		Event:     event,
+		Timestamp: time.Now().UTC(),
+		Migration: status,
+	}
+	if srcStats != nil {
+		update.Source = queueStatsSnapshotFrom(*srcStats)
+	}
+	if dstStats != nil {
+		update.Destination = queueStatsSnapshotFrom(*dstStats)
+	}
+
+	for _, ch := range channels {
+		select {
+		case ch <- update:
+		default:
+		}
+	}
+}
+
+func (m *Manager) removeSubscriber(migrationID, subscriberID string) {
+	m.mu.Lock()
+	subs, ok := m.subscribers[migrationID]
+	if !ok {
+		m.mu.Unlock()
+		return
+	}
+
+	ch, ok := subs[subscriberID]
+	if ok {
+		delete(subs, subscriberID)
+	}
+	if len(subs) == 0 {
+		delete(m.subscribers, migrationID)
+	}
+	m.mu.Unlock()
+
+	if ok {
+		close(ch)
+	}
+}
+
+func (m *Manager) closeSubscribers(migrationID string) {
+	m.mu.Lock()
+	subs := m.subscribers[migrationID]
+	delete(m.subscribers, migrationID)
+	m.mu.Unlock()
+
+	for _, ch := range subs {
+		close(ch)
 	}
 }
 

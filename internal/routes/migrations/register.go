@@ -23,4 +23,6 @@ func Register(router chi.Router, logger zerolog.Logger, core corebridge.Bridge) 
 	router.Post("/migrate/start", h.handleStartMigration) // legacy alias
 	router.Get("/migrations/{migrationID}", h.handleGetMigrationStatus)
 	router.Get("/migrate/status/{migrationID}", h.handleGetMigrationStatus) // legacy alias
+	router.Get("/migrations/{migrationID}/stream", h.handleStream)
+	router.Get("/migrate/status/{migrationID}/stream", h.handleStream) // legacy alias
 }
