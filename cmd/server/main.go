@@ -26,7 +26,10 @@ func main() {
 	log := logger.New(cfg.Environment)
 	log.Info().Msg("starting Sylos API server")
 
-	coreBridge := corebridge.NewMockBridge(log)
+	coreBridge, err := corebridge.NewManager(log, cfg)
+	if err != nil {
+		log.Fatal().Err(err).Msg("failed to initialize core bridge")
+	}
 	authManager, err := auth.NewManager(auth.Config{
 		Secret: cfg.JWT.Secret,
 		TTL:    cfg.JWT.AccessTokenTTL,

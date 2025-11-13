@@ -4,5 +4,29 @@ http:
 jwt:
   secret: "change-me"
   access_token_ttl: "15m"
+runtime:
+  data_dir: "./data"
+  log_address: "127.0.0.1:8081"
+  log_level: "info"
+  skip_log_listener: true
+  default_worker_count: 10
+  default_max_retries: 3
+  default_coordinator_lead: 4
+services:
+  local:
+    - id: "local-default"
+      name: "Local Filesystem"
+      root_path: "/path/to/allowlisted/root"
+  spectra:
+    - id: "spectra-primary"
+      name: "Spectra Primary"
+      config_path: "../Migration-Engine/pkg/configs/spectra.json"
+      world: "primary"
+      root_id: "root"
+    - id: "spectra-s1"
+      name: "Spectra S1"
+      config_path: "../Migration-Engine/pkg/configs/spectra.json"
+      world: "s1"
+      root_id: "root"
 
 
