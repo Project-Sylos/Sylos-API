@@ -5,6 +5,7 @@ import (
 	"github.com/rs/zerolog"
 
 	"github.com/Project-Sylos/Sylos-API/internal/corebridge"
+	"github.com/Project-Sylos/Sylos-API/internal/routes/middleware"
 )
 
 type handler struct {
@@ -13,16 +14,21 @@ type handler struct {
 }
 
 // Register mounts migration orchestration endpoints.
-func Register(router chi.Router, logger zerolog.Logger, core corebridge.Bridge) {
+func Register(router chi.Router, logger zerolog.Logger, core corebridge.Bridge, mw *middleware.Middleware) {
 	h := handler{
 		logger: logger,
 		core:   core,
 	}
 
-	router.Post("/migrations", h.handleStartMigration)
-	router.Post("/migrate/start", h.handleStartMigration) // legacy alias
-	router.Get("/migrations/{migrationID}", h.handleGetMigrationStatus)
-	router.Get("/migrate/status/{migrationID}", h.handleGetMigrationStatus) // legacy alias
+	router.Post("/migrations/roots", middleware.JSON(mw, h.setRoot))
+	router.Post("/migrations", middleware.JSON(mw, h.start))
+	router.Post("/migrate/start", middleware.JSON(mw, h.start)) // legacy alias
+	router.Post("/migrations/log-terminal", middleware.JSON(mw, h.toggleLogTerminal))
+	router.Post("/migrations/db/upload", middleware.MultipartForm(mw, h.uploadDB))
+	router.Get("/migrations/db/list", middleware.NoBody(mw, h.listDBs))
+	router.Get("/migrations/{migrationID}", middleware.NoBody(mw, h.status))
+	router.Get("/migrate/status/{migrationID}", middleware.NoBody(mw, h.status)) // legacy alias
+	router.Get("/migrations/{migrationID}/inspect", middleware.NoBody(mw, h.inspect))
 	router.Get("/migrations/{migrationID}/stream", h.handleStream)
 	router.Get("/migrate/status/{migrationID}/stream", h.handleStream) // legacy alias
 }

@@ -1,6 +1,8 @@
 package config
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -25,6 +27,7 @@ type HTTPConfig struct {
 type JWTConfig struct {
 	Secret         string
 	AccessTokenTTL time.Duration
+	Generated      bool
 }
 
 func Load() (Config, error) {
@@ -46,6 +49,7 @@ func Load() (Config, error) {
 	v.SetDefault("http.port", 8080)
 	v.SetDefault("jwt.access_token_ttl", "15m")
 	v.SetDefault("runtime.data_dir", "data")
+	v.SetDefault("runtime.migration_db_storage_dir", "data/migration-dbs")
 	v.SetDefault("runtime.log_level", "info")
 	v.SetDefault("runtime.default_worker_count", 10)
 	v.SetDefault("runtime.default_max_retries", 3)
@@ -77,7 +81,8 @@ func Load() (Config, error) {
 	}
 
 	if cfg.JWT.Secret == "" {
-		return Config{}, fmt.Errorf("jwt.secret is required (set SYLOS_JWT_SECRET)")
+		cfg.JWT.Secret = generateEphemeralSecret()
+		cfg.JWT.Generated = true
 	}
 
 	if cfg.JWT.AccessTokenTTL <= 0 {
@@ -104,14 +109,41 @@ func (c *Config) normalizeRuntime() error {
 
 	c.Runtime.DataDir = absDir
 
+	// Normalize migration DB storage directory
+	migrationDBDir := c.Runtime.MigrationDBStorageDir
+	if migrationDBDir == "" {
+		migrationDBDir = filepath.Join(absDir, "migration-dbs")
+	}
+
+	absMigrationDBDir, err := filepath.Abs(migrationDBDir)
+	if err != nil {
+		return fmt.Errorf("failed to determine absolute migration DB storage dir: %w", err)
+	}
+
+	if err := os.MkdirAll(absMigrationDBDir, 0o755); err != nil {
+		return fmt.Errorf("failed to create migration DB storage dir %s: %w", absMigrationDBDir, err)
+	}
+
+	c.Runtime.MigrationDBStorageDir = absMigrationDBDir
+
 	return nil
+}
+
+func generateEphemeralSecret() string {
+	const secretBytes = 32
+	b := make([]byte, secretBytes)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("ephemeral-%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b)
 }
 
 type RuntimeConfig struct {
 	DataDir                string `mapstructure:"data_dir"`
+	MigrationDBStorageDir  string `mapstructure:"migration_db_storage_dir"`
 	LogAddress             string `mapstructure:"log_address"`
 	LogLevel               string `mapstructure:"log_level"`
-	SkipLogListener        bool   `mapstructure:"skip_log_listener"`
+	EnableLoggingTerminal  bool   `mapstructure:"enable_logging_terminal"`
 	DefaultWorkerCount     int    `mapstructure:"default_worker_count"`
 	DefaultMaxRetries      int    `mapstructure:"default_max_retries"`
 	DefaultCoordinatorLead int    `mapstructure:"default_coordinator_lead"`

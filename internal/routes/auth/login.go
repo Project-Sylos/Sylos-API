@@ -1,8 +1,9 @@
 package auth
 
 import (
-	"encoding/json"
 	"net/http"
+
+	"github.com/Project-Sylos/Sylos-API/internal/routes/middleware"
 )
 
 type loginRequest struct {
@@ -14,24 +15,17 @@ type loginResponse struct {
 	Token string `json:"token"`
 }
 
-func (h handler) handleLogin(w http.ResponseWriter, r *http.Request) {
-	var req loginRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-
+func (h handler) login(ctx *middleware.Context, req loginRequest) {
 	if req.Username == "" || req.Password == "" {
-		h.respondError(w, http.StatusUnauthorized, "invalid credentials")
+		ctx.Error(http.StatusUnauthorized, "invalid credentials", nil)
 		return
 	}
 
 	token, err := h.manager.GenerateToken(req.Username, []string{"user"})
 	if err != nil {
-		h.logger.Error().Err(err).Msg("failed to generate token")
-		h.respondError(w, http.StatusInternalServerError, "failed to generate token")
+		ctx.Error(http.StatusInternalServerError, "failed to generate token", err)
 		return
 	}
 
-	h.respondJSON(w, http.StatusOK, loginResponse{Token: token})
+	ctx.Response(http.StatusOK, loginResponse{Token: token})
 }

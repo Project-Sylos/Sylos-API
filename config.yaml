@@ -1,14 +1,12 @@
 environment: development
 http:
   port: 8080
-jwt:
-  secret: "change-me"
-  access_token_ttl: "15m"
 runtime:
   data_dir: "./data"
+  migration_db_storage_dir: "./data"
   log_address: "127.0.0.1:8081"
-  log_level: "info"
-  skip_log_listener: true
+  log_level: "debug"
+  enable_logging_terminal: true
   default_worker_count: 10
   default_max_retries: 3
   default_coordinator_lead: 4

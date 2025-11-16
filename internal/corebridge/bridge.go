@@ -5,12 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/Project-Sylos/Migration-Engine/pkg/db"
 	"github.com/Project-Sylos/Migration-Engine/pkg/fsservices"
 	"github.com/Project-Sylos/Migration-Engine/pkg/logservice"
 	"github.com/Project-Sylos/Migration-Engine/pkg/migration"
@@ -33,6 +35,11 @@ const (
 	ServiceTypeSpectra ServiceType = "spectra"
 )
 
+const (
+	rootRoleSource      = "source"
+	rootRoleDestination = "destination"
+)
+
 type Source struct {
 	ID          string            `json:"id"`
 	DisplayName string            `json:"displayName"`
@@ -43,6 +50,7 @@ type Source struct {
 type ListChildrenRequest struct {
 	ServiceID  string
 	Identifier string
+	Role       string // "source" or "destination" - used to map "spectra" to the correct world
 }
 
 type FolderDescriptor struct {
@@ -57,8 +65,9 @@ type FolderDescriptor struct {
 }
 
 type ServiceSelection struct {
-	ServiceID string           `json:"serviceId"`
-	Root      FolderDescriptor `json:"root"`
+	ServiceID    string           `json:"serviceId"`
+	ConnectionID string           `json:"connectionId,omitempty"`
+	Root         FolderDescriptor `json:"root"`
 }
 
 type VerificationOptions struct {
@@ -68,24 +77,44 @@ type VerificationOptions struct {
 }
 
 type MigrationOptions struct {
-	MigrationID        string              `json:"migrationId,omitempty"`
-	DatabasePath       string              `json:"databasePath,omitempty"`
-	RemoveExistingDB   bool                `json:"removeExistingDatabase,omitempty"`
-	WorkerCount        int                 `json:"workerCount,omitempty"`
-	MaxRetries         int                 `json:"maxRetries,omitempty"`
-	CoordinatorLead    int                 `json:"coordinatorLead,omitempty"`
-	LogAddress         string              `json:"logAddress,omitempty"`
-	LogLevel           string              `json:"logLevel,omitempty"`
-	SkipLogListener    bool                `json:"skipLogListener,omitempty"`
-	StartupDelaySec    int                 `json:"startupDelaySeconds,omitempty"`
-	ProgressTickMillis int                 `json:"progressTickMillis,omitempty"`
-	Verification       VerificationOptions `json:"verification,omitempty"`
+	MigrationID             string              `json:"migrationId,omitempty"`
+	DatabasePath            string              `json:"databasePath,omitempty"`
+	RemoveExistingDB        bool                `json:"removeExistingDatabase,omitempty"`
+	UsePreseededDB          bool                `json:"usePreseededDatabase,omitempty"`
+	SourceConnectionID      string              `json:"sourceConnectionId,omitempty"`
+	DestinationConnectionID string              `json:"destinationConnectionId,omitempty"`
+	WorkerCount             int                 `json:"workerCount,omitempty"`
+	MaxRetries              int                 `json:"maxRetries,omitempty"`
+	CoordinatorLead         int                 `json:"coordinatorLead,omitempty"`
+	LogAddress              string              `json:"logAddress,omitempty"`
+	LogLevel                string              `json:"logLevel,omitempty"`
+	EnableLoggingTerminal   bool                `json:"enableLoggingTerminal,omitempty"`
+	StartupDelaySec         int                 `json:"startupDelaySeconds,omitempty"`
+	ProgressTickMillis      int                 `json:"progressTickMillis,omitempty"`
+	Verification            VerificationOptions `json:"verification,omitempty"`
 }
 
 type StartMigrationRequest struct {
-	Source      ServiceSelection `json:"source"`
-	Destination ServiceSelection `json:"destination"`
+	MigrationID string           `json:"migrationId,omitempty"`
 	Options     MigrationOptions `json:"options"`
+}
+
+type SetRootRequest struct {
+	MigrationID  string           `json:"migrationId,omitempty"`
+	Role         string           `json:"role"`
+	ServiceID    string           `json:"serviceId"`
+	ConnectionID string           `json:"connectionId,omitempty"`
+	Root         FolderDescriptor `json:"root"`
+}
+
+type SetRootResponse struct {
+	MigrationID             string                     `json:"migrationId"`
+	Role                    string                     `json:"role"`
+	Ready                   bool                       `json:"ready"`
+	DatabasePath            string                     `json:"databasePath,omitempty"`
+	RootSummary             *migration.RootSeedSummary `json:"rootSummary,omitempty"`
+	SourceConnectionID      string                     `json:"sourceConnectionId,omitempty"`
+	DestinationConnectionID string                     `json:"destinationConnectionId,omitempty"`
 }
 
 type Migration struct {
@@ -155,21 +184,49 @@ type ProgressEvent struct {
 	Destination QueueStatsSnapshot `json:"destination"`
 }
 
+type UploadMigrationDBRequest struct {
+	Filename  string `json:"filename"`
+	Overwrite bool   `json:"overwrite,omitempty"`
+}
+
+type UploadMigrationDBResponse struct {
+	Success bool   `json:"success"`
+	Error   string `json:"error,omitempty"`
+	Path    string `json:"path,omitempty"`
+}
+
+type MigrationDBInfo struct {
+	Filename   string    `json:"filename"`
+	Path       string    `json:"path"`
+	Size       int64     `json:"size"`
+	ModifiedAt time.Time `json:"modifiedAt"`
+}
+
 type Bridge interface {
 	ListSources(ctx context.Context) ([]Source, error)
 	ListChildren(ctx context.Context, req ListChildrenRequest) (fsservices.ListResult, error)
+	SetRoot(ctx context.Context, req SetRootRequest) (SetRootResponse, error)
 	StartMigration(ctx context.Context, req StartMigrationRequest) (Migration, error)
 	GetMigrationStatus(ctx context.Context, id string) (Status, error)
+	InspectMigrationStatus(ctx context.Context, migrationID string) (migration.MigrationStatus, error)
+	InspectMigrationStatusFromDB(ctx context.Context, dbPath string) (migration.MigrationStatus, error)
+	UploadMigrationDB(ctx context.Context, filename string, data []byte, overwrite bool) (UploadMigrationDBResponse, error)
+	ListMigrationDBs(ctx context.Context) ([]MigrationDBInfo, error)
 	SubscribeProgress(ctx context.Context, id string) (<-chan ProgressEvent, func(), error)
+	ToggleLogTerminal(ctx context.Context, enable bool, logAddress string) error
 }
 
 type Manager struct {
-	logger      zerolog.Logger
-	cfg         config.Config
-	services    map[string]serviceDefinition
-	migrations  map[string]*migrationRecord
-	subscribers map[string]map[string]chan ProgressEvent
-	mu          sync.RWMutex
+	logger        zerolog.Logger
+	cfg           config.Config
+	services      map[string]serviceDefinition
+	migrations    map[string]*migrationRecord
+	plans         map[string]*rootPlan
+	subscribers   map[string]map[string]chan ProgressEvent
+	connections   map[string]*serviceConnection
+	logTerminal   *exec.Cmd  // Currently running log terminal process
+	logTerminalMu sync.Mutex // Protects logTerminal
+	mu            sync.RWMutex
 }
 
 type serviceDefinition struct {
@@ -191,6 +248,27 @@ type migrationRecord struct {
 	Error         string
 }
 
+type rootPlan struct {
+	HasSource               bool
+	SourceDefinition        serviceDefinition
+	SourceRoot              fsservices.Folder
+	SourceConnectionID      string
+	HasDestination          bool
+	DestinationDefinition   serviceDefinition
+	DestinationRoot         fsservices.Folder
+	DestinationConnectionID string
+	DatabasePath            string
+	RootSummary             migration.RootSeedSummary
+	Seeded                  bool
+	Seeding                 bool
+}
+
+type serviceConnection struct {
+	typ      ServiceType
+	spectra  *sdk.SpectraFS
+	refCount int
+}
+
 const (
 	migrationStatusRunning   = "running"
 	migrationStatusCompleted = "completed"
@@ -203,7 +281,9 @@ func NewManager(logger zerolog.Logger, cfg config.Config) (*Manager, error) {
 		cfg:         cfg,
 		services:    make(map[string]serviceDefinition),
 		migrations:  make(map[string]*migrationRecord),
+		plans:       make(map[string]*rootPlan),
 		subscribers: make(map[string]map[string]chan ProgressEvent),
+		connections: make(map[string]*serviceConnection),
 	}
 
 	if err := manager.loadServices(); err != nil {
@@ -277,7 +357,10 @@ func (m *Manager) ListSources(ctx context.Context) ([]Source, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	sources := make([]Source, 0, len(m.services))
+	sources := make([]Source, 0)
+	hasSpectra := false
+	var spectraConfigPath string
+
 	for _, svc := range m.services {
 		select {
 		case <-ctx.Done():
@@ -285,25 +368,44 @@ func (m *Manager) ListSources(ctx context.Context) ([]Source, error) {
 		default:
 		}
 
-		metadata := map[string]string{
-			"name": svc.Name,
-		}
 		switch svc.Type {
 		case ServiceTypeLocal:
+			// Add all local services individually
+			metadata := map[string]string{
+				"name": svc.Name,
+			}
 			if svc.Local != nil && svc.Local.RootPath != "" {
 				metadata["rootPath"] = svc.Local.RootPath
 			}
+			sources = append(sources, Source{
+				ID:          svc.ID,
+				DisplayName: svc.Name,
+				Type:        svc.Type,
+				Metadata:    metadata,
+			})
 		case ServiceTypeSpectra:
-			if svc.Spectra != nil {
-				metadata["world"] = svc.Spectra.World
-				metadata["configPath"] = svc.Spectra.ConfigPath
+			// Track that we have Spectra services, but don't add them individually
+			if !hasSpectra {
+				if svc.Spectra != nil {
+					spectraConfigPath = svc.Spectra.ConfigPath
+				}
+				hasSpectra = true
 			}
 		}
+	}
 
+	// Add a single "spectra" service entry if any Spectra services exist
+	if hasSpectra {
+		metadata := map[string]string{
+			"name": "Spectra",
+		}
+		if spectraConfigPath != "" {
+			metadata["configPath"] = spectraConfigPath
+		}
 		sources = append(sources, Source{
-			ID:          svc.ID,
-			DisplayName: svc.Name,
-			Type:        svc.Type,
+			ID:          "spectra",
+			DisplayName: "Spectra",
+			Type:        ServiceTypeSpectra,
 			Metadata:    metadata,
 		})
 	}
@@ -316,7 +418,30 @@ func (m *Manager) ListSources(ctx context.Context) ([]Source, error) {
 }
 
 func (m *Manager) ListChildren(ctx context.Context, req ListChildrenRequest) (fsservices.ListResult, error) {
-	def, err := m.serviceDefinition(req.ServiceID)
+	serviceID := req.ServiceID
+
+	// Map "spectra" virtual service to the appropriate world based on role
+	if serviceID == "spectra" {
+		role := strings.ToLower(strings.TrimSpace(req.Role))
+		var world string
+		switch role {
+		case rootRoleSource:
+			world = "primary"
+		case rootRoleDestination:
+			world = "s1"
+		default:
+			// Default to primary if no role specified
+			world = "primary"
+		}
+
+		def, err := m.findSpectraServiceByWorld(world)
+		if err != nil {
+			return fsservices.ListResult{}, fmt.Errorf("spectra service with world %s not found: %w", world, err)
+		}
+		return m.listSpectraChildren(def, req.Identifier)
+	}
+
+	def, err := m.serviceDefinition(serviceID)
 	if err != nil {
 		return fsservices.ListResult{}, err
 	}
@@ -331,72 +456,710 @@ func (m *Manager) ListChildren(ctx context.Context, req ListChildrenRequest) (fs
 	}
 }
 
-func (m *Manager) StartMigration(ctx context.Context, req StartMigrationRequest) (Migration, error) {
-	srcDef, err := m.serviceDefinition(req.Source.ServiceID)
-	if err != nil {
-		return Migration{}, err
-	}
-	dstDef, err := m.serviceDefinition(req.Destination.ServiceID)
-	if err != nil {
-		return Migration{}, err
+func (m *Manager) SetRoot(ctx context.Context, req SetRootRequest) (SetRootResponse, error) {
+	role := strings.ToLower(strings.TrimSpace(req.Role))
+	if role != rootRoleSource && role != rootRoleDestination {
+		return SetRootResponse{}, fmt.Errorf("role must be 'source' or 'destination'")
 	}
 
-	srcFolder, err := folderFromDescriptor(req.Source.Root)
-	if err != nil {
-		return Migration{}, fmt.Errorf("invalid source root: %w", err)
-	}
-	dstFolder, err := folderFromDescriptor(req.Destination.Root)
-	if err != nil {
-		return Migration{}, fmt.Errorf("invalid destination root: %w", err)
+	if req.ServiceID == "" {
+		return SetRootResponse{}, fmt.Errorf("serviceId is required")
 	}
 
-	migrationID := req.Options.MigrationID
+	// Map "spectra" virtual service to the appropriate world based on role
+	serviceID := req.ServiceID
+	var serviceDef serviceDefinition
+	var err error
+
+	if serviceID == "spectra" {
+		var world string
+		switch role {
+		case rootRoleSource:
+			world = "primary"
+		case rootRoleDestination:
+			world = "s1"
+		default:
+			return SetRootResponse{}, fmt.Errorf("role must be 'source' or 'destination' when using 'spectra' service")
+		}
+
+		serviceDef, err = m.findSpectraServiceByWorld(world)
+		if err != nil {
+			return SetRootResponse{}, fmt.Errorf("spectra service with world %s not found: %w", world, err)
+		}
+	} else {
+		serviceDef, err = m.serviceDefinition(serviceID)
+		if err != nil {
+			return SetRootResponse{}, err
+		}
+	}
+
+	folder, err := folderFromDescriptor(req.Root)
+	if err != nil {
+		return SetRootResponse{}, fmt.Errorf("invalid %s root: %w", role, err)
+	}
+
+	migrationID := req.MigrationID
 	if migrationID == "" {
 		migrationID = xid.New().String()
-	}
-
-	record := &migrationRecord{
-		ID:            migrationID,
-		SourceID:      srcDef.ID,
-		DestinationID: dstDef.ID,
-		Status:        migrationStatusRunning,
-		StartedAt:     time.Now().UTC(),
 	}
 
 	m.mu.Lock()
 	if _, exists := m.migrations[migrationID]; exists {
 		m.mu.Unlock()
-		return Migration{}, fmt.Errorf("migration %s already exists", migrationID)
+		return SetRootResponse{}, fmt.Errorf("migration %s already exists", migrationID)
 	}
-	m.migrations[migrationID] = record
-	if _, ok := m.subscribers[migrationID]; !ok {
-		m.subscribers[migrationID] = make(map[string]chan ProgressEvent)
+
+	plan := m.plans[migrationID]
+	if plan == nil {
+		plan = &rootPlan{}
+		m.plans[migrationID] = plan
 	}
+
+	plan.Seeded = false
+	plan.Seeding = false
+	plan.DatabasePath = ""
+	plan.RootSummary = migration.RootSeedSummary{}
+
+	if role == rootRoleSource {
+		plan.HasSource = true
+		plan.SourceDefinition = serviceDef
+		plan.SourceRoot = folder
+		plan.SourceConnectionID = req.ConnectionID
+	} else {
+		plan.HasDestination = true
+		plan.DestinationDefinition = serviceDef
+		plan.DestinationRoot = folder
+		plan.DestinationConnectionID = req.ConnectionID
+	}
+
+	planReady := plan.HasSource && plan.HasDestination
 	m.mu.Unlock()
 
-	m.publishProgress(record.ID, "started", nil, nil)
+	if planReady {
+		if _, _, _, err := m.seedPlanIfReady(migrationID); err != nil {
+			return SetRootResponse{}, err
+		}
+	}
 
-	go m.runMigration(record, srcDef, dstDef, srcFolder, dstFolder, req.Options)
+	m.mu.RLock()
+	plan = m.plans[migrationID]
+	var (
+		ready      bool
+		dbPath     string
+		summary    *migration.RootSeedSummary
+		sourceConn string
+		destConn   string
+	)
+	if plan != nil {
+		ready = plan.Seeded
+		dbPath = plan.DatabasePath
+		sourceConn = plan.SourceConnectionID
+		destConn = plan.DestinationConnectionID
+		if plan.Seeded {
+			s := plan.RootSummary
+			summary = &s
+		}
+	}
+	m.mu.RUnlock()
 
-	return Migration{
-		ID:            record.ID,
-		SourceID:      record.SourceID,
-		DestinationID: record.DestinationID,
-		StartedAt:     record.StartedAt,
-		Status:        record.Status,
+	return SetRootResponse{
+		MigrationID:             migrationID,
+		Role:                    role,
+		Ready:                   ready,
+		DatabasePath:            dbPath,
+		RootSummary:             summary,
+		SourceConnectionID:      sourceConn,
+		DestinationConnectionID: destConn,
 	}, nil
+}
+
+func (m *Manager) seedPlanIfReady(migrationID string) (bool, migration.RootSeedSummary, string, error) {
+	m.mu.Lock()
+	plan, ok := m.plans[migrationID]
+	if !ok || !plan.HasSource || !plan.HasDestination {
+		m.mu.Unlock()
+		return false, migration.RootSeedSummary{}, "", nil
+	}
+	if plan.Seeding {
+		seeded := plan.Seeded
+		summary := plan.RootSummary
+		dbPath := plan.DatabasePath
+		m.mu.Unlock()
+		return seeded, summary, dbPath, nil
+	}
+
+	plan.Seeding = true
+	sourceDef := plan.SourceDefinition
+	destDef := plan.DestinationDefinition
+	sourceRoot := plan.SourceRoot
+	destRoot := plan.DestinationRoot
+	sourceConn := plan.SourceConnectionID
+	destConn := plan.DestinationConnectionID
+	dbPath := plan.DatabasePath
+	m.mu.Unlock()
+
+	if dbPath == "" {
+		var err error
+		dbPath, err = m.resolveDatabasePath("", migrationID)
+		if err != nil {
+			m.mu.Lock()
+			if plan, ok := m.plans[migrationID]; ok {
+				plan.Seeding = false
+			}
+			m.mu.Unlock()
+			return false, migration.RootSeedSummary{}, "", err
+		}
+	}
+
+	// Check if database file already exists
+	if _, err := os.Stat(dbPath); err == nil {
+		// Database exists - validate schema to see if we should skip seeding
+		database, err := db.NewDB(dbPath)
+		if err == nil {
+			// Validate schema - if valid, skip seeding and let LetsMigrate handle resume
+			if err := database.ValidateCoreSchema(); err == nil {
+				// Valid schema exists - check if it has roots already
+				// If it does, we can skip seeding and let LetsMigrate resume
+				status, inspectErr := migration.InspectMigrationStatus(database)
+				closeErr := database.Close()
+				if closeErr != nil {
+					m.logger.Warn().Err(closeErr).Msg("failed to close database after inspection")
+				}
+				if inspectErr == nil && !status.IsEmpty() {
+					// Database has valid schema and is not empty - skip seeding
+					// LetsMigrate will handle resume automatically
+					m.logger.Info().
+						Str("migration_id", migrationID).
+						Str("db_path", dbPath).
+						Msg("database exists with valid schema, skipping seeding (will resume)")
+
+					// Create a summary from the existing database state
+					summary := migration.RootSeedSummary{
+						SrcRoots: status.SrcTotal,
+						DstRoots: status.DstTotal,
+					}
+
+					m.mu.Lock()
+					plan, ok = m.plans[migrationID]
+					if !ok {
+						m.mu.Unlock()
+						return false, migration.RootSeedSummary{}, "", fmt.Errorf("migration %s plan removed during seeding", migrationID)
+					}
+
+					plan.Seeding = false
+					if !plan.HasSource ||
+						plan.SourceDefinition.ID != sourceDef.ID ||
+						plan.SourceRoot.Id != sourceRoot.Id ||
+						!plan.HasDestination ||
+						plan.DestinationDefinition.ID != destDef.ID ||
+						plan.DestinationRoot.Id != destRoot.Id {
+						plan.Seeded = false
+						plan.DatabasePath = ""
+						plan.RootSummary = migration.RootSeedSummary{}
+						m.mu.Unlock()
+						return false, migration.RootSeedSummary{}, "", nil
+					}
+
+					plan.Seeded = true
+					plan.DatabasePath = dbPath
+					plan.RootSummary = summary
+					plan.SourceConnectionID = sourceConn
+					plan.DestinationConnectionID = destConn
+					m.mu.Unlock()
+
+					return true, summary, dbPath, nil
+				}
+				// If inspection failed or DB is empty, fall through to seeding
+			}
+			// If schema validation failed, fall through to create fresh DB
+		}
+		// If opening DB failed, fall through to create fresh DB
+	}
+
+	// Database doesn't exist or has invalid schema - create fresh and seed roots
+	database, err := migration.SetupDatabase(migration.DatabaseConfig{
+		Path:           dbPath,
+		RemoveExisting: true,
+	})
+	if err != nil {
+		m.mu.Lock()
+		if plan, ok := m.plans[migrationID]; ok {
+			plan.Seeding = false
+		}
+		m.mu.Unlock()
+		return false, migration.RootSeedSummary{}, "", err
+	}
+
+	summary, seedErr := migration.SeedRootTasks(database, sourceRoot, destRoot)
+	closeErr := database.Close()
+	if closeErr != nil {
+		m.logger.Warn().Err(closeErr).Msg("failed to close database after seeding roots")
+	}
+	if seedErr != nil {
+		m.mu.Lock()
+		if plan, ok := m.plans[migrationID]; ok {
+			plan.Seeding = false
+		}
+		m.mu.Unlock()
+		return false, migration.RootSeedSummary{}, "", seedErr
+	}
+
+	m.mu.Lock()
+	plan, ok = m.plans[migrationID]
+	if !ok {
+		m.mu.Unlock()
+		return false, migration.RootSeedSummary{}, "", fmt.Errorf("migration %s plan removed during seeding", migrationID)
+	}
+
+	plan.Seeding = false
+	if !plan.HasSource ||
+		plan.SourceDefinition.ID != sourceDef.ID ||
+		plan.SourceRoot.Id != sourceRoot.Id ||
+		!plan.HasDestination ||
+		plan.DestinationDefinition.ID != destDef.ID ||
+		plan.DestinationRoot.Id != destRoot.Id {
+		plan.Seeded = false
+		plan.DatabasePath = ""
+		plan.RootSummary = migration.RootSeedSummary{}
+		m.mu.Unlock()
+		return false, migration.RootSeedSummary{}, "", nil
+	}
+
+	plan.Seeded = true
+	plan.DatabasePath = dbPath
+	plan.RootSummary = summary
+	plan.SourceConnectionID = sourceConn
+	plan.DestinationConnectionID = destConn
+	m.mu.Unlock()
+
+	return true, summary, dbPath, nil
+}
+
+func (m *Manager) StartMigration(ctx context.Context, req StartMigrationRequest) (Migration, error) {
+	migrationID := req.MigrationID
+	if migrationID == "" {
+		migrationID = req.Options.MigrationID
+	}
+	if migrationID == "" {
+		return Migration{}, fmt.Errorf("migration id is required")
+	}
+
+	opts := req.Options
+	opts.MigrationID = migrationID
+
+	// If databasePath is provided, we can start migration directly from uploaded DB
+	// Otherwise, we need roots to be set
+	if opts.DatabasePath != "" {
+		// Validate that the DB file exists
+		if _, err := os.Stat(opts.DatabasePath); os.IsNotExist(err) {
+			return Migration{}, fmt.Errorf("database file not found: %s", opts.DatabasePath)
+		}
+
+		// Check if DB has valid schema and get roots from it
+		database, err := db.NewDB(opts.DatabasePath)
+		if err != nil {
+			return Migration{}, fmt.Errorf("failed to open database: %w", err)
+		}
+		defer database.Close()
+
+		if err := database.ValidateCoreSchema(); err != nil {
+			return Migration{}, fmt.Errorf("database schema invalid: %w", err)
+		}
+
+		// Get status to check if DB has roots
+		status, err := migration.InspectMigrationStatus(database)
+		if err != nil {
+			return Migration{}, fmt.Errorf("failed to inspect database: %w", err)
+		}
+
+		if status.IsEmpty() {
+			return Migration{}, fmt.Errorf("database is empty, roots must be set first")
+		}
+
+		// For uploaded DBs, we need to infer source/destination from the DB or require them in options
+		// For now, use generic values - the migration will work with whatever is in the DB
+		srcDef := serviceDefinition{
+			ID:   "uploaded-db-source",
+			Name: "Uploaded DB Source",
+			Type: ServiceTypeLocal,
+		}
+		dstDef := serviceDefinition{
+			ID:   "uploaded-db-destination",
+			Name: "Uploaded DB Destination",
+			Type: ServiceTypeLocal,
+		}
+
+		// Create minimal folder descriptors (not used when resuming from existing DB)
+		srcFolder := fsservices.Folder{Id: "root", LocationPath: "/"}
+		dstFolder := fsservices.Folder{Id: "root", LocationPath: "/"}
+
+		opts.UsePreseededDB = true
+		opts.RemoveExistingDB = false
+		if opts.LogAddress == "" {
+			opts.LogAddress = m.cfg.Runtime.LogAddress
+		}
+		if opts.LogLevel == "" {
+			opts.LogLevel = m.cfg.Runtime.LogLevel
+		}
+
+		record := &migrationRecord{
+			ID:            migrationID,
+			SourceID:      srcDef.ID,
+			DestinationID: dstDef.ID,
+			Status:        migrationStatusRunning,
+			StartedAt:     time.Now().UTC(),
+		}
+
+		m.mu.Lock()
+		if _, exists := m.migrations[migrationID]; exists {
+			m.mu.Unlock()
+			return Migration{}, fmt.Errorf("migration %s already exists", migrationID)
+		}
+		m.migrations[migrationID] = record
+		if _, ok := m.subscribers[migrationID]; !ok {
+			m.subscribers[migrationID] = make(map[string]chan ProgressEvent)
+		}
+		m.mu.Unlock()
+
+		m.publishProgress(record.ID, "started", nil, nil)
+
+		// Spawn log terminal if enabled
+		if m.shouldEnableLoggingTerminal(opts) {
+			logAddr := m.selectLogAddress(opts.LogAddress)
+			if logAddr != "" {
+				if err := m.spawnLogTerminal(logAddr); err != nil {
+					m.logger.Warn().
+						Err(err).
+						Str("migration_id", migrationID).
+						Msg("failed to spawn log terminal, continuing without it")
+				}
+			}
+		}
+
+		go m.runMigration(
+			record,
+			srcDef,
+			dstDef,
+			srcFolder,
+			dstFolder,
+			opts,
+		)
+
+		return Migration{
+			ID:            record.ID,
+			SourceID:      record.SourceID,
+			DestinationID: record.DestinationID,
+			StartedAt:     record.StartedAt,
+			Status:        record.Status,
+		}, nil
+	}
+
+	// Original flow: require roots to be set
+	m.mu.RLock()
+	plan, ok := m.plans[migrationID]
+	if ok {
+		planCopy := *plan
+		m.mu.RUnlock()
+
+		if !planCopy.HasSource || !planCopy.HasDestination {
+			return Migration{}, fmt.Errorf("roots not fully configured for migration %s", migrationID)
+		}
+
+		if !planCopy.Seeded {
+			if _, _, _, err := m.seedPlanIfReady(migrationID); err != nil {
+				return Migration{}, err
+			}
+			m.mu.RLock()
+			plan, ok = m.plans[migrationID]
+			if ok {
+				planCopy = *plan
+			}
+			m.mu.RUnlock()
+			if !ok || !planCopy.Seeded {
+				return Migration{}, fmt.Errorf("roots not fully configured for migration %s", migrationID)
+			}
+		}
+
+		opts.DatabasePath = planCopy.DatabasePath
+		opts.UsePreseededDB = true
+		opts.RemoveExistingDB = false
+		if opts.SourceConnectionID == "" {
+			opts.SourceConnectionID = planCopy.SourceConnectionID
+		}
+		if opts.DestinationConnectionID == "" {
+			opts.DestinationConnectionID = planCopy.DestinationConnectionID
+		}
+		if opts.LogAddress == "" {
+			opts.LogAddress = m.cfg.Runtime.LogAddress
+		}
+		if opts.LogLevel == "" {
+			opts.LogLevel = m.cfg.Runtime.LogLevel
+		}
+
+		record := &migrationRecord{
+			ID:            migrationID,
+			SourceID:      planCopy.SourceDefinition.ID,
+			DestinationID: planCopy.DestinationDefinition.ID,
+			Status:        migrationStatusRunning,
+			StartedAt:     time.Now().UTC(),
+		}
+
+		m.mu.Lock()
+		if _, exists := m.migrations[migrationID]; exists {
+			m.mu.Unlock()
+			return Migration{}, fmt.Errorf("migration %s already exists", migrationID)
+		}
+		m.migrations[migrationID] = record
+		if _, ok := m.subscribers[migrationID]; !ok {
+			m.subscribers[migrationID] = make(map[string]chan ProgressEvent)
+		}
+		m.mu.Unlock()
+
+		m.publishProgress(record.ID, "started", nil, nil)
+
+		// Spawn log terminal if enabled
+		if m.shouldEnableLoggingTerminal(opts) {
+			logAddr := m.selectLogAddress(opts.LogAddress)
+			if logAddr != "" {
+				if err := m.spawnLogTerminal(logAddr); err != nil {
+					m.logger.Warn().
+						Err(err).
+						Str("migration_id", migrationID).
+						Msg("failed to spawn log terminal, continuing without it")
+				}
+			}
+		}
+
+		go m.runMigration(
+			record,
+			planCopy.SourceDefinition,
+			planCopy.DestinationDefinition,
+			planCopy.SourceRoot,
+			planCopy.DestinationRoot,
+			opts,
+		)
+
+		return Migration{
+			ID:            record.ID,
+			SourceID:      record.SourceID,
+			DestinationID: record.DestinationID,
+			StartedAt:     record.StartedAt,
+			Status:        record.Status,
+		}, nil
+	}
+	m.mu.RUnlock()
+
+	return Migration{}, fmt.Errorf("roots not set for migration %s and no databasePath provided", migrationID)
 }
 
 func (m *Manager) GetMigrationStatus(ctx context.Context, id string) (Status, error) {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
-
 	record, ok := m.migrations[id]
-	if !ok {
+	m.mu.RUnlock()
+
+	if ok {
+		return record.toStatus(), nil
+	}
+
+	// In-memory record not found - try to query database directly
+	// This allows checking status of migrations that were started before server restart
+	dbPath, err := m.resolveDatabasePath("", id)
+	if err != nil {
 		return Status{}, ErrMigrationNotFound
 	}
 
-	return record.toStatus(), nil
+	// Check if database file exists
+	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+		return Status{}, ErrMigrationNotFound
+	}
+
+	// Open and inspect database
+	dbStatus, err := m.InspectMigrationStatusFromDB(ctx, dbPath)
+	if err != nil {
+		return Status{}, ErrMigrationNotFound
+	}
+
+	// Convert migration.MigrationStatus to API Status format
+	// We need to infer some fields that aren't in MigrationStatus
+	status := Status{
+		Migration: Migration{
+			ID:        id,
+			StartedAt: time.Now().UTC(), // We don't have this in DB, use current time as fallback
+			Status:    migrationStatusCompleted,
+		},
+	}
+
+	if dbStatus.HasPending() {
+		status.Status = migrationStatusRunning
+	} else if dbStatus.HasFailures() {
+		status.Status = migrationStatusFailed
+	}
+
+	// Create result view from migration status
+	if !dbStatus.IsEmpty() {
+		status.Result = &ResultView{
+			Verification: VerificationView{
+				SrcTotal:   dbStatus.SrcTotal,
+				DstTotal:   dbStatus.DstTotal,
+				SrcPending: dbStatus.SrcPending,
+				DstPending: dbStatus.DstPending,
+				SrcFailed:  dbStatus.SrcFailed,
+				DstFailed:  dbStatus.DstFailed,
+			},
+		}
+	}
+
+	return status, nil
+}
+
+func (m *Manager) InspectMigrationStatus(ctx context.Context, migrationID string) (migration.MigrationStatus, error) {
+	// Resolve database path from migration ID
+	dbPath, err := m.resolveDatabasePath("", migrationID)
+	if err != nil {
+		return migration.MigrationStatus{}, ErrMigrationNotFound
+	}
+
+	// Check if database file exists
+	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+		return migration.MigrationStatus{}, ErrMigrationNotFound
+	}
+
+	return m.InspectMigrationStatusFromDB(ctx, dbPath)
+}
+
+func (m *Manager) InspectMigrationStatusFromDB(ctx context.Context, dbPath string) (migration.MigrationStatus, error) {
+	// Open database
+	database, err := db.NewDB(dbPath)
+	if err != nil {
+		return migration.MigrationStatus{}, fmt.Errorf("failed to open database: %w", err)
+	}
+	defer func() {
+		if err := database.Close(); err != nil {
+			m.logger.Warn().Err(err).Str("db_path", dbPath).Msg("failed to close database after inspection")
+		}
+	}()
+
+	// Validate schema
+	if err := database.ValidateCoreSchema(); err != nil {
+		return migration.MigrationStatus{}, fmt.Errorf("database schema invalid: %w", err)
+	}
+
+	// Inspect status
+	status, err := migration.InspectMigrationStatus(database)
+	if err != nil {
+		return migration.MigrationStatus{}, fmt.Errorf("failed to inspect migration status: %w", err)
+	}
+
+	return status, nil
+}
+
+func (m *Manager) UploadMigrationDB(ctx context.Context, filename string, data []byte, overwrite bool) (UploadMigrationDBResponse, error) {
+	// Validate filename
+	if filename == "" {
+		return UploadMigrationDBResponse{
+			Success: false,
+			Error:   "filename is required",
+		}, nil
+	}
+
+	// Ensure filename ends with .db
+	if !strings.HasSuffix(filename, ".db") {
+		filename = filename + ".db"
+	}
+
+	// Sanitize filename to prevent path traversal
+	filename = filepath.Base(filename)
+	if filename == "." || filename == ".." {
+		return UploadMigrationDBResponse{
+			Success: false,
+			Error:   "invalid filename",
+		}, nil
+	}
+
+	// Construct full path
+	dbPath := filepath.Join(m.cfg.Runtime.MigrationDBStorageDir, filename)
+
+	// Check if file already exists
+	if _, err := os.Stat(dbPath); err == nil {
+		if !overwrite {
+			return UploadMigrationDBResponse{
+				Success: false,
+				Error:   "file already present on API",
+			}, nil
+		}
+	}
+
+	// Write file
+	if err := os.WriteFile(dbPath, data, 0o644); err != nil {
+		m.logger.Error().Err(err).Str("filename", filename).Msg("failed to write migration DB file")
+		return UploadMigrationDBResponse{
+			Success: false,
+			Error:   fmt.Sprintf("failed to save file: %v", err),
+		}, nil
+	}
+
+	m.logger.Info().
+		Str("filename", filename).
+		Str("path", dbPath).
+		Int("size", len(data)).
+		Bool("overwrite", overwrite).
+		Msg("uploaded migration DB file")
+
+	return UploadMigrationDBResponse{
+		Success: true,
+		Path:    dbPath,
+	}, nil
+}
+
+func (m *Manager) ListMigrationDBs(ctx context.Context) ([]MigrationDBInfo, error) {
+	dir := m.cfg.Runtime.MigrationDBStorageDir
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return []MigrationDBInfo{}, nil
+		}
+		return []MigrationDBInfo{}, fmt.Errorf("failed to read migration DB storage directory: %w", err)
+	}
+
+	// Initialize as empty slice (not nil) to ensure JSON serializes as [] instead of null
+	dbs := make([]MigrationDBInfo, 0)
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+
+		// Only list .db files
+		if !strings.HasSuffix(entry.Name(), ".db") {
+			continue
+		}
+
+		info, err := entry.Info()
+		if err != nil {
+			m.logger.Warn().Err(err).Str("filename", entry.Name()).Msg("failed to get file info")
+			continue
+		}
+
+		fullPath := filepath.Join(dir, entry.Name())
+		dbs = append(dbs, MigrationDBInfo{
+			Filename:   entry.Name(),
+			Path:       fullPath,
+			Size:       info.Size(),
+			ModifiedAt: info.ModTime(),
+		})
+	}
+
+	// Sort by modified time (newest first)
+	sort.Slice(dbs, func(i, j int) bool {
+		return dbs[i].ModifiedAt.After(dbs[j].ModifiedAt)
+	})
+
+	// Ensure we always return a non-nil slice (even if empty)
+	if dbs == nil {
+		return []MigrationDBInfo{}, nil
+	}
+
+	return dbs, nil
 }
 
 func (m *Manager) SubscribeProgress(ctx context.Context, id string) (<-chan ProgressEvent, func(), error) {
@@ -502,13 +1265,13 @@ func (m *Manager) executeMigration(migrationID string, srcDef, dstDef serviceDef
 		return nil, err
 	}
 
-	srcAdapter, srcCleanup, err := m.instantiateAdapterForMigration(srcDef, srcFolder.Id)
+	srcAdapter, srcCleanup, err := m.acquireAdapter(srcDef, srcFolder.Id, opts.SourceConnectionID)
 	if err != nil {
 		return nil, fmt.Errorf("source adapter: %w", err)
 	}
 	defer srcCleanup()
 
-	dstAdapter, dstCleanup, err := m.instantiateAdapterForMigration(dstDef, dstFolder.Id)
+	dstAdapter, dstCleanup, err := m.acquireAdapter(dstDef, dstFolder.Id, opts.DestinationConnectionID)
 	if err != nil {
 		return nil, fmt.Errorf("destination adapter: %w", err)
 	}
@@ -532,7 +1295,7 @@ func (m *Manager) executeMigration(migrationID string, srcDef, dstDef serviceDef
 		CoordinatorLead: m.selectCoordinatorLead(opts.CoordinatorLead),
 		LogAddress:      m.selectLogAddress(opts.LogAddress),
 		LogLevel:        m.selectLogLevel(opts.LogLevel),
-		SkipListener:    opts.SkipLogListener || m.cfg.Runtime.SkipLogListener,
+		SkipListener:    !m.shouldEnableLoggingTerminal(opts),
 		StartupDelay:    time.Duration(opts.StartupDelaySec) * time.Second,
 		ProgressTick:    time.Duration(opts.ProgressTickMillis) * time.Millisecond,
 		Verification: migration.VerifyOptions{
@@ -553,6 +1316,11 @@ func (m *Manager) executeMigration(migrationID string, srcDef, dstDef serviceDef
 		return nil, err
 	}
 
+	// Set SeedRoots to true - LetsMigrate will only use it if DB is empty
+	cfg.SeedRoots = true
+
+	// LetsMigrate automatically detects and resumes in-progress migrations
+	// when provided with an existing database file
 	result, err := migration.LetsMigrate(cfg)
 	if logservice.LS != nil {
 		_ = logservice.LS.Close()
@@ -611,6 +1379,168 @@ func (m *Manager) selectLogLevel(value string) string {
 	return "info"
 }
 
+func (m *Manager) shouldEnableLoggingTerminal(opts MigrationOptions) bool {
+	// If explicitly set in options, use that
+	if opts.EnableLoggingTerminal {
+		return true
+	}
+	// Otherwise use config default
+	return m.cfg.Runtime.EnableLoggingTerminal
+}
+
+// findTerminalEmulator finds an available terminal emulator on the system.
+// Returns the command name.
+func findTerminalEmulator() string {
+	// Try common terminal emulators in order of preference
+	terminals := []string{
+		"gnome-terminal",
+		"konsole",
+		"xterm",
+		"x-terminal-emulator", // Generic fallback on Debian/Ubuntu
+	}
+
+	for _, term := range terminals {
+		if _, err := exec.LookPath(term); err == nil {
+			return term
+		}
+	}
+
+	return ""
+}
+
+// spawnLogTerminal spawns the log terminal process if not already running.
+// Returns an error if a terminal is already running on the given address.
+func (m *Manager) spawnLogTerminal(logAddress string) error {
+	m.logTerminalMu.Lock()
+	defer m.logTerminalMu.Unlock()
+
+	if m.logTerminal != nil {
+		// Check if process is still running
+		if m.logTerminal.ProcessState == nil {
+			// Process is still running (hasn't exited yet)
+			return fmt.Errorf("log terminal already running on %s", logAddress)
+		}
+		// Process exited, clear it
+		m.logTerminal = nil
+	}
+
+	// Find the Migration Engine directory
+	// Try relative path from current working directory first (for development)
+	migrationEnginePath := "../Migration-Engine"
+	if _, err := os.Stat(migrationEnginePath); os.IsNotExist(err) {
+		// Fallback: try relative to executable
+		execPath, err := os.Executable()
+		if err == nil {
+			migrationEnginePath = filepath.Join(filepath.Dir(filepath.Dir(filepath.Dir(execPath))), "Migration-Engine")
+		}
+		// If still not found, try absolute path from go.mod replace directive
+		if _, err := os.Stat(migrationEnginePath); os.IsNotExist(err) {
+			return fmt.Errorf("Migration-Engine directory not found (tried %s)", migrationEnginePath)
+		}
+	}
+
+	spawnPath := filepath.Join(migrationEnginePath, "pkg", "logservice", "main", "spawn.go")
+	if _, err := os.Stat(spawnPath); os.IsNotExist(err) {
+		return fmt.Errorf("log service spawn.go not found at %s", spawnPath)
+	}
+
+	// Find an available terminal emulator
+	terminalCmd := findTerminalEmulator()
+	if terminalCmd == "" {
+		return fmt.Errorf("no terminal emulator found (tried: xterm, gnome-terminal, konsole, x-terminal-emulator)")
+	}
+
+	// Build the command to run in the new terminal
+	goRunCmd := fmt.Sprintf("go run %s %s", spawnPath, logAddress)
+
+	// Prepare terminal command with arguments
+	var cmd *exec.Cmd
+	switch terminalCmd {
+	case "gnome-terminal":
+		cmd = exec.Command(terminalCmd, "--title=Log Terminal", "--", "sh", "-c", goRunCmd)
+	case "konsole":
+		cmd = exec.Command(terminalCmd, "-e", "sh", "-c", goRunCmd)
+	case "xterm":
+		cmd = exec.Command(terminalCmd, "-T", "Log Terminal", "-e", "sh", "-c", goRunCmd)
+	default:
+		// Generic x-terminal-emulator
+		cmd = exec.Command(terminalCmd, "-e", "sh", "-c", goRunCmd)
+	}
+
+	// Don't attach stdout/stderr - let the terminal handle it
+	cmd.Stdin = nil
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("failed to start log terminal: %w", err)
+	}
+
+	m.logTerminal = cmd
+
+	// Monitor process in background
+	go func() {
+		if err := cmd.Wait(); err != nil {
+			m.logger.Warn().
+				Err(err).
+				Str("address", logAddress).
+				Msg("log terminal process exited")
+		}
+		m.logTerminalMu.Lock()
+		if m.logTerminal == cmd {
+			m.logTerminal = nil
+		}
+		m.logTerminalMu.Unlock()
+	}()
+
+	m.logger.Info().
+		Str("address", logAddress).
+		Int("pid", cmd.Process.Pid).
+		Msg("spawned log terminal")
+
+	return nil
+}
+
+// stopLogTerminal stops the currently running log terminal process if any.
+func (m *Manager) stopLogTerminal() error {
+	m.logTerminalMu.Lock()
+	defer m.logTerminalMu.Unlock()
+
+	if m.logTerminal == nil {
+		return nil
+	}
+
+	if m.logTerminal.ProcessState != nil && m.logTerminal.ProcessState.Exited() {
+		m.logTerminal = nil
+		return nil
+	}
+
+	if err := m.logTerminal.Process.Kill(); err != nil {
+		return fmt.Errorf("failed to kill log terminal: %w", err)
+	}
+
+	m.logger.Info().
+		Int("pid", m.logTerminal.Process.Pid).
+		Msg("stopped log terminal")
+
+	m.logTerminal = nil
+	return nil
+}
+
+// ToggleLogTerminal toggles the log terminal on or off.
+func (m *Manager) ToggleLogTerminal(ctx context.Context, enable bool, logAddress string) error {
+	if enable {
+		if logAddress == "" {
+			logAddress = m.cfg.Runtime.LogAddress
+		}
+		if logAddress == "" {
+			return fmt.Errorf("log address is required")
+		}
+		return m.spawnLogTerminal(logAddress)
+	}
+	return m.stopLogTerminal()
+}
+
 func (m *Manager) resolveDatabasePath(path, migrationID string) (string, error) {
 	if path == "" {
 		filename := fmt.Sprintf("%s.db", migrationID)
@@ -629,7 +1559,7 @@ func (m *Manager) resolveDatabasePath(path, migrationID string) (string, error) 
 	return filepath.Clean(abs), nil
 }
 
-func (m *Manager) instantiateAdapterForMigration(def serviceDefinition, rootID string) (fsservices.FSAdapter, func(), error) {
+func (m *Manager) acquireAdapter(def serviceDefinition, rootID, connectionID string) (fsservices.FSAdapter, func(), error) {
 	switch def.Type {
 	case ServiceTypeLocal:
 		if rootID == "" {
@@ -644,26 +1574,121 @@ func (m *Manager) instantiateAdapterForMigration(def serviceDefinition, rootID s
 		if def.Spectra == nil {
 			return nil, nil, fmt.Errorf("spectra configuration missing")
 		}
+		return m.acquireSpectraAdapter(def, rootID, connectionID)
+	default:
+		return nil, nil, fmt.Errorf("unsupported service type: %s", def.Type)
+	}
+}
+
+func (m *Manager) acquireSpectraAdapter(def serviceDefinition, rootID, connectionID string) (fsservices.FSAdapter, func(), error) {
+	root := def.Spectra.RootID
+	if rootID != "" {
+		root = rootID
+	}
+
+	if connectionID == "" {
 		spectraFS, err := sdk.New(def.Spectra.ConfigPath)
 		if err != nil {
 			return nil, nil, err
 		}
-		root := def.Spectra.RootID
-		if rootID != "" {
-			root = rootID
-		}
+
 		adapter, err := fsservices.NewSpectraFS(spectraFS, root, def.Spectra.World)
 		if err != nil {
 			_ = spectraFS.Close()
 			return nil, nil, err
 		}
-		cleanup := func() {
+		return adapter, func() {
 			_ = spectraFS.Close()
-		}
-		return adapter, cleanup, nil
-	default:
-		return nil, nil, fmt.Errorf("unsupported service type: %s", def.Type)
+		}, nil
 	}
+
+	m.mu.Lock()
+	conn, ok := m.connections[connectionID]
+	if ok {
+		if conn.typ != ServiceTypeSpectra {
+			m.mu.Unlock()
+			return nil, nil, fmt.Errorf("connection %s is already in use by a different service type", connectionID)
+		}
+		conn.refCount++
+		spectraFS := conn.spectra
+		m.mu.Unlock()
+
+		adapter, err := fsservices.NewSpectraFS(spectraFS, root, def.Spectra.World)
+		if err != nil {
+			m.releaseConnection(connectionID)
+			return nil, nil, err
+		}
+
+		return adapter, func() {
+			m.releaseConnection(connectionID)
+		}, nil
+	}
+	m.mu.Unlock()
+
+	spectraFS, err := sdk.New(def.Spectra.ConfigPath)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	adapter, err := fsservices.NewSpectraFS(spectraFS, root, def.Spectra.World)
+	if err != nil {
+		_ = spectraFS.Close()
+		return nil, nil, err
+	}
+
+	m.mu.Lock()
+	if existing, exists := m.connections[connectionID]; exists {
+		existing.refCount++
+		spectraShared := existing.spectra
+		m.mu.Unlock()
+
+		_ = spectraFS.Close()
+
+		adapter, err := fsservices.NewSpectraFS(spectraShared, root, def.Spectra.World)
+		if err != nil {
+			m.releaseConnection(connectionID)
+			return nil, nil, err
+		}
+		return adapter, func() {
+			m.releaseConnection(connectionID)
+		}, nil
+	}
+
+	m.connections[connectionID] = &serviceConnection{
+		typ:      ServiceTypeSpectra,
+		spectra:  spectraFS,
+		refCount: 1,
+	}
+	m.mu.Unlock()
+
+	return adapter, func() {
+		m.releaseConnection(connectionID)
+	}, nil
+}
+
+func (m *Manager) releaseConnection(connectionID string) {
+	if connectionID == "" {
+		return
+	}
+
+	m.mu.Lock()
+	conn, ok := m.connections[connectionID]
+	if !ok {
+		m.mu.Unlock()
+		return
+	}
+
+	conn.refCount--
+	if conn.refCount <= 0 {
+		delete(m.connections, connectionID)
+		switch conn.typ {
+		case ServiceTypeSpectra:
+			if conn.spectra != nil {
+				_ = conn.spectra.Close()
+			}
+		}
+	}
+	m.mu.Unlock()
 }
 
 func (m *Manager) listLocalChildren(def serviceDefinition, identifier string) (fsservices.ListResult, error) {
@@ -732,6 +1757,19 @@ func (m *Manager) serviceDefinition(id string) (serviceDefinition, error) {
 		return serviceDefinition{}, ErrServiceNotFound
 	}
 	return def, nil
+}
+
+// findSpectraServiceByWorld finds the first Spectra service with the given world.
+func (m *Manager) findSpectraServiceByWorld(world string) (serviceDefinition, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	for _, svc := range m.services {
+		if svc.Type == ServiceTypeSpectra && svc.Spectra != nil && svc.Spectra.World == world {
+			return svc, nil
+		}
+	}
+	return serviceDefinition{}, ErrServiceNotFound
 }
 
 func folderFromDescriptor(desc FolderDescriptor) (fsservices.Folder, error) {

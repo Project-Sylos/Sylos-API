@@ -28,13 +28,15 @@ type Claims struct {
 }
 
 type Manager struct {
-	secret []byte
-	ttl    time.Duration
+	secret         []byte
+	ttl            time.Duration
+	allowAnonymous bool
 }
 
 type Config struct {
-	Secret string
-	TTL    time.Duration
+	Secret         string
+	TTL            time.Duration
+	AllowAnonymous bool
 }
 
 func NewManager(cfg Config) (*Manager, error) {
@@ -47,8 +49,9 @@ func NewManager(cfg Config) (*Manager, error) {
 	}
 
 	return &Manager{
-		secret: []byte(cfg.Secret),
-		ttl:    cfg.TTL,
+		secret:         []byte(cfg.Secret),
+		ttl:            cfg.TTL,
+		allowAnonymous: cfg.AllowAnonymous,
 	}, nil
 }
 
@@ -91,18 +94,30 @@ func (m *Manager) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		authHeader := r.Header.Get("Authorization")
 		if authHeader == "" {
+			if m.allowAnonymous {
+				next.ServeHTTP(w, r)
+				return
+			}
 			http.Error(w, "missing authorization header", http.StatusUnauthorized)
 			return
 		}
 
 		parts := strings.SplitN(authHeader, " ", 2)
 		if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
+			if m.allowAnonymous {
+				next.ServeHTTP(w, r)
+				return
+			}
 			http.Error(w, "invalid authorization header", http.StatusUnauthorized)
 			return
 		}
 
 		claims, err := m.ValidateToken(parts[1])
 		if err != nil {
+			if m.allowAnonymous {
+				next.ServeHTTP(w, r)
+				return
+			}
 			http.Error(w, "invalid token", http.StatusUnauthorized)
 			return
 		}

@@ -5,12 +5,14 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
 	"github.com/Project-Sylos/Sylos-API/internal/auth"
 	"github.com/Project-Sylos/Sylos-API/internal/corebridge"
 	"github.com/Project-Sylos/Sylos-API/internal/routes"
+	"github.com/Project-Sylos/Sylos-API/internal/routes/middleware"
 	"github.com/Project-Sylos/Sylos-API/internal/server"
 	"github.com/Project-Sylos/Sylos-API/pkg/config"
 	"github.com/Project-Sylos/Sylos-API/pkg/logger"
@@ -26,22 +28,34 @@ func main() {
 	log := logger.New(cfg.Environment)
 	log.Info().Msg("starting Sylos API server")
 
+	if cfg.JWT.Generated {
+		log.Warn().Msg("jwt.secret not configured; generated ephemeral secret for this runtime")
+	}
+
 	coreBridge, err := corebridge.NewManager(log, cfg)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize core bridge")
 	}
 	authManager, err := auth.NewManager(auth.Config{
-		Secret: cfg.JWT.Secret,
-		TTL:    cfg.JWT.AccessTokenTTL,
+		Secret:         cfg.JWT.Secret,
+		TTL:            cfg.JWT.AccessTokenTTL,
+		AllowAnonymous: cfg.JWT.Generated,
 	})
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize auth manager")
 	}
 
+	apiMiddleware, err := middleware.New(log, filepath.Join(cfg.Runtime.DataDir, "api-runtime.log"))
+	if err != nil {
+		log.Warn().Err(err).Msg("failed to initialize API middleware logger; proceeding without runtime file log")
+	}
+	defer apiMiddleware.Close()
+
 	router := routes.New(routes.Dependencies{
 		Logger:      log,
 		CoreBridge:  coreBridge,
 		AuthManager: authManager,
+		Middleware:  apiMiddleware,
 	})
 
 	httpServer := server.New(server.Config{

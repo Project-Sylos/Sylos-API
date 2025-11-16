@@ -1,31 +1,34 @@
 package migrations
 
 import (
-	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/Project-Sylos/Sylos-API/internal/corebridge"
+	"github.com/Project-Sylos/Sylos-API/internal/routes/middleware"
 )
 
-func (h handler) handleStartMigration(w http.ResponseWriter, r *http.Request) {
-	var req corebridge.StartMigrationRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		h.respondError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-
-	migration, err := h.core.StartMigration(r.Context(), req)
+func (h handler) start(ctx *middleware.Context, payload corebridge.StartMigrationRequest) {
+	migration, err := h.core.StartMigration(ctx.Request().Context(), payload)
 	if err != nil {
-		if errors.Is(err, corebridge.ErrServiceNotFound) {
-			h.respondError(w, http.StatusBadRequest, "unknown service in request")
+		if errors.Is(err, corebridge.ErrServiceNotFound) ||
+			errors.Is(err, corebridge.ErrMigrationNotFound) ||
+			isStartInputError(err) {
+			ctx.Error(http.StatusBadRequest, err.Error(), err)
 			return
 		}
 
-		h.logger.Error().Err(err).Msg("failed to start migration")
-		h.respondError(w, http.StatusInternalServerError, "failed to start migration")
+		ctx.Error(http.StatusInternalServerError, "failed to start migration", err)
 		return
 	}
 
-	h.respondJSON(w, http.StatusAccepted, migration)
+	ctx.Response(http.StatusAccepted, migration)
+}
+
+func isStartInputError(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "root") ||
+		strings.Contains(msg, "migration id") ||
+		strings.Contains(msg, "configured")
 }

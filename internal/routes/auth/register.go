@@ -5,6 +5,7 @@ import (
 	"github.com/rs/zerolog"
 
 	appauth "github.com/Project-Sylos/Sylos-API/internal/auth"
+	"github.com/Project-Sylos/Sylos-API/internal/routes/middleware"
 )
 
 type handler struct {
@@ -13,11 +14,11 @@ type handler struct {
 }
 
 // Register mounts authentication routes that do not require prior credentials.
-func Register(router chi.Router, logger zerolog.Logger, manager *appauth.Manager) {
+func Register(router chi.Router, logger zerolog.Logger, manager *appauth.Manager, mw *middleware.Middleware) {
 	h := handler{
 		logger:  logger,
 		manager: manager,
 	}
 
-	router.Post("/api/auth/login", h.handleLogin)
+	router.Post("/api/auth/login", middleware.JSON(mw, h.login))
 }

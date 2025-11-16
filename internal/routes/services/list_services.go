@@ -2,15 +2,16 @@ package services
 
 import (
 	"net/http"
+
+	"github.com/Project-Sylos/Sylos-API/internal/routes/middleware"
 )
 
-func (h handler) handleListServices(w http.ResponseWriter, r *http.Request) {
-	sources, err := h.core.ListSources(r.Context())
+func (h handler) listServices(ctx *middleware.Context) {
+	sources, err := h.core.ListSources(ctx.Request().Context())
 	if err != nil {
-		h.logger.Error().Err(err).Msg("failed to list services")
-		h.respondError(w, http.StatusInternalServerError, "failed to list services")
+		ctx.Error(http.StatusInternalServerError, "failed to list services", err)
 		return
 	}
 
-	h.respondJSON(w, http.StatusOK, sources)
+	ctx.Response(http.StatusOK, sources)
 }

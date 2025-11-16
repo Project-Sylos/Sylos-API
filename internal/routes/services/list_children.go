@@ -6,30 +6,32 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/Project-Sylos/Sylos-API/internal/corebridge"
+	"github.com/Project-Sylos/Sylos-API/internal/routes/middleware"
 )
 
-func (h handler) handleListChildren(w http.ResponseWriter, r *http.Request) {
-	serviceID := chi.URLParam(r, "serviceID")
+func (h handler) listChildren(ctx *middleware.Context) {
+	serviceID := chi.URLParam(ctx.Request(), "serviceID")
 	if serviceID == "" {
-		h.respondError(w, http.StatusBadRequest, "service id is required")
+		ctx.Error(http.StatusBadRequest, "service id is required", nil)
 		return
 	}
 
-	identifier := r.URL.Query().Get("identifier")
-	children, err := h.core.ListChildren(r.Context(), corebridge.ListChildrenRequest{
+	identifier := ctx.Request().URL.Query().Get("identifier")
+	role := ctx.Request().URL.Query().Get("role")
+	children, err := h.core.ListChildren(ctx.Request().Context(), corebridge.ListChildrenRequest{
 		ServiceID:  serviceID,
 		Identifier: identifier,
+		Role:       role,
 	})
 	if err != nil {
 		if err == corebridge.ErrServiceNotFound {
-			h.respondError(w, http.StatusNotFound, "service not found")
+			ctx.Error(http.StatusNotFound, "service not found", err)
 			return
 		}
 
-		h.logger.Error().Err(err).Str("service", serviceID).Msg("failed to list children")
-		h.respondError(w, http.StatusInternalServerError, "failed to list children")
+		ctx.Error(http.StatusInternalServerError, "failed to list children", err)
 		return
 	}
 
-	h.respondJSON(w, http.StatusOK, children)
+	ctx.Response(http.StatusOK, children)
 }

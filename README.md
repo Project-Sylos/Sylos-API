@@ -82,13 +82,13 @@ environment: development
 http:
   port: 8080
 jwt:
-  secret: "change-me"            # required
+  secret: "change-me"            # optional; random secret generated if omitted
   access_token_ttl: "15m"
 runtime:
   data_dir: "./data"             # outputs DBs, logs here (normalized to absolute path)
   log_address: "127.0.0.1:8081"  # optional UDP listener for live logs
   log_level: "info"
-  skip_log_listener: true
+  enable_logging_terminal: false
   default_worker_count: 10
   default_max_retries: 3
   default_coordinator_lead: 4
@@ -107,11 +107,11 @@ services:
 
 Important notes:
 
-- **JWT secret** must be supplied either in config or via `SYLOS_JWT_SECRET`; the API will refuse to start otherwise.
+- **JWT secret**: if omitted, the server generates a random ephemeral secret on startup (valid only for that process). Set `SYLOS_JWT_SECRET` or `jwt.secret` if you need stable tokens across restarts or multiple instances.
 - **Local services**: users can only browse within the configured `root_path` (the service enforces prefix checks).
 - **Spectra services**: each entry identifies a config file and world; the API spawns a temporary Spectra SDK client per request.
 - **Runtime data**: migration databases and log buffers are written to `${runtime.data_dir}/${migrationID}.db`. The directory is created automatically.
-- **UDP logging**: set `runtime.log_address` and leave `skip_log_listener=false` to spawn a listener for live logs (matching the Migration Engine SDK behavior).
+- **Logging terminal**: set `runtime.enable_logging_terminal=true` and `runtime.log_address` to automatically spawn a log terminal process (`go run pkg/logservice/main/spawn.go`) when starting migrations. The terminal displays live UDP logs from the migration engine. You can also toggle it mid-run via `POST /api/migrations/log-terminal`.
 
 ---
 
@@ -132,12 +132,39 @@ Important notes:
 | GET | `/api/services` | List configured service connectors (local + Spectra) |
 | GET | `/api/source/list` | Legacy alias for `GET /api/services` |
 | GET | `/api/services/{serviceID}/children?identifier=` | List folders/files under a given service node |
+| POST | `/api/migrations/roots` | Seed database with selected source/destination roots and receive a migration id |
 | POST | `/api/migrations` | Start a migration; body matches `corebridge.StartMigrationRequest` |
 | POST | `/api/migrate/start` | Legacy alias |
+| POST | `/api/migrations/log-terminal` | Toggle log terminal on/off mid-run; body: `{"enable": true, "logAddress": "127.0.0.1:8081"}` (logAddress optional) |
 | GET | `/api/migrations/{migrationID}` | Fetch migration status/result summary |
 | GET | `/api/migrate/status/{migrationID}` | Legacy alias |
 | GET | `/api/migrations/{migrationID}/stream` | Server-Sent Events (SSE) stream of progress events |
 | GET | `/api/migrate/status/{migrationID}/stream` | Legacy alias for the SSE stream |
+
+Typical flow for the UI:
+
+1. `GET /api/services` → populate source/destination pickers.
+2. `GET /api/services/{serviceID}/children` → browse folders until the user selects a root.
+3. Call `POST /api/migrations/roots` **once per role** (`role: "source"` or `"destination"`) with the selected `serviceId`, optional `connectionId`, and folder descriptor. The first call stores the root; after the second role is set the API seeds the database and responds with `ready: true`, the shared `migrationId`, and any connection ids to reuse. Example payload:
+   ```json
+   {
+     "migrationId": "abc123",
+     "role": "source",
+     "serviceId": "spectra-primary",
+     "connectionId": "shared-spectra-session",
+     "root": {
+       "id": "root",
+       "displayName": "Root",
+       "locationPath": "/",
+       "type": "folder"
+     }
+   }
+   ```
+4. `POST /api/migrations` with the `migrationId` (either top-level `migrationId` field or inside `options.migrationId`) → trigger traversal/execution. Reuse the same connection ids so shared connectors stay in sync. Minimal payload:
+   ```json
+   { "migrationId": "abc123" }
+   ```
+5. `GET /api/migrations/{migrationID}/stream` → stream progress until `event: completed` or `event: failed` arrives.
 
 ### Route packages
 
@@ -158,6 +185,7 @@ Select responses are backed by the types exported from `internal/corebridge`:
 - `Migration`: `id`, `sourceId`, `destinationId`, `startedAt`, `status`.
 - `Status`: extends `Migration` with `completedAt`, `error`, and `result`.
 - `Result`: includes `rootSummary`, `runtime` queue stats, and `verification` report from the Migration Engine SDK.
+- `SetRootResponse`: `{ migrationId, role, ready, databasePath?, rootSummary?, sourceConnectionId?, destinationConnectionId? }` — when `ready` is true both roots are set and the database has been seeded for `/api/migrations`.
 - `ProgressEvent` (SSE stream):
   ```json
   {
@@ -178,7 +206,7 @@ All error responses follow `{ "error": "message" }`.
 
 - Every HTTP request is logged via Chi middleware (method, path, status, bytes, duration).
 - The core bridge logs migration lifecycle, including successes/failures, and can forward logs to the Migration Engine’s UDP listener if configured.
-- Enable UDP listener for local development via `runtime.log_address` and `runtime.skip_log_listener=false`; logs also persist in the migration database via the SDK.
+- Enable logging terminal for local development via `runtime.enable_logging_terminal=true` and `runtime.log_address`; this spawns a terminal process that displays live UDP logs. You can also toggle it mid-run via `POST /api/migrations/log-terminal`. Logs also persist in the migration database via the SDK.
 - Progress streams are delivered over SSE. Heartbeats (`: heartbeat`) are sent every 30 seconds to keep connections alive; reconnect on network drops to continue receiving updates.
 
 ---
