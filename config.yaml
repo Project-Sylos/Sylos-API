@@ -1,6 +1,6 @@
 environment: development
 http:
-  port: 8080
+  port: 8086
 runtime:
   data_dir: "./data"
   migration_db_storage_dir: "./data"
