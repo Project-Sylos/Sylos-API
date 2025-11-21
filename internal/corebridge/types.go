@@ -188,6 +188,15 @@ type MigrationDBInfo struct {
 	ModifiedAt time.Time `json:"modifiedAt"`
 }
 
+// MigrationMetadata represents minimal metadata for a migration
+// The Migration Engine's YAML config file contains all the detailed state
+type MigrationMetadata struct {
+	ID         string    `json:"id"`
+	Name       string    `json:"name"`
+	ConfigPath string    `json:"configPath"` // Path to the Migration Engine's YAML config file
+	CreatedAt  time.Time `json:"createdAt"`
+}
+
 type Bridge interface {
 	ListSources(ctx context.Context) ([]Source, error)
 	ListChildren(ctx context.Context, req ListChildrenRequest) (fsservices.ListResult, error)
@@ -200,10 +209,14 @@ type Bridge interface {
 	ListMigrationDBs(ctx context.Context) ([]MigrationDBInfo, error)
 	SubscribeProgress(ctx context.Context, id string) (<-chan ProgressEvent, func(), error)
 	ToggleLogTerminal(ctx context.Context, enable bool, logAddress string) error
+	ListAllMigrations(ctx context.Context) ([]MigrationMetadata, error)
+	LoadMigration(ctx context.Context, migrationID string) (Migration, error)
+	StopMigration(ctx context.Context, migrationID string) (Status, error)
 }
 
 const (
 	MigrationStatusRunning   = "running"
 	MigrationStatusCompleted = "completed"
+	MigrationStatusSuspended = "suspended"
 	MigrationStatusFailed    = "failed"
 )

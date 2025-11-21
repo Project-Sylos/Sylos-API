@@ -2,10 +2,13 @@ package corebridge
 
 import (
 	"context"
+	"fmt"
+	"time"
 
 	"github.com/Project-Sylos/Migration-Engine/pkg/fsservices"
 	"github.com/Project-Sylos/Migration-Engine/pkg/migration"
 	"github.com/Project-Sylos/Sylos-API/internal/corebridge/database"
+	"github.com/Project-Sylos/Sylos-API/internal/corebridge/metadata"
 	"github.com/Project-Sylos/Sylos-API/internal/corebridge/migrations"
 	"github.com/Project-Sylos/Sylos-API/internal/corebridge/roots"
 	"github.com/Project-Sylos/Sylos-API/internal/corebridge/services"
@@ -294,4 +297,146 @@ func convertStatus(s migrations.Status) Status {
 
 func (m *Manager) ToggleLogTerminal(ctx context.Context, enable bool, logAddress string) error {
 	return m.terminalMgr.ToggleLogTerminal(ctx, enable, logAddress)
+}
+
+// GetMigrationMetadata retrieves metadata for a specific migration
+func (m *Manager) GetMigrationMetadata(ctx context.Context, migrationID string) (MigrationMetadata, error) {
+	metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
+	meta, err := metaMgr.GetMigrationMetadata(migrationID)
+	if err != nil {
+		return MigrationMetadata{}, err
+	}
+	return convertMetadata(meta), nil
+}
+
+// UpdateMigrationName updates the name of a migration
+func (m *Manager) UpdateMigrationName(ctx context.Context, migrationID, name string) error {
+	metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
+	meta, err := metaMgr.GetMigrationMetadata(migrationID)
+	if err != nil {
+		return err
+	}
+	meta.Name = name
+	return metaMgr.UpdateMigrationMetadata(meta)
+}
+
+// ListAllMigrations returns all migration metadata
+func (m *Manager) ListAllMigrations(ctx context.Context) ([]MigrationMetadata, error) {
+	metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
+	metas, err := metaMgr.ListAllMigrations()
+	if err != nil {
+		return nil, err
+	}
+	result := make([]MigrationMetadata, len(metas))
+	for i, meta := range metas {
+		result[i] = convertMetadata(meta)
+	}
+	return result, nil
+}
+
+// LoadMigration loads and resumes a migration from its YAML config file
+func (m *Manager) LoadMigration(ctx context.Context, migrationID string) (Migration, error) {
+	// Get migration metadata to find the config path
+	metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
+	meta, err := metaMgr.GetMigrationMetadata(migrationID)
+	if err != nil {
+		return Migration{}, fmt.Errorf("migration metadata not found: %w", err)
+	}
+
+	if meta.ConfigPath == "" {
+		return Migration{}, fmt.Errorf("migration %s has no config path", migrationID)
+	}
+
+	// Use the migrations manager's LoadMigrationFromConfigPath method
+	mg, err := m.migrationsMgr.LoadMigrationFromConfigPath(ctx, migrationID, meta.ConfigPath)
+	if err != nil {
+		return Migration{}, err
+	}
+
+	// Convert migrations.Migration to corebridge.Migration
+	return Migration{
+		ID:            mg.ID,
+		SourceID:      mg.SourceID,
+		DestinationID: mg.DestinationID,
+		StartedAt:     mg.StartedAt,
+		Status:        mg.Status,
+	}, nil
+}
+
+func (m *Manager) StopMigration(ctx context.Context, migrationID string) (Status, error) {
+	// Call the migrations manager's StopMigration method
+	result, err := m.migrationsMgr.StopMigration(ctx, migrationID)
+	if err != nil {
+		return Status{}, err
+	}
+
+	// Get the migration status to build a complete Status response
+	status, err := m.GetMigrationStatus(ctx, migrationID)
+	if err != nil {
+		// If we can't get status, create a minimal status from the result
+		status = Status{
+			Migration: Migration{
+				ID:     migrationID,
+				Status: MigrationStatusSuspended,
+			},
+		}
+		if result != nil {
+			status.Result = convertResultToView(result)
+			finished := time.Now().UTC()
+			status.CompletedAt = &finished
+		}
+	}
+
+	return status, nil
+}
+
+func convertResultToView(res *migration.Result) *ResultView {
+	if res == nil {
+		return nil
+	}
+
+	return &ResultView{
+		RootSummary: RootSummaryView{
+			SrcRoots: res.RootSummary.SrcRoots,
+			DstRoots: res.RootSummary.DstRoots,
+		},
+		Runtime: RuntimeStatsView{
+			Duration: res.Runtime.Duration.String(),
+			Src: QueueStatsView{
+				Name:         res.Runtime.Src.Name,
+				Round:        res.Runtime.Src.Round,
+				Pending:      res.Runtime.Src.Pending,
+				InProgress:   res.Runtime.Src.InProgress,
+				TotalTracked: res.Runtime.Src.TotalTracked,
+				Workers:      res.Runtime.Src.Workers,
+			},
+			Dst: QueueStatsView{
+				Name:         res.Runtime.Dst.Name,
+				Round:        res.Runtime.Dst.Round,
+				Pending:      res.Runtime.Dst.Pending,
+				InProgress:   res.Runtime.Dst.InProgress,
+				TotalTracked: res.Runtime.Dst.TotalTracked,
+				Workers:      res.Runtime.Dst.Workers,
+			},
+		},
+		Verification: VerificationView{
+			SrcTotal:    res.Verification.SrcTotal,
+			DstTotal:    res.Verification.DstTotal,
+			SrcPending:  res.Verification.SrcPending,
+			DstPending:  res.Verification.DstPending,
+			SrcFailed:   res.Verification.SrcFailed,
+			DstFailed:   res.Verification.DstFailed,
+			DstNotOnSrc: res.Verification.DstNotOnSrc,
+		},
+	}
+}
+
+// convertMetadata converts internal metadata to public API metadata
+func convertMetadata(meta metadata.MigrationMetadata) MigrationMetadata {
+	return MigrationMetadata{
+		ID:         meta.ID,
+		Name:       meta.Name,
+		ConfigPath: meta.ConfigPath,
+		CreatedAt:  meta.CreatedAt,
+	}
 }

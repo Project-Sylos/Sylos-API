@@ -8,6 +8,7 @@ import (
 	"github.com/Project-Sylos/Migration-Engine/pkg/logservice"
 	"github.com/Project-Sylos/Migration-Engine/pkg/migration"
 	"github.com/Project-Sylos/Migration-Engine/pkg/queue"
+	corebridgeDB "github.com/Project-Sylos/Sylos-API/internal/corebridge/database"
 	"github.com/Project-Sylos/Sylos-API/internal/corebridge/services"
 )
 
@@ -71,18 +72,34 @@ func (m *Manager) ExecuteMigration(migrationID string, srcDef, dstDef services.S
 	// Set SeedRoots to true - LetsMigrate will only use it if DB is empty
 	cfg.SeedRoots = true
 
-	// LetsMigrate automatically detects and resumes in-progress migrations
-	// when provided with an existing database file
-	result, err := migration.LetsMigrate(cfg)
+	// Create and save Migration Engine YAML config before starting migration
+	configPath := corebridgeDB.ConfigPathFromDatabasePath(dbPath)
 
-	// Safely close log service - LetsMigrate may have already closed it
+	// Get initial migration status to create YAML config
+	status := migration.MigrationStatus{} // Empty status for new migration
+	yamlCfg, err := migration.NewMigrationConfigYAML(cfg, status)
+	if err == nil {
+		// Update migration ID in YAML config
+		yamlCfg.Metadata.MigrationID = migrationID
+		if err := migration.SaveMigrationConfig(configPath, yamlCfg); err != nil {
+			// Log warning but continue - Migration Engine will update it during execution
+			m.logger.Warn().Err(err).Str("migration_id", migrationID).Str("config_path", configPath).Msg("failed to save initial YAML config")
+		}
+	}
+
+	// StartMigration runs the migration asynchronously and returns a controller
+	// The Migration Engine will automatically detect and resume in-progress migrations
+	// when provided with an existing database file
+	controller := migration.StartMigration(cfg)
+
+	// Wait for migration to complete or be shutdown
+	result, err := controller.Wait()
+
+	// Safely close log service - migration may have already closed it
 	// Use recover to prevent panic from double-closing
 	if logservice.LS != nil {
 		func() {
 			defer func() {
-				// This is the most bullshit bandaid fix I've ever seen
-				// But whatever I have bigger things to work on right now. 
-				// TODO: Fix this properly.
 				if r := recover(); r != nil {
 					// Channel already closed, ignore the panic
 				}
@@ -91,11 +108,102 @@ func (m *Manager) ExecuteMigration(migrationID string, srcDef, dstDef services.S
 		}()
 	}
 
+	// Check if migration was suspended (clean shutdown)
+	if err != nil && err.Error() == "migration suspended by force shutdown" {
+		// Migration was cleanly suspended - result contains stats up to shutdown point
+		// This is expected behavior for killswitch, not an error
+		return &result, nil
+	}
+
 	if err != nil {
 		return nil, err
 	}
 
 	return &result, nil
+}
+
+// ExecuteMigrationWithController executes a migration and returns the controller for programmatic shutdown
+// This allows the caller to control when to shutdown the migration
+func (m *Manager) ExecuteMigrationWithController(migrationID string, srcDef, dstDef services.ServiceDefinition, srcFolder, dstFolder fsservices.Folder, opts MigrationOptions, resolveDBPath func(path, migrationID string) (string, error), acquireAdapter func(services.ServiceDefinition, string, string) (fsservices.FSAdapter, func(), error)) (*migration.MigrationController, error) {
+	dbPath, err := resolveDBPath(opts.DatabasePath, migrationID)
+	if err != nil {
+		return nil, err
+	}
+
+	srcAdapter, srcCleanup, err := acquireAdapter(srcDef, srcFolder.Id, opts.SourceConnectionID)
+	if err != nil {
+		return nil, fmt.Errorf("source adapter: %w", err)
+	}
+	defer srcCleanup()
+
+	dstAdapter, dstCleanup, err := acquireAdapter(dstDef, dstFolder.Id, opts.DestinationConnectionID)
+	if err != nil {
+		return nil, fmt.Errorf("destination adapter: %w", err)
+	}
+	defer dstCleanup()
+
+	cfg := migration.Config{
+		Database: migration.DatabaseConfig{
+			Path:           dbPath,
+			RemoveExisting: opts.RemoveExistingDB,
+		},
+		Source: migration.Service{
+			Name:    srcDef.Name,
+			Adapter: srcAdapter,
+		},
+		Destination: migration.Service{
+			Name:    dstDef.Name,
+			Adapter: dstAdapter,
+		},
+		WorkerCount:     m.selectWorkerCount(opts.WorkerCount),
+		MaxRetries:      m.selectMaxRetries(opts.MaxRetries),
+		CoordinatorLead: m.selectCoordinatorLead(opts.CoordinatorLead),
+		LogAddress:      m.selectLogAddress(opts.LogAddress),
+		LogLevel:        m.selectLogLevel(opts.LogLevel),
+		SkipListener:    !m.shouldEnableLoggingTerminal(opts),
+		StartupDelay:    time.Duration(opts.StartupDelaySec) * time.Second,
+		ProgressTick:    time.Duration(opts.ProgressTickMillis) * time.Millisecond,
+		Verification: migration.VerifyOptions{
+			AllowPending:  opts.Verification.AllowPending,
+			AllowFailed:   opts.Verification.AllowFailed,
+			AllowNotOnSrc: opts.Verification.AllowNotOnSrc,
+		},
+	}
+
+	if cfg.StartupDelay == 0 {
+		cfg.StartupDelay = 3 * time.Second
+	}
+	if cfg.ProgressTick == 0 {
+		cfg.ProgressTick = 500 * time.Millisecond
+	}
+
+	if err := cfg.SetRootFolders(srcFolder, dstFolder); err != nil {
+		return nil, err
+	}
+
+	// Set SeedRoots to true - StartMigration will only use it if DB is empty
+	cfg.SeedRoots = true
+
+	// Create and save Migration Engine YAML config before starting migration
+	configPath := corebridgeDB.ConfigPathFromDatabasePath(dbPath)
+
+	// Get initial migration status to create YAML config
+	status := migration.MigrationStatus{} // Empty status for new migration
+	yamlCfg, err := migration.NewMigrationConfigYAML(cfg, status)
+	if err == nil {
+		// Update migration ID in YAML config
+		yamlCfg.Metadata.MigrationID = migrationID
+		if err := migration.SaveMigrationConfig(configPath, yamlCfg); err != nil {
+			// Log warning but continue - Migration Engine will update it during execution
+			m.logger.Warn().Err(err).Str("migration_id", migrationID).Str("config_path", configPath).Msg("failed to save initial YAML config")
+		}
+	}
+
+	// StartMigration runs the migration asynchronously and returns a controller
+	// The Migration Engine will automatically detect and resume in-progress migrations
+	controller := migration.StartMigration(cfg)
+
+	return controller, nil
 }
 
 func (m *Manager) selectWorkerCount(value int) int {

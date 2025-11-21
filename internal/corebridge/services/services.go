@@ -321,6 +321,11 @@ func (m *ServiceManager) GetServiceDefinitionByWorld(world string) (ServiceDefin
 }
 
 func (m *ServiceManager) AcquireAdapter(def serviceDefinition, rootID, connectionID string) (fsservices.FSAdapter, func(), error) {
+	return m.AcquireAdapterWithOverride(def, rootID, connectionID, "")
+}
+
+// AcquireAdapterWithOverride acquires an adapter, with optional Spectra config override path
+func (m *ServiceManager) AcquireAdapterWithOverride(def serviceDefinition, rootID, connectionID, spectraConfigOverridePath string) (fsservices.FSAdapter, func(), error) {
 	switch def.Type {
 	case ServiceTypeLocal:
 		if rootID == "" {
@@ -335,20 +340,26 @@ func (m *ServiceManager) AcquireAdapter(def serviceDefinition, rootID, connectio
 		if def.Spectra == nil {
 			return nil, nil, fmt.Errorf("spectra configuration missing")
 		}
-		return m.acquireSpectraAdapter(def, rootID, connectionID)
+		return m.acquireSpectraAdapter(def, rootID, connectionID, spectraConfigOverridePath)
 	default:
 		return nil, nil, fmt.Errorf("unsupported service type: %s", def.Type)
 	}
 }
 
-func (m *ServiceManager) acquireSpectraAdapter(def serviceDefinition, rootID, connectionID string) (fsservices.FSAdapter, func(), error) {
+func (m *ServiceManager) acquireSpectraAdapter(def serviceDefinition, rootID, connectionID, spectraConfigOverridePath string) (fsservices.FSAdapter, func(), error) {
 	root := def.Spectra.RootID
 	if rootID != "" {
 		root = rootID
 	}
 
+	// Use override config path if provided, otherwise use original
+	configPath := def.Spectra.ConfigPath
+	if spectraConfigOverridePath != "" {
+		configPath = spectraConfigOverridePath
+	}
+
 	if connectionID == "" {
-		spectraFS, err := sdk.New(def.Spectra.ConfigPath)
+		spectraFS, err := sdk.New(configPath)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -386,7 +397,7 @@ func (m *ServiceManager) acquireSpectraAdapter(def serviceDefinition, rootID, co
 	}
 	m.mu.Unlock()
 
-	spectraFS, err := sdk.New(def.Spectra.ConfigPath)
+	spectraFS, err := sdk.New(configPath)
 	if err != nil {
 		return nil, nil, err
 	}

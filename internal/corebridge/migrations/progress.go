@@ -5,7 +5,6 @@ import (
 	"time"
 
 	"github.com/Project-Sylos/Migration-Engine/pkg/fsservices"
-	"github.com/Project-Sylos/Migration-Engine/pkg/migration"
 	"github.com/Project-Sylos/Migration-Engine/pkg/queue"
 	"github.com/Project-Sylos/Sylos-API/internal/corebridge/services"
 	"github.com/rs/xid"
@@ -48,12 +47,39 @@ func (m *Manager) SubscribeProgress(ctx context.Context, id string) (<-chan Prog
 	return ch, cancel, nil
 }
 
-func (m *Manager) RunMigration(record *MigrationRecord, srcDef, dstDef services.ServiceDefinition, srcFolder, dstFolder fsservices.Folder, opts MigrationOptions, executeFn func(string, services.ServiceDefinition, services.ServiceDefinition, fsservices.Folder, fsservices.Folder, MigrationOptions) (*migration.Result, error)) {
+func (m *Manager) RunMigration(record *MigrationRecord, srcDef, dstDef services.ServiceDefinition, srcFolder, dstFolder fsservices.Folder, opts MigrationOptions, spectraConfigOverridePath string) {
 	m.logger.Info().
 		Str("migration_id", record.ID).
 		Str("source", srcDef.ID).
 		Str("destination", dstDef.ID).
 		Msg("starting migration")
+
+	// Start migration with controller for programmatic shutdown
+	controller, err := m.ExecuteMigrationWithController(record.ID, srcDef, dstDef, srcFolder, dstFolder, opts, m.resolveDBPath, func(def services.ServiceDefinition, rootID, connID string) (fsservices.FSAdapter, func(), error) {
+		return m.serviceMgr.AcquireAdapterWithOverride(def, rootID, connID, spectraConfigOverridePath)
+	})
+	if err != nil {
+		m.mu.Lock()
+		record.Status = MigrationStatusFailed
+		record.Error = err.Error()
+		finished := time.Now().UTC()
+		record.CompletedAt = &finished
+		m.mu.Unlock()
+
+		m.logger.Error().
+			Err(err).
+			Str("migration_id", record.ID).
+			Msg("failed to start migration")
+
+		m.publishProgress(record.ID, "failed", nil, nil)
+		m.closeSubscribers(record.ID)
+		return
+	}
+
+	// Store controller in record for programmatic shutdown
+	m.mu.Lock()
+	record.Controller = controller
+	m.mu.Unlock()
 
 	heartbeat := time.NewTicker(5 * time.Second)
 	done := make(chan struct{})
@@ -69,8 +95,32 @@ func (m *Manager) RunMigration(record *MigrationRecord, srcDef, dstDef services.
 		}
 	}()
 
-	result, err := executeFn(record.ID, srcDef, dstDef, srcFolder, dstFolder, opts)
+	// Wait for migration to complete or be shutdown
+	result, err := controller.Wait()
 	close(done)
+
+	// Check if migration was suspended (clean shutdown via killswitch)
+	if err != nil && err.Error() == "migration suspended by force shutdown" {
+		// Migration was cleanly suspended - result contains stats up to shutdown point
+		finished := time.Now().UTC()
+
+		m.mu.Lock()
+		record.Status = MigrationStatusSuspended
+		record.CompletedAt = &finished
+		record.Result = &result
+		record.Controller = nil // Clear controller reference
+		m.mu.Unlock()
+
+		m.logger.Info().
+			Str("migration_id", record.ID).
+			Msg("migration suspended (killswitch activated)")
+
+		srcStats := result.Runtime.Src
+		dstStats := result.Runtime.Dst
+		m.publishProgress(record.ID, "suspended", &srcStats, &dstStats)
+		m.closeSubscribers(record.ID)
+		return
+	}
 
 	if err != nil {
 		m.mu.Lock()
@@ -78,6 +128,7 @@ func (m *Manager) RunMigration(record *MigrationRecord, srcDef, dstDef services.
 		record.Error = err.Error()
 		finished := time.Now().UTC()
 		record.CompletedAt = &finished
+		record.Controller = nil // Clear controller reference
 		m.mu.Unlock()
 
 		m.logger.Error().
@@ -95,8 +146,12 @@ func (m *Manager) RunMigration(record *MigrationRecord, srcDef, dstDef services.
 	m.mu.Lock()
 	record.Status = MigrationStatusCompleted
 	record.CompletedAt = &finished
-	record.Result = result
+	record.Result = &result
+	record.Controller = nil // Clear controller reference
 	m.mu.Unlock()
+
+	// Migration Engine will update its YAML config with completion status and rounds
+	// No need to update our minimal metadata here
 
 	m.logger.Info().
 		Str("migration_id", record.ID).
@@ -139,6 +194,9 @@ func (m *Manager) publishProgress(id, event string, srcStats, dstStats *queue.Qu
 	if dstStats != nil {
 		update.Destination = queueStatsSnapshotFrom(*dstStats)
 	}
+
+	// Migration Engine will update its YAML config with round changes
+	// No need to update our minimal metadata here
 
 	for _, ch := range channels {
 		select {

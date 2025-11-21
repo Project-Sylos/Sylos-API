@@ -213,6 +213,9 @@ func (m *Manager) SetRoot(ctx context.Context, req SetRootRequest) (SetRootRespo
 	}
 	m.mu.RUnlock()
 
+	// Migration Engine will update its YAML config when roots are set
+	// No need to update our minimal metadata here
+
 	return SetRootResponse{
 		MigrationID:             migrationID,
 		Role:                    role,

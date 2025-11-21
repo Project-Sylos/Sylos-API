@@ -154,6 +154,12 @@ func ResolveDatabasePath(dataDir, path, migrationID string) (string, error) {
 	return filepath.Clean(abs), nil
 }
 
+// ConfigPathFromDatabasePath returns the config YAML path for a given database path.
+// Following Migration Engine's pattern: {database_path}.yaml
+func ConfigPathFromDatabasePath(dbPath string) string {
+	return dbPath + ".yaml"
+}
+
 func InspectMigrationStatusFromDB(ctx context.Context, logger zerolog.Logger, dbPath string) (migration.MigrationStatus, error) {
 	// Open database
 	database, err := db.NewDB(dbPath)

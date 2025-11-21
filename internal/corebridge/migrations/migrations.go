@@ -4,13 +4,17 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/Project-Sylos/Migration-Engine/pkg/db"
 	"github.com/Project-Sylos/Migration-Engine/pkg/fsservices"
+	"github.com/Project-Sylos/Migration-Engine/pkg/logservice"
 	"github.com/Project-Sylos/Migration-Engine/pkg/migration"
-	"github.com/Project-Sylos/Sylos-API/internal/corebridge/database"
+	"github.com/Project-Sylos/Spectra/sdk"
+	corebridgeDB "github.com/Project-Sylos/Sylos-API/internal/corebridge/database"
+	"github.com/Project-Sylos/Sylos-API/internal/corebridge/metadata"
 	"github.com/Project-Sylos/Sylos-API/internal/corebridge/roots"
 	"github.com/Project-Sylos/Sylos-API/internal/corebridge/services"
 	"github.com/Project-Sylos/Sylos-API/pkg/config"
@@ -136,6 +140,7 @@ type Manager struct {
 	mu            sync.RWMutex
 	serviceMgr    *services.ServiceManager
 	rootsMgr      *roots.Manager
+	metadataMgr   *metadata.Manager
 	resolveDBPath func(path, migrationID string) (string, error)
 }
 
@@ -148,11 +153,13 @@ type MigrationRecord struct {
 	CompletedAt   *time.Time
 	Result        *migration.Result
 	Error         string
+	Controller    *migration.MigrationController // Controller for programmatic shutdown
 }
 
 const (
 	MigrationStatusRunning   = "running"
 	MigrationStatusCompleted = "completed"
+	MigrationStatusSuspended = "suspended"
 	MigrationStatusFailed    = "failed"
 )
 
@@ -164,8 +171,90 @@ func NewManager(logger zerolog.Logger, cfg config.Config, serviceMgr *services.S
 		subscribers:   make(map[string]map[string]chan ProgressEvent),
 		serviceMgr:    serviceMgr,
 		rootsMgr:      rootsMgr,
+		metadataMgr:   metadata.NewManager(cfg.Runtime.DataDir),
 		resolveDBPath: resolveDBPath,
 	}
+}
+
+// LoadMigrationFromConfigPath loads and resumes a migration from its YAML config file path
+func (m *Manager) LoadMigrationFromConfigPath(ctx context.Context, migrationID, configPath string) (Migration, error) {
+	// Check if config file exists
+	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+		return Migration{}, fmt.Errorf("migration config file not found: %s", configPath)
+	}
+
+	// Check if Spectra override config exists
+	overridePath, exists, _ := services.LoadSpectraConfigOverride(m.cfg.Runtime.DataDir, migrationID)
+	var spectraConfigPath string
+	if exists {
+		spectraConfigPath = overridePath
+	}
+
+	// Load YAML config and reconstruct migration config
+	adapterFactory := m.createAdapterFactory(spectraConfigPath)
+	cfg, err := migration.LoadMigrationConfigFromYAML(configPath, adapterFactory)
+	if err != nil {
+		return Migration{}, fmt.Errorf("failed to load migration config: %w", err)
+	}
+
+	// Extract database path from config
+	dbPath := cfg.Database.Path
+	if dbPath == "" {
+		return Migration{}, fmt.Errorf("migration config has no database path")
+	}
+
+	// Validate that the DB file exists
+	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+		return Migration{}, fmt.Errorf("migration database file not found: %s", dbPath)
+	}
+
+	// Create migration options with defaults
+	opts := MigrationOptions{
+		MigrationID:      migrationID,
+		DatabasePath:     dbPath,
+		UsePreseededDB:   true,
+		RemoveExistingDB: false,
+		LogAddress:       m.cfg.Runtime.LogAddress,
+		LogLevel:         m.cfg.Runtime.LogLevel,
+	}
+
+	// Create migration record
+	record := &MigrationRecord{
+		ID:            migrationID,
+		SourceID:      cfg.Source.Name,
+		DestinationID: cfg.Destination.Name,
+		Status:        MigrationStatusRunning,
+		StartedAt:     time.Now().UTC(),
+	}
+
+	m.mu.Lock()
+	if _, exists := m.migrations[migrationID]; exists {
+		m.mu.Unlock()
+		return Migration{}, fmt.Errorf("migration %s is already running", migrationID)
+	}
+	m.migrations[migrationID] = record
+	if _, ok := m.subscribers[migrationID]; !ok {
+		m.subscribers[migrationID] = make(map[string]chan ProgressEvent)
+	}
+	m.mu.Unlock()
+
+	m.publishProgress(record.ID, "started", nil, nil)
+
+	// Resume migration using reconstructed config
+	go m.RunMigrationFromConfig(
+		record,
+		cfg,
+		opts,
+		spectraConfigPath,
+	)
+
+	return Migration{
+		ID:            record.ID,
+		SourceID:      record.SourceID,
+		DestinationID: record.DestinationID,
+		StartedAt:     record.StartedAt,
+		Status:        record.Status,
+	}, nil
 }
 
 func (m *Manager) StartMigration(ctx context.Context, req StartMigrationRequest) (Migration, error) {
@@ -209,8 +298,71 @@ func (m *Manager) StartMigration(ctx context.Context, req StartMigrationRequest)
 			return Migration{}, fmt.Errorf("database is empty, roots must be set first")
 		}
 
-		// For uploaded DBs, we need to infer source/destination from the DB or require them in options
-		// For now, use generic values - the migration will work with whatever is in the DB
+		// Try to load Migration Engine YAML config to restore service info and Spectra config
+		configPath := corebridgeDB.ConfigPathFromDatabasePath(opts.DatabasePath)
+
+		// Check if Spectra override config exists
+		overridePath, exists, _ := services.LoadSpectraConfigOverride(m.cfg.Runtime.DataDir, migrationID)
+		var spectraConfigPath string
+		if exists {
+			spectraConfigPath = overridePath
+		}
+
+		// Try loading YAML config to reconstruct migration config
+		adapterFactory := m.createAdapterFactory(spectraConfigPath)
+		cfg, err := migration.LoadMigrationConfigFromYAML(configPath, adapterFactory)
+		if err == nil {
+			// Successfully reconstructed config - use it to resume migration
+			// The config already has all service info, roots, etc.
+			opts.UsePreseededDB = true
+			opts.RemoveExistingDB = false
+			if opts.LogAddress == "" {
+				opts.LogAddress = m.cfg.Runtime.LogAddress
+			}
+			if opts.LogLevel == "" {
+				opts.LogLevel = m.cfg.Runtime.LogLevel
+			}
+
+			record := &MigrationRecord{
+				ID:            migrationID,
+				SourceID:      cfg.Source.Name,
+				DestinationID: cfg.Destination.Name,
+				Status:        MigrationStatusRunning,
+				StartedAt:     time.Now().UTC(),
+			}
+
+			m.mu.Lock()
+			if _, exists := m.migrations[migrationID]; exists {
+				m.mu.Unlock()
+				return Migration{}, fmt.Errorf("migration %s already exists", migrationID)
+			}
+			m.migrations[migrationID] = record
+			if _, ok := m.subscribers[migrationID]; !ok {
+				m.subscribers[migrationID] = make(map[string]chan ProgressEvent)
+			}
+			m.mu.Unlock()
+
+			m.publishProgress(record.ID, "started", nil, nil)
+
+			// Resume migration using reconstructed config
+			go m.RunMigrationFromConfig(
+				record,
+				cfg,
+				opts,
+				spectraConfigPath,
+			)
+
+			return Migration{
+				ID:            record.ID,
+				SourceID:      record.SourceID,
+				DestinationID: record.DestinationID,
+				StartedAt:     record.StartedAt,
+				Status:        record.Status,
+			}, nil
+		}
+		// If reconstruction failed, fall through to generic values
+
+		// No YAML config found or reconstruction failed - use generic values for uploaded DB
 		srcDef := services.ServiceDefinition{
 			ID:   "uploaded-db-source",
 			Name: "Uploaded DB Source",
@@ -264,9 +416,7 @@ func (m *Manager) StartMigration(ctx context.Context, req StartMigrationRequest)
 			srcFolder,
 			dstFolder,
 			opts,
-			func(id string, src, dst services.ServiceDefinition, srcF, dstF fsservices.Folder, opts MigrationOptions) (*migration.Result, error) {
-				return m.ExecuteMigration(id, src, dst, srcF, dstF, opts, m.resolveDBPath, m.serviceMgr.AcquireAdapter)
-			},
+			"", // No override config for uploaded DB without metadata
 		)
 
 		return Migration{
@@ -314,6 +464,36 @@ func (m *Manager) StartMigration(ctx context.Context, req StartMigrationRequest)
 		opts.LogLevel = m.cfg.Runtime.LogLevel
 	}
 
+	// Check if Spectra is used and create config override if needed
+	var spectraConfigPath string
+	isSpectraMigration := plan.SourceDefinition.Type == services.ServiceTypeSpectra || plan.DestinationDefinition.Type == services.ServiceTypeSpectra
+
+	if isSpectraMigration {
+		// Get the Spectra service definition (same for both src and dst)
+		var spectraDef services.ServiceDefinition
+		if plan.SourceDefinition.Type == services.ServiceTypeSpectra {
+			spectraDef = plan.SourceDefinition
+		} else {
+			spectraDef = plan.DestinationDefinition
+		}
+
+		// Create Spectra config override
+		overridePath, err := services.SaveSpectraConfigOverride(m.cfg.Runtime.DataDir, migrationID, spectraDef.Spectra.ConfigPath)
+		if err != nil {
+			return Migration{}, fmt.Errorf("failed to create Spectra config override: %w", err)
+		}
+		spectraConfigPath = overridePath
+	}
+
+	// Create Migration Engine YAML config file
+	configPath := corebridgeDB.ConfigPathFromDatabasePath(plan.DatabasePath)
+
+	// The Migration Engine will create/update the YAML config during migration execution
+	// For now, just store the config path in our minimal metadata
+	if err := m.updateMetadataForMigration(migrationID, migrationID, configPath); err != nil {
+		m.logger.Warn().Err(err).Str("migration_id", migrationID).Msg("failed to update migration metadata")
+	}
+
 	record := &MigrationRecord{
 		ID:            migrationID,
 		SourceID:      plan.SourceDefinition.ID,
@@ -343,9 +523,7 @@ func (m *Manager) StartMigration(ctx context.Context, req StartMigrationRequest)
 		plan.SourceRoot,
 		plan.DestinationRoot,
 		opts,
-		func(id string, src, dst services.ServiceDefinition, srcF, dstF fsservices.Folder, opts MigrationOptions) (*migration.Result, error) {
-			return m.ExecuteMigration(id, src, dst, srcF, dstF, opts, m.resolveDBPath, m.serviceMgr.AcquireAdapter)
-		},
+		spectraConfigPath, // Pass override config path
 	)
 
 	return Migration{
@@ -355,6 +533,93 @@ func (m *Manager) StartMigration(ctx context.Context, req StartMigrationRequest)
 		StartedAt:     record.StartedAt,
 		Status:        record.Status,
 	}, nil
+}
+
+// StopMigration triggers a programmatic shutdown of a running migration
+func (m *Manager) StopMigration(ctx context.Context, id string) (*migration.Result, error) {
+	m.mu.RLock()
+	record, ok := m.migrations[id]
+	if !ok {
+		m.mu.RUnlock()
+		return nil, ErrMigrationNotFound
+	}
+
+	// Check if migration has a controller (is actively running)
+	if record.Controller == nil {
+		m.mu.RUnlock()
+		return nil, fmt.Errorf("migration %s is not running (no controller)", id)
+	}
+
+	controller := record.Controller
+	m.mu.RUnlock()
+
+	// Trigger shutdown
+	m.logger.Info().
+		Str("migration_id", id).
+		Msg("triggering migration shutdown (killswitch)")
+
+	controller.Shutdown()
+
+	// Wait for shutdown to complete
+	result, err := controller.Wait()
+
+	// Check if migration was cleanly suspended
+	if err != nil && err.Error() == "migration suspended by force shutdown" {
+		// Clean shutdown - migration state is saved for resumption
+		m.logger.Info().
+			Str("migration_id", id).
+			Msg("migration suspended successfully (killswitch)")
+
+		// Update record status
+		finished := time.Now().UTC()
+		m.mu.Lock()
+		record.Status = MigrationStatusSuspended
+		record.CompletedAt = &finished
+		record.Result = &result
+		record.Controller = nil // Clear controller reference
+		m.mu.Unlock()
+
+		// Publish suspended event
+		srcStats := result.Runtime.Src
+		dstStats := result.Runtime.Dst
+		m.publishProgress(id, "suspended", &srcStats, &dstStats)
+
+		return &result, nil
+	}
+
+	if err != nil {
+		m.logger.Error().
+			Err(err).
+			Str("migration_id", id).
+			Msg("migration shutdown failed")
+
+		// Update record with error
+		finished := time.Now().UTC()
+		m.mu.Lock()
+		record.Status = MigrationStatusFailed
+		record.Error = err.Error()
+		record.CompletedAt = &finished
+		record.Controller = nil
+		m.mu.Unlock()
+
+		m.publishProgress(id, "failed", nil, nil)
+		return nil, fmt.Errorf("migration shutdown failed: %w", err)
+	}
+
+	// Migration completed normally (shouldn't happen after shutdown, but handle it)
+	finished := time.Now().UTC()
+	m.mu.Lock()
+	record.Status = MigrationStatusCompleted
+	record.CompletedAt = &finished
+	record.Result = &result
+	record.Controller = nil
+	m.mu.Unlock()
+
+	srcStats := result.Runtime.Src
+	dstStats := result.Runtime.Dst
+	m.publishProgress(id, "completed", &srcStats, &dstStats)
+
+	return &result, nil
 }
 
 func (m *Manager) GetMigrationStatus(ctx context.Context, id string) (Status, error) {
@@ -379,7 +644,7 @@ func (m *Manager) GetMigrationStatus(ctx context.Context, id string) (Status, er
 	}
 
 	// Open and inspect database
-	dbStatus, err := database.InspectMigrationStatusFromDB(ctx, m.logger, dbPath)
+	dbStatus, err := corebridgeDB.InspectMigrationStatusFromDB(ctx, m.logger, dbPath)
 	if err != nil {
 		return Status{}, ErrMigrationNotFound
 	}
@@ -429,7 +694,7 @@ func (m *Manager) InspectMigrationStatus(ctx context.Context, migrationID string
 		return migration.MigrationStatus{}, ErrMigrationNotFound
 	}
 
-	return database.InspectMigrationStatusFromDB(ctx, m.logger, dbPath)
+	return corebridgeDB.InspectMigrationStatusFromDB(ctx, m.logger, dbPath)
 }
 
 func (m *Manager) GetRecord(migrationID string) *MigrationRecord {
@@ -442,6 +707,304 @@ func (m *Manager) SetRecord(migrationID string, record *MigrationRecord) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.migrations[migrationID] = record
+}
+
+// updateMetadataForMigration creates or updates minimal metadata (ID, name, config path)
+func (m *Manager) updateMetadataForMigration(migrationID, name, configPath string) error {
+	meta, err := m.metadataMgr.GetMigrationMetadata(migrationID)
+	if err != nil {
+		// Create new metadata entry
+		meta = metadata.MigrationMetadata{
+			ID:         migrationID,
+			Name:       name,
+			ConfigPath: configPath,
+		}
+	} else {
+		// Update existing metadata
+		if name != "" {
+			meta.Name = name
+		}
+		if configPath != "" {
+			meta.ConfigPath = configPath
+		}
+	}
+
+	return m.metadataMgr.UpdateMigrationMetadata(meta)
+}
+
+// createAdapterFactory creates an adapter factory for reconstructing adapters from YAML config
+func (m *Manager) createAdapterFactory(spectraConfigOverridePath string) migration.AdapterFactory {
+	return func(serviceType string, serviceCfg migration.ServiceConfigYAML, serviceConfigs map[string]interface{}) (fsservices.FSAdapter, error) {
+		switch strings.ToLower(serviceType) {
+		case "spectra":
+			// Use override config if provided, otherwise try to extract from serviceConfigs
+			configPath := spectraConfigOverridePath
+			if configPath == "" {
+				// Try to get original config path from service name
+				// Look up the service definition to get the original config path
+				def, err := m.serviceMgr.GetServiceDefinition(serviceCfg.Name)
+				if err == nil && def.Spectra != nil {
+					configPath = def.Spectra.ConfigPath
+				} else {
+					// Try to find by world if name lookup fails
+					// Extract world from service name
+					world := "primary"
+					if strings.Contains(strings.ToLower(serviceCfg.Name), "s1") {
+						world = "s1"
+					}
+					def, err := m.serviceMgr.GetServiceDefinitionByWorld(world)
+					if err == nil && def.Spectra != nil {
+						configPath = def.Spectra.ConfigPath
+					} else {
+						return nil, fmt.Errorf("spectra config path not found for service %s", serviceCfg.Name)
+					}
+				}
+			}
+
+			spectraFS, err := sdk.New(configPath)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create SpectraFS: %w", err)
+			}
+
+			rootID := serviceCfg.RootID
+			if rootID == "" {
+				rootID = "root"
+			}
+
+			// Extract world from service name or use default
+			world := "primary"
+			if strings.Contains(strings.ToLower(serviceCfg.Name), "s1") {
+				world = "s1"
+			} else {
+				// Try to get world from service definition
+				def, err := m.serviceMgr.GetServiceDefinition(serviceCfg.Name)
+				if err == nil && def.Spectra != nil {
+					world = def.Spectra.World
+				} else {
+					// Try to find by world
+					def, err := m.serviceMgr.GetServiceDefinitionByWorld(world)
+					if err == nil && def.Spectra != nil {
+						world = def.Spectra.World
+					}
+				}
+			}
+
+			adapter, err := fsservices.NewSpectraFS(spectraFS, rootID, world)
+			if err != nil {
+				_ = spectraFS.Close()
+				return nil, fmt.Errorf("failed to create SpectraFS adapter: %w", err)
+			}
+
+			return adapter, nil
+
+		case "local":
+			// For local services, use RootPath
+			rootPath := serviceCfg.RootPath
+			if rootPath == "" {
+				return nil, fmt.Errorf("local service %s missing root path", serviceCfg.Name)
+			}
+
+			adapter, err := fsservices.NewLocalFS(rootPath)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create LocalFS adapter: %w", err)
+			}
+
+			return adapter, nil
+
+		default:
+			return nil, fmt.Errorf("unsupported service type: %s", serviceType)
+		}
+	}
+}
+
+// ExecuteMigrationFromConfig executes a migration using a pre-constructed migration.Config
+func (m *Manager) ExecuteMigrationFromConfig(cfg migration.Config, opts MigrationOptions) (*migration.Result, error) {
+	// Update config with options if needed
+	if opts.WorkerCount > 0 {
+		cfg.WorkerCount = opts.WorkerCount
+	}
+	if opts.MaxRetries > 0 {
+		cfg.MaxRetries = opts.MaxRetries
+	}
+	if opts.CoordinatorLead > 0 {
+		cfg.CoordinatorLead = opts.CoordinatorLead
+	}
+	if opts.LogAddress != "" {
+		cfg.LogAddress = opts.LogAddress
+	}
+	if opts.LogLevel != "" {
+		cfg.LogLevel = opts.LogLevel
+	}
+	cfg.SkipListener = !m.shouldEnableLoggingTerminal(opts)
+
+	// StartMigration runs the migration asynchronously and returns a controller
+	controller := migration.StartMigration(cfg)
+
+	// Wait for migration to complete or be shutdown
+	result, err := controller.Wait()
+
+	// Safely close log service
+	if logservice.LS != nil {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					// Channel already closed, ignore the panic
+				}
+			}()
+			_ = logservice.LS.Close()
+		}()
+	}
+
+	// Check if migration was suspended (clean shutdown)
+	if err != nil && err.Error() == "migration suspended by force shutdown" {
+		// Migration was cleanly suspended - result contains stats up to shutdown point
+		return &result, nil
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	return &result, nil
+}
+
+// ExecuteMigrationFromConfigWithController executes a migration using a pre-constructed migration.Config
+// and returns the controller for programmatic shutdown
+func (m *Manager) ExecuteMigrationFromConfigWithController(cfg migration.Config, opts MigrationOptions) (*migration.MigrationController, error) {
+	// Update config with options if needed
+	if opts.WorkerCount > 0 {
+		cfg.WorkerCount = opts.WorkerCount
+	}
+	if opts.MaxRetries > 0 {
+		cfg.MaxRetries = opts.MaxRetries
+	}
+	if opts.CoordinatorLead > 0 {
+		cfg.CoordinatorLead = opts.CoordinatorLead
+	}
+	if opts.LogAddress != "" {
+		cfg.LogAddress = opts.LogAddress
+	}
+	if opts.LogLevel != "" {
+		cfg.LogLevel = opts.LogLevel
+	}
+	cfg.SkipListener = !m.shouldEnableLoggingTerminal(opts)
+
+	// StartMigration runs the migration asynchronously and returns a controller
+	controller := migration.StartMigration(cfg)
+
+	return controller, nil
+}
+
+// RunMigrationFromConfig runs a migration using a pre-constructed migration.Config
+func (m *Manager) RunMigrationFromConfig(record *MigrationRecord, cfg migration.Config, opts MigrationOptions, spectraConfigOverridePath string) {
+	m.logger.Info().
+		Str("migration_id", record.ID).
+		Str("source", cfg.Source.Name).
+		Str("destination", cfg.Destination.Name).
+		Msg("resuming migration from config")
+
+	// Start migration with controller for programmatic shutdown
+	controller, err := m.ExecuteMigrationFromConfigWithController(cfg, opts)
+	if err != nil {
+		m.mu.Lock()
+		record.Status = MigrationStatusFailed
+		record.Error = err.Error()
+		finished := time.Now().UTC()
+		record.CompletedAt = &finished
+		m.mu.Unlock()
+
+		m.logger.Error().
+			Err(err).
+			Str("migration_id", record.ID).
+			Msg("failed to start migration")
+
+		m.publishProgress(record.ID, "failed", nil, nil)
+		m.closeSubscribers(record.ID)
+		return
+	}
+
+	// Store controller in record for programmatic shutdown
+	m.mu.Lock()
+	record.Controller = controller
+	m.mu.Unlock()
+
+	heartbeat := time.NewTicker(5 * time.Second)
+	done := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-heartbeat.C:
+				m.publishProgress(record.ID, "running", nil, nil)
+			case <-done:
+				heartbeat.Stop()
+				return
+			}
+		}
+	}()
+
+	// Wait for migration to complete or be shutdown
+	result, err := controller.Wait()
+	close(done)
+
+	// Check if migration was suspended (clean shutdown via killswitch)
+	if err != nil && err.Error() == "migration suspended by force shutdown" {
+		// Migration was cleanly suspended - result contains stats up to shutdown point
+		finished := time.Now().UTC()
+
+		m.mu.Lock()
+		record.Status = MigrationStatusSuspended
+		record.CompletedAt = &finished
+		record.Result = &result
+		record.Controller = nil // Clear controller reference
+		m.mu.Unlock()
+
+		m.logger.Info().
+			Str("migration_id", record.ID).
+			Msg("migration suspended (killswitch activated)")
+
+		srcStats := result.Runtime.Src
+		dstStats := result.Runtime.Dst
+		m.publishProgress(record.ID, "suspended", &srcStats, &dstStats)
+		m.closeSubscribers(record.ID)
+		return
+	}
+
+	if err != nil {
+		m.mu.Lock()
+		record.Status = MigrationStatusFailed
+		record.Error = err.Error()
+		finished := time.Now().UTC()
+		record.CompletedAt = &finished
+		record.Controller = nil // Clear controller reference
+		m.mu.Unlock()
+
+		m.logger.Error().
+			Err(err).
+			Str("migration_id", record.ID).
+			Msg("migration failed")
+
+		m.publishProgress(record.ID, "failed", nil, nil)
+		m.closeSubscribers(record.ID)
+		return
+	}
+
+	finished := time.Now().UTC()
+
+	m.mu.Lock()
+	record.Status = MigrationStatusCompleted
+	record.CompletedAt = &finished
+	record.Result = &result
+	record.Controller = nil // Clear controller reference
+	m.mu.Unlock()
+
+	m.logger.Info().
+		Str("migration_id", record.ID).
+		Msg("migration completed successfully")
+
+	srcStats := result.Runtime.Src
+	dstStats := result.Runtime.Dst
+	m.publishProgress(record.ID, "completed", &srcStats, &dstStats)
+	m.closeSubscribers(record.ID)
 }
 
 func (m *Manager) recordToStatus(r *MigrationRecord) Status {
