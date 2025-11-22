@@ -3,8 +3,8 @@ module github.com/Project-Sylos/Sylos-API
 go 1.24.2
 
 require (
-	github.com/Project-Sylos/Migration-Engine v0.1.0
-	github.com/Project-Sylos/Spectra v0.2.53
+	github.com/Project-Sylos/Migration-Engine v0.1.1
+	github.com/Project-Sylos/Spectra v0.2.54
 	github.com/go-chi/chi/v5 v5.2.3
 	github.com/go-chi/cors v1.2.1
 	github.com/golang-jwt/jwt/v5 v5.3.0
@@ -32,5 +32,3 @@ require (
 	golang.org/x/sys v0.29.0 // indirect
 	golang.org/x/text v0.28.0 // indirect
 )
-
-replace github.com/Project-Sylos/Migration-Engine => ../Migration-Engine
