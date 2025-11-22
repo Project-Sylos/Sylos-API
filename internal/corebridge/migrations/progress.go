@@ -76,6 +76,11 @@ func (m *Manager) RunMigration(record *MigrationRecord, srcDef, dstDef services.
 		return
 	}
 
+	// Note: We do NOT call cleanup functions here. Once migration.StartMigration() is called,
+	// the migration engine takes ownership of the adapters and handles cleanup itself.
+	// Calling cleanup here would cause double-close issues since adapters share the same
+	// underlying Spectra SDK instance.
+
 	// Store controller in record for programmatic shutdown
 	m.mu.Lock()
 	record.Controller = controller

@@ -449,8 +449,35 @@ func (m *Manager) StartMigration(ctx context.Context, req StartMigrationRequest)
 	}
 
 	opts.DatabasePath = plan.DatabasePath
-	opts.UsePreseededDB = true
-	opts.RemoveExistingDB = false
+
+	// Check if this is a new migration (not a resume)
+	// If IsNewMigration is true, we should start fresh (remove existing DB)
+	metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
+	meta, err := metaMgr.GetMigrationMetadata(migrationID)
+	isNewMigration := true
+	if err == nil {
+		isNewMigration = meta.IsNewMigration
+	} else {
+		// Metadata doesn't exist yet - treat as new migration
+		meta = metadata.MigrationMetadata{
+			ID:             migrationID,
+			Name:           migrationID,
+			IsNewMigration: true,
+		}
+	}
+
+	if isNewMigration {
+		// New migration - start fresh, remove existing DB if it exists
+		opts.UsePreseededDB = false
+		opts.RemoveExistingDB = true
+		m.logger.Info().Str("migration_id", migrationID).Msg("starting new migration (removing existing DB if present)")
+	} else {
+		// Resume existing migration - use existing DB
+		opts.UsePreseededDB = true
+		opts.RemoveExistingDB = false
+		m.logger.Info().Str("migration_id", migrationID).Msg("resuming existing migration")
+	}
+
 	if opts.SourceConnectionID == "" {
 		opts.SourceConnectionID = plan.SourceConnectionID
 	}
@@ -492,6 +519,14 @@ func (m *Manager) StartMigration(ctx context.Context, req StartMigrationRequest)
 	// For now, just store the config path in our minimal metadata
 	if err := m.updateMetadataForMigration(migrationID, migrationID, configPath); err != nil {
 		m.logger.Warn().Err(err).Str("migration_id", migrationID).Msg("failed to update migration metadata")
+	}
+
+	// Clear IsNewMigration flag after migration starts (it's no longer "new")
+	if isNewMigration {
+		meta.IsNewMigration = false
+		if err := metaMgr.UpdateMigrationMetadata(meta); err != nil {
+			m.logger.Warn().Err(err).Str("migration_id", migrationID).Msg("failed to clear IsNewMigration flag")
+		}
 	}
 
 	record := &MigrationRecord{

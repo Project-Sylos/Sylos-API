@@ -191,10 +191,11 @@ type MigrationDBInfo struct {
 // MigrationMetadata represents minimal metadata for a migration
 // The Migration Engine's YAML config file contains all the detailed state
 type MigrationMetadata struct {
-	ID         string    `json:"id"`
-	Name       string    `json:"name"`
-	ConfigPath string    `json:"configPath"` // Path to the Migration Engine's YAML config file
-	CreatedAt  time.Time `json:"createdAt"`
+	ID             string    `json:"id"`
+	Name           string    `json:"name"`
+	ConfigPath     string    `json:"configPath"` // Path to the Migration Engine's YAML config file
+	CreatedAt      time.Time `json:"createdAt"`
+	IsNewMigration bool      `json:"isNewMigration"` // Flag to indicate this is a new migration (not a resume)
 }
 
 type Bridge interface {

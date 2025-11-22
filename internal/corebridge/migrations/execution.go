@@ -18,17 +18,19 @@ func (m *Manager) ExecuteMigration(migrationID string, srcDef, dstDef services.S
 		return nil, err
 	}
 
-	srcAdapter, srcCleanup, err := acquireAdapter(srcDef, srcFolder.Id, opts.SourceConnectionID)
+	srcAdapter, _, err := acquireAdapter(srcDef, srcFolder.Id, opts.SourceConnectionID)
 	if err != nil {
 		return nil, fmt.Errorf("source adapter: %w", err)
 	}
-	defer srcCleanup()
+	// Note: Cleanup functions are not used. Once migration.StartMigration() is called,
+	// the migration engine takes ownership of the adapters and handles cleanup itself.
 
-	dstAdapter, dstCleanup, err := acquireAdapter(dstDef, dstFolder.Id, opts.DestinationConnectionID)
+	dstAdapter, _, err := acquireAdapter(dstDef, dstFolder.Id, opts.DestinationConnectionID)
 	if err != nil {
 		return nil, fmt.Errorf("destination adapter: %w", err)
 	}
-	defer dstCleanup()
+	// Note: Cleanup functions are not called here. Once migration.StartMigration() is called,
+	// the migration engine takes ownership of the adapters and handles cleanup itself.
 
 	cfg := migration.Config{
 		Database: migration.DatabaseConfig{
@@ -124,23 +126,24 @@ func (m *Manager) ExecuteMigration(migrationID string, srcDef, dstDef services.S
 
 // ExecuteMigrationWithController executes a migration and returns the controller for programmatic shutdown
 // This allows the caller to control when to shutdown the migration
+// The migration engine takes ownership of the adapters and handles cleanup
 func (m *Manager) ExecuteMigrationWithController(migrationID string, srcDef, dstDef services.ServiceDefinition, srcFolder, dstFolder fsservices.Folder, opts MigrationOptions, resolveDBPath func(path, migrationID string) (string, error), acquireAdapter func(services.ServiceDefinition, string, string) (fsservices.FSAdapter, func(), error)) (*migration.MigrationController, error) {
 	dbPath, err := resolveDBPath(opts.DatabasePath, migrationID)
 	if err != nil {
 		return nil, err
 	}
 
-	srcAdapter, srcCleanup, err := acquireAdapter(srcDef, srcFolder.Id, opts.SourceConnectionID)
+	srcAdapter, _, err := acquireAdapter(srcDef, srcFolder.Id, opts.SourceConnectionID)
 	if err != nil {
 		return nil, fmt.Errorf("source adapter: %w", err)
 	}
-	defer srcCleanup()
+	// Note: Cleanup functions are not used. Once migration.StartMigration() is called,
+	// the migration engine takes ownership of the adapters and handles cleanup itself.
 
-	dstAdapter, dstCleanup, err := acquireAdapter(dstDef, dstFolder.Id, opts.DestinationConnectionID)
+	dstAdapter, _, err := acquireAdapter(dstDef, dstFolder.Id, opts.DestinationConnectionID)
 	if err != nil {
 		return nil, fmt.Errorf("destination adapter: %w", err)
 	}
-	defer dstCleanup()
 
 	cfg := migration.Config{
 		Database: migration.DatabaseConfig{
@@ -201,6 +204,7 @@ func (m *Manager) ExecuteMigrationWithController(migrationID string, srcDef, dst
 
 	// StartMigration runs the migration asynchronously and returns a controller
 	// The Migration Engine will automatically detect and resume in-progress migrations
+	// At this point, the migration engine takes ownership of the adapters and will handle cleanup
 	controller := migration.StartMigration(cfg)
 
 	return controller, nil

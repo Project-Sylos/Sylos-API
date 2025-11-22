@@ -101,6 +101,34 @@ func (m *Manager) SetRoot(ctx context.Context, req SetRootRequest) (SetRootRespo
 	if err != nil {
 		return SetRootResponse{}, err
 	}
+
+	// Update metadata in migrations.yaml when roots are set
+	// When source root is set, create new migration entry with IsNewMigration=true
+	// When destination root is set, update existing entry (keep IsNewMigration flag)
+	metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
+	existingMeta, err := metaMgr.GetMigrationMetadata(resp.MigrationID)
+	isNewMigration := true
+	if err == nil {
+		// Migration already exists - preserve IsNewMigration flag if it was set
+		isNewMigration = existingMeta.IsNewMigration
+	}
+
+	// Determine config path (will be set when migration starts, but we can prepare it)
+	var configPath string
+	if resp.DatabasePath != "" {
+		configPath = database.ConfigPathFromDatabasePath(resp.DatabasePath)
+	}
+
+	meta := metadata.MigrationMetadata{
+		ID:             resp.MigrationID,
+		Name:           resp.MigrationID, // Default to ID, user can change later
+		ConfigPath:     configPath,
+		IsNewMigration: isNewMigration,
+	}
+	if err := metaMgr.UpdateMigrationMetadata(meta); err != nil {
+		m.logger.Warn().Err(err).Str("migration_id", resp.MigrationID).Msg("failed to update migration metadata when setting root")
+	}
+
 	return SetRootResponse{
 		MigrationID:             resp.MigrationID,
 		Role:                    resp.Role,
