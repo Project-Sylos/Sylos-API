@@ -176,11 +176,49 @@ func NewManager(logger zerolog.Logger, cfg config.Config, serviceMgr *services.S
 	}
 }
 
+// checkYAMLStatus checks the status from the YAML config file and returns an error if migration cannot be started
+// Returns nil if migration can proceed (suspended, failed, or no YAML found), error if it cannot (running, completed)
+func (m *Manager) checkYAMLStatus(migrationID string, configPath string) error {
+	// Check if config file exists
+	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+		// No YAML file - migration can proceed (new migration)
+		return nil
+	}
+
+	// Load the YAML config directly (without adapters) to check status
+	yamlCfg, err := migration.LoadMigrationConfig(configPath)
+	if err != nil {
+		// If we can't load the YAML, allow migration to proceed (might be corrupted, will be overwritten)
+		return nil
+	}
+
+	// Check the state.status field from the loaded YAML config
+	status := strings.ToLower(strings.TrimSpace(yamlCfg.State.Status))
+
+	switch status {
+	case "running":
+		return fmt.Errorf("migration %s is already running", migrationID)
+	case "completed":
+		return fmt.Errorf("migration %s has already completed", migrationID)
+	case "suspended", "failed":
+		// Suspended and failed migrations can be rerun
+		return nil
+	default:
+		// Unknown status or empty - allow migration to proceed
+		return nil
+	}
+}
+
 // LoadMigrationFromConfigPath loads and resumes a migration from its YAML config file path
 func (m *Manager) LoadMigrationFromConfigPath(ctx context.Context, migrationID, configPath string) (Migration, error) {
 	// Check if config file exists
 	if _, err := os.Stat(configPath); os.IsNotExist(err) {
 		return Migration{}, fmt.Errorf("migration config file not found: %s", configPath)
+	}
+
+	// Check YAML status before proceeding
+	if err := m.checkYAMLStatus(migrationID, configPath); err != nil {
+		return Migration{}, err
 	}
 
 	// Check if Spectra override config exists
@@ -208,6 +246,15 @@ func (m *Manager) LoadMigrationFromConfigPath(ctx context.Context, migrationID, 
 		return Migration{}, fmt.Errorf("migration database file not found: %s", dbPath)
 	}
 
+	// CRITICAL: Force RemoveExisting to false for resumption (same as test logic)
+	// The YAML might have remove_existing: true, but we must never remove existing DB when resuming
+	cfg.Database.RemoveExisting = false
+
+	// CRITICAL: Ensure SeedRoots is set (same as test logic)
+	// StartMigration will only use it if DB is empty, so it's safe to set to true
+	// The YAML might have seed_roots: false, but we should set it to true for consistency
+	cfg.SeedRoots = true
+
 	// Create migration options with defaults
 	opts := MigrationOptions{
 		MigrationID:      migrationID,
@@ -228,9 +275,15 @@ func (m *Manager) LoadMigrationFromConfigPath(ctx context.Context, migrationID, 
 	}
 
 	m.mu.Lock()
-	if _, exists := m.migrations[migrationID]; exists {
-		m.mu.Unlock()
-		return Migration{}, fmt.Errorf("migration %s is already running", migrationID)
+	existing, exists := m.migrations[migrationID]
+	if exists {
+		// Check if the existing migration is actually running (has controller or status is running)
+		if existing.Controller != nil || existing.Status == MigrationStatusRunning {
+			m.mu.Unlock()
+			return Migration{}, fmt.Errorf("migration %s is already running", migrationID)
+		}
+		// If it's suspended or failed, we can resume it - remove the old record
+		// The YAML status check already validated it's safe to resume
 	}
 	m.migrations[migrationID] = record
 	if _, ok := m.subscribers[migrationID]; !ok {
@@ -308,12 +361,26 @@ func (m *Manager) StartMigration(ctx context.Context, req StartMigrationRequest)
 			spectraConfigPath = overridePath
 		}
 
+		// Check YAML status before proceeding
+		if err := m.checkYAMLStatus(migrationID, configPath); err != nil {
+			return Migration{}, err
+		}
+
 		// Try loading YAML config to reconstruct migration config
 		adapterFactory := m.createAdapterFactory(spectraConfigPath)
 		cfg, err := migration.LoadMigrationConfigFromYAML(configPath, adapterFactory)
 		if err == nil {
 			// Successfully reconstructed config - use it to resume migration
 			// The config already has all service info, roots, etc.
+
+			// CRITICAL: Force RemoveExisting to false for resumption (same as test logic)
+			// The YAML might have remove_existing: true, but we must never remove existing DB when resuming
+			cfg.Database.RemoveExisting = false
+
+			// CRITICAL: Ensure SeedRoots is set (same as test logic)
+			// StartMigration will only use it if DB is empty, so it's safe to set to true
+			cfg.SeedRoots = true
+
 			opts.UsePreseededDB = true
 			opts.RemoveExistingDB = false
 			if opts.LogAddress == "" {
@@ -334,7 +401,7 @@ func (m *Manager) StartMigration(ctx context.Context, req StartMigrationRequest)
 			m.mu.Lock()
 			if _, exists := m.migrations[migrationID]; exists {
 				m.mu.Unlock()
-				return Migration{}, fmt.Errorf("migration %s already exists", migrationID)
+				return Migration{}, fmt.Errorf("migration %s is already running", migrationID)
 			}
 			m.migrations[migrationID] = record
 			if _, ok := m.subscribers[migrationID]; !ok {
@@ -387,6 +454,13 @@ func (m *Manager) StartMigration(ctx context.Context, req StartMigrationRequest)
 			opts.LogLevel = m.cfg.Runtime.LogLevel
 		}
 
+		// Check YAML status if config exists
+		if _, err := os.Stat(configPath); err == nil {
+			if err := m.checkYAMLStatus(migrationID, configPath); err != nil {
+				return Migration{}, err
+			}
+		}
+
 		record := &MigrationRecord{
 			ID:            migrationID,
 			SourceID:      srcDef.ID,
@@ -398,7 +472,7 @@ func (m *Manager) StartMigration(ctx context.Context, req StartMigrationRequest)
 		m.mu.Lock()
 		if _, exists := m.migrations[migrationID]; exists {
 			m.mu.Unlock()
-			return Migration{}, fmt.Errorf("migration %s already exists", migrationID)
+			return Migration{}, fmt.Errorf("migration %s is already running", migrationID)
 		}
 		m.migrations[migrationID] = record
 		if _, ok := m.subscribers[migrationID]; !ok {
@@ -467,10 +541,10 @@ func (m *Manager) StartMigration(ctx context.Context, req StartMigrationRequest)
 	}
 
 	if isNewMigration {
-		// New migration - start fresh, remove existing DB if it exists
+		// New migration - start fresh
 		opts.UsePreseededDB = false
-		opts.RemoveExistingDB = true
-		m.logger.Info().Str("migration_id", migrationID).Msg("starting new migration (removing existing DB if present)")
+		opts.RemoveExistingDB = false // Always false - anti-pattern to remove existing DB
+		m.logger.Info().Str("migration_id", migrationID).Msg("starting new migration")
 	} else {
 		// Resume existing migration - use existing DB
 		opts.UsePreseededDB = true
@@ -515,6 +589,13 @@ func (m *Manager) StartMigration(ctx context.Context, req StartMigrationRequest)
 	// Create Migration Engine YAML config file
 	configPath := corebridgeDB.ConfigPathFromDatabasePath(plan.DatabasePath)
 
+	// Check YAML status before proceeding (if YAML exists)
+	if _, err := os.Stat(configPath); err == nil {
+		if err := m.checkYAMLStatus(migrationID, configPath); err != nil {
+			return Migration{}, err
+		}
+	}
+
 	// The Migration Engine will create/update the YAML config during migration execution
 	// For now, just store the config path in our minimal metadata
 	if err := m.updateMetadataForMigration(migrationID, migrationID, configPath); err != nil {
@@ -540,7 +621,7 @@ func (m *Manager) StartMigration(ctx context.Context, req StartMigrationRequest)
 	m.mu.Lock()
 	if _, exists := m.migrations[migrationID]; exists {
 		m.mu.Unlock()
-		return Migration{}, fmt.Errorf("migration %s already exists", migrationID)
+		return Migration{}, fmt.Errorf("migration %s is already running", migrationID)
 	}
 	m.migrations[migrationID] = record
 	if _, ok := m.subscribers[migrationID]; !ok {
@@ -888,6 +969,7 @@ func (m *Manager) ExecuteMigrationFromConfig(cfg migration.Config, opts Migratio
 			}()
 			_ = logservice.LS.Close()
 		}()
+		logservice.LS = nil
 	}
 
 	// Check if migration was suspended (clean shutdown)
@@ -906,6 +988,13 @@ func (m *Manager) ExecuteMigrationFromConfig(cfg migration.Config, opts Migratio
 // ExecuteMigrationFromConfigWithController executes a migration using a pre-constructed migration.Config
 // and returns the controller for programmatic shutdown
 func (m *Manager) ExecuteMigrationFromConfigWithController(cfg migration.Config, opts MigrationOptions) (*migration.MigrationController, error) {
+	// CRITICAL: Always force RemoveExisting to false (anti-pattern to remove existing DB)
+	cfg.Database.RemoveExisting = false
+
+	// CRITICAL: Ensure SeedRoots is set (same as test logic)
+	// StartMigration will only use it if DB is empty, so it's safe to set to true
+	cfg.SeedRoots = true
+
 	// Update config with options if needed
 	if opts.WorkerCount > 0 {
 		cfg.WorkerCount = opts.WorkerCount
@@ -925,6 +1014,7 @@ func (m *Manager) ExecuteMigrationFromConfigWithController(cfg migration.Config,
 	cfg.SkipListener = !m.shouldEnableLoggingTerminal(opts)
 
 	// StartMigration runs the migration asynchronously and returns a controller
+	// It will automatically detect and resume from suspended state if DB exists
 	controller := migration.StartMigration(cfg)
 
 	return controller, nil

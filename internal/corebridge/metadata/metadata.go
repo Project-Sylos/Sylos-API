@@ -170,6 +170,7 @@ func (m *Manager) DeleteMigrationMetadata(migrationID string) error {
 }
 
 // ListAllMigrations returns all migration metadata
+// Validates that config files exist and removes invalid entries from migrations.yaml
 func (m *Manager) ListAllMigrations() ([]MigrationMetadata, error) {
 	all, err := m.LoadAllMetadata()
 	if err != nil {
@@ -177,8 +178,33 @@ func (m *Manager) ListAllMigrations() ([]MigrationMetadata, error) {
 	}
 
 	result := make([]MigrationMetadata, 0, len(all.Migrations))
-	for _, meta := range all.Migrations {
-		result = append(result, meta)
+	validMigrations := make(map[string]MigrationMetadata)
+	needsUpdate := false
+
+	for id, meta := range all.Migrations {
+		// Check if config file exists
+		if meta.ConfigPath != "" {
+			if _, err := os.Stat(meta.ConfigPath); err == nil {
+				// Config file exists - include in result
+				result = append(result, meta)
+				validMigrations[id] = meta
+			} else {
+				// Config file missing - skip and mark for removal
+				needsUpdate = true
+			}
+		} else {
+			// No config path - skip and mark for removal
+			needsUpdate = true
+		}
+	}
+
+	// Update migrations.yaml if we found invalid entries
+	if needsUpdate {
+		all.Migrations = validMigrations
+		if err := m.SaveAllMetadata(all); err != nil {
+			// Log error but still return valid migrations
+			// We don't want to fail the entire request if cleanup fails
+		}
 	}
 
 	return result, nil

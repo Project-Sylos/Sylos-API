@@ -108,6 +108,8 @@ func (m *Manager) ExecuteMigration(migrationID string, srcDef, dstDef services.S
 			}()
 			_ = logservice.LS.Close()
 		}()
+		// Allow Migration Engine to recreate the global logger on next run
+		logservice.LS = nil
 	}
 
 	// Check if migration was suspended (clean shutdown)

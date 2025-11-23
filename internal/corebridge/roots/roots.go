@@ -333,7 +333,7 @@ func (m *Manager) SeedPlanIfReady(migrationID string) (bool, migration.RootSeedS
 	// Database doesn't exist or has invalid schema - create fresh and seed roots
 	database, wasFresh, err := migration.SetupDatabase(migration.DatabaseConfig{
 		Path:           dbPath,
-		RemoveExisting: true,
+		RemoveExisting: false, // Always false - anti-pattern to remove existing DB
 	})
 	if err != nil {
 		m.mu.Lock()
