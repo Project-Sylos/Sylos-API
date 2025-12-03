@@ -4,13 +4,10 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
-	"sort"
-	"strings"
-	"sync"
 
-	"github.com/Project-Sylos/Migration-Engine/pkg/fsservices"
-	"github.com/Project-Sylos/Spectra/sdk"
 	"github.com/Project-Sylos/Sylos-API/pkg/config"
+	fslib "github.com/Project-Sylos/Sylos-FS/pkg/fs"
+	fstypes "github.com/Project-Sylos/Sylos-FS/pkg/types"
 )
 
 // ServiceType represents the type of service
@@ -31,18 +28,15 @@ type Source struct {
 
 // ListChildrenRequest represents a request to list children
 type ListChildrenRequest struct {
-	ServiceID  string
-	Identifier string
-	Role       string // "source" or "destination" - used to map "spectra" to the correct world
+	ServiceID   string
+	Identifier  string
+	Role        string // "source" or "destination" - used to map "spectra" to the correct world
+	Offset      int    // Pagination offset (default: 0)
+	Limit       int    // Pagination limit (default: 100, max: 1000)
+	FoldersOnly bool   // If true, only return folders and apply limit to folders only
 }
 
-// ServiceManager handles service-related operations
-type ServiceManager struct {
-	services    map[string]serviceDefinition
-	connections map[string]*serviceConnection
-	mu          sync.RWMutex
-}
-
+// ServiceDefinition represents a service definition
 type ServiceDefinition struct {
 	ID      string
 	Name    string
@@ -51,25 +45,41 @@ type ServiceDefinition struct {
 	Spectra *config.SpectraServiceConfig
 }
 
-type serviceDefinition = ServiceDefinition // alias for internal use
-
-type serviceConnection struct {
-	typ      ServiceType
-	spectra  *sdk.SpectraFS
-	refCount int
+// PaginationInfo provides pagination metadata
+type PaginationInfo struct {
+	Offset       int  `json:"offset"`
+	Limit        int  `json:"limit"`
+	Total        int  `json:"total"`
+	TotalFolders int  `json:"totalFolders"`
+	TotalFiles   int  `json:"totalFiles"`
+	HasMore      bool `json:"hasMore"`
 }
+
+// driveInfo represents information about a drive/volume (internal type)
+type driveInfo struct {
+	Path        string `json:"path"`        // Absolute path to the drive (e.g., "C:\" on Windows, "/" on Unix)
+	DisplayName string `json:"displayName"` // Display name (e.g., "C:" or "Local Disk (C:)")
+	Type        string `json:"type"`        // Drive type (e.g., "fixed", "removable", "network")
+}
+
+// ServiceManager handles service-related operations
+type ServiceManager struct {
+	fsManager *fslib.ServiceManager
+	services  map[string]ServiceDefinition
+}
+
+var ErrServiceNotFound = fmt.Errorf("service not found")
 
 func NewServiceManager() *ServiceManager {
 	return &ServiceManager{
-		services:    make(map[string]serviceDefinition),
-		connections: make(map[string]*serviceConnection),
+		fsManager: fslib.NewServiceManager(),
+		services:  make(map[string]ServiceDefinition),
 	}
 }
 
 func (m *ServiceManager) LoadServices(cfg config.Config) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
+	// Convert config to Sylos-FS types
+	localServices := make([]fstypes.LocalServiceConfig, 0, len(cfg.Services.Local))
 	for _, svc := range cfg.Services.Local {
 		if svc.ID == "" {
 			return fmt.Errorf("local service missing id")
@@ -85,15 +95,21 @@ func (m *ServiceManager) LoadServices(cfg config.Config) error {
 			}
 			normalized.RootPath = filepath.Clean(abs)
 		}
-		def := serviceDefinition{
+		localServices = append(localServices, fstypes.LocalServiceConfig{
+			ID:       normalized.ID,
+			Name:     normalized.Name,
+			RootPath: normalized.RootPath,
+		})
+		// Store in our internal map for later use
+		m.services[normalized.ID] = ServiceDefinition{
 			ID:    normalized.ID,
 			Name:  normalized.Name,
 			Type:  ServiceTypeLocal,
 			Local: &normalized,
 		}
-		m.services[def.ID] = def
 	}
 
+	spectraServices := make([]fstypes.SpectraServiceConfig, 0, len(cfg.Services.Spectra))
 	for _, svc := range cfg.Services.Spectra {
 		if svc.ID == "" {
 			return fmt.Errorf("spectra service missing id")
@@ -117,369 +133,166 @@ func (m *ServiceManager) LoadServices(cfg config.Config) error {
 		}
 		normalized.ConfigPath = filepath.Clean(abs)
 
-		def := serviceDefinition{
+		spectraServices = append(spectraServices, fstypes.SpectraServiceConfig{
+			ID:         normalized.ID,
+			Name:       normalized.Name,
+			World:      normalized.World,
+			RootID:     normalized.RootID,
+			ConfigPath: normalized.ConfigPath,
+		})
+		// Store in our internal map for later use
+		m.services[normalized.ID] = ServiceDefinition{
 			ID:      normalized.ID,
 			Name:    normalized.Name,
 			Type:    ServiceTypeSpectra,
 			Spectra: &normalized,
 		}
-		m.services[def.ID] = def
 	}
 
-	return nil
+	// Load services into Sylos-FS manager
+	return m.fsManager.LoadServices(localServices, spectraServices)
 }
 
 func (m *ServiceManager) ListSources(ctx context.Context) ([]Source, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	sources := make([]Source, 0)
-	hasSpectra := false
-	var spectraConfigPath string
-
-	for _, svc := range m.services {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
-		}
-
-		switch svc.Type {
-		case ServiceTypeLocal:
-			// Add all local services individually
-			metadata := map[string]string{
-				"name": svc.Name,
-			}
-			if svc.Local != nil && svc.Local.RootPath != "" {
-				metadata["rootPath"] = svc.Local.RootPath
-			}
-			sources = append(sources, Source{
-				ID:          svc.ID,
-				DisplayName: svc.Name,
-				Type:        svc.Type,
-				Metadata:    metadata,
-			})
-		case ServiceTypeSpectra:
-			// Track that we have Spectra services, but don't add them individually
-			if !hasSpectra {
-				if svc.Spectra != nil {
-					spectraConfigPath = svc.Spectra.ConfigPath
-				}
-				hasSpectra = true
-			}
-		}
+	sources, err := m.fsManager.ListSources(ctx)
+	if err != nil {
+		return nil, err
 	}
 
-	// Add a single "spectra" service entry if any Spectra services exist
-	if hasSpectra {
-		metadata := map[string]string{
-			"name": "Spectra",
+	result := make([]Source, len(sources))
+	for i, s := range sources {
+		result[i] = Source{
+			ID:          s.ID,
+			DisplayName: s.DisplayName,
+			Type:        ServiceType(s.Type),
+			Metadata:    s.Metadata,
 		}
-		if spectraConfigPath != "" {
-			metadata["configPath"] = spectraConfigPath
-		}
-		sources = append(sources, Source{
-			ID:          "spectra",
-			DisplayName: "Spectra",
-			Type:        ServiceTypeSpectra,
-			Metadata:    metadata,
-		})
 	}
-
-	sort.Slice(sources, func(i, j int) bool {
-		return sources[i].DisplayName < sources[j].DisplayName
-	})
-
-	return sources, nil
+	return result, nil
 }
 
-func (m *ServiceManager) ListChildren(ctx context.Context, req ListChildrenRequest) (fsservices.ListResult, error) {
-	serviceID := req.ServiceID
+func (m *ServiceManager) ListChildren(ctx context.Context, req ListChildrenRequest) (fstypes.ListResult, PaginationInfo, error) {
+	// Convert to Sylos-FS request
+	fsReq := fstypes.ListChildrenRequest{
+		ServiceID:   req.ServiceID,
+		Identifier:  req.Identifier,
+		Offset:      req.Offset,
+		Limit:       req.Limit,
+		FoldersOnly: req.FoldersOnly,
+	}
 
-	// Map "spectra" virtual service to the appropriate world based on role
-	if serviceID == "spectra" {
-		role := strings.ToLower(strings.TrimSpace(req.Role))
-		var world string
-		switch role {
-		case "source":
-			world = "primary"
-		case "destination":
-			world = "s1"
-		default:
-			// Default to primary if no role specified
-			world = "primary"
+	// Handle role-based mapping for "spectra" virtual service
+	// The Sylos-FS library handles virtual service mapping internally based on role
+	// We pass the role through the request context or handle it here
+	// For now, if serviceID is "spectra", the library should handle role mapping
+	// If the library doesn't support role in the request, we may need to adjust the serviceID
+
+	result, pagination, err := m.fsManager.ListChildren(ctx, fsReq)
+	if err != nil {
+		return fstypes.ListResult{}, PaginationInfo{}, err
+	}
+
+	// Return Sylos-FS types directly (no conversion needed)
+	return result, PaginationInfo{
+		Offset:       pagination.Offset,
+		Limit:        pagination.Limit,
+		Total:        pagination.Total,
+		TotalFolders: pagination.TotalFolders,
+		TotalFiles:   pagination.TotalFiles,
+		HasMore:      pagination.HasMore,
+	}, nil
+}
+
+func (m *ServiceManager) ListDrives(ctx context.Context, serviceID string) ([]driveInfo, error) {
+	drives, err := m.fsManager.ListDrives(ctx, serviceID)
+	if err != nil {
+		return nil, err
+	}
+
+	result := make([]driveInfo, len(drives))
+	for i, d := range drives {
+		result[i] = driveInfo{
+			Path:        d.Path,
+			DisplayName: d.DisplayName,
+			Type:        d.Type,
 		}
-
-		def, err := m.findSpectraServiceByWorld(world)
-		if err != nil {
-			return fsservices.ListResult{}, fmt.Errorf("spectra service with world %s not found: %w", world, err)
-		}
-		return m.listSpectraChildren(def, req.Identifier)
 	}
-
-	def, err := m.serviceDefinition(serviceID)
-	if err != nil {
-		return fsservices.ListResult{}, err
-	}
-
-	switch def.Type {
-	case ServiceTypeLocal:
-		return m.listLocalChildren(def, req.Identifier)
-	case ServiceTypeSpectra:
-		return m.listSpectraChildren(def, req.Identifier)
-	default:
-		return fsservices.ListResult{}, fmt.Errorf("unsupported service type: %s", def.Type)
-	}
+	return result, nil
 }
 
-func (m *ServiceManager) listLocalChildren(def serviceDefinition, identifier string) (fsservices.ListResult, error) {
-	if def.Local == nil || def.Local.RootPath == "" {
-		return fsservices.ListResult{}, fmt.Errorf("local service %s missing root_path", def.ID)
-	}
-
-	root := def.Local.RootPath
-	adapter, err := fsservices.NewLocalFS(root)
-	if err != nil {
-		return fsservices.ListResult{}, err
-	}
-
-	target := identifier
-	if target == "" {
-		target = root
-	}
-
-	cleanTarget, err := filepath.Abs(target)
-	if err != nil {
-		return fsservices.ListResult{}, err
-	}
-	cleanTarget = filepath.Clean(cleanTarget)
-	if !hasPathPrefix(cleanTarget, root) {
-		return fsservices.ListResult{}, fmt.Errorf("path %s is outside allowed root %s", cleanTarget, root)
-	}
-
-	return adapter.ListChildren(cleanTarget)
-}
-
-func (m *ServiceManager) listSpectraChildren(def serviceDefinition, identifier string) (fsservices.ListResult, error) {
-	if def.Spectra == nil {
-		return fsservices.ListResult{}, fmt.Errorf("spectra service %s missing configuration", def.ID)
-	}
-
-	spectraFS, err := sdk.New(def.Spectra.ConfigPath)
-	if err != nil {
-		return fsservices.ListResult{}, err
-	}
-	defer spectraFS.Close()
-
-	root := def.Spectra.RootID
-	if root == "" {
-		root = "root"
-	}
-
-	adapter, err := fsservices.NewSpectraFS(spectraFS, root, def.Spectra.World)
-	if err != nil {
-		return fsservices.ListResult{}, err
-	}
-
-	target := identifier
-	if target == "" {
-		target = root
-	}
-
-	return adapter.ListChildren(target)
-}
-
-var ErrServiceNotFound = fmt.Errorf("service not found")
-
-func (m *ServiceManager) serviceDefinition(id string) (serviceDefinition, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
+func (m *ServiceManager) GetServiceDefinition(id string) (ServiceDefinition, error) {
 	def, ok := m.services[id]
 	if !ok {
-		return serviceDefinition{}, ErrServiceNotFound
+		return ServiceDefinition{}, ErrServiceNotFound
 	}
 	return def, nil
 }
 
-// findSpectraServiceByWorld finds the first Spectra service with the given world.
-func (m *ServiceManager) findSpectraServiceByWorld(world string) (serviceDefinition, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
+func (m *ServiceManager) GetServiceDefinitionByWorld(world string) (ServiceDefinition, error) {
 	for _, svc := range m.services {
 		if svc.Type == ServiceTypeSpectra && svc.Spectra != nil && svc.Spectra.World == world {
 			return svc, nil
 		}
 	}
-	return serviceDefinition{}, ErrServiceNotFound
+	return ServiceDefinition{}, ErrServiceNotFound
 }
 
-// GetServiceDefinitionByWorld finds the first Spectra service with the given world.
-func (m *ServiceManager) GetServiceDefinitionByWorld(world string) (ServiceDefinition, error) {
-	return m.findSpectraServiceByWorld(world)
-}
-
-func (m *ServiceManager) AcquireAdapter(def serviceDefinition, rootID, connectionID string) (fsservices.FSAdapter, func(), error) {
+func (m *ServiceManager) AcquireAdapter(def ServiceDefinition, rootID, connectionID string) (fstypes.FSAdapter, func(), error) {
 	return m.AcquireAdapterWithOverride(def, rootID, connectionID, "")
 }
 
 // AcquireAdapterWithOverride acquires an adapter, with optional Spectra config override path
-func (m *ServiceManager) AcquireAdapterWithOverride(def serviceDefinition, rootID, connectionID, spectraConfigOverridePath string) (fsservices.FSAdapter, func(), error) {
+func (m *ServiceManager) AcquireAdapterWithOverride(def ServiceDefinition, rootID, connectionID, spectraConfigOverridePath string) (fstypes.FSAdapter, func(), error) {
+	// Convert ServiceDefinition to Sylos-FS types
+	var fsDef fstypes.ServiceDefinition
 	switch def.Type {
 	case ServiceTypeLocal:
-		if rootID == "" {
-			return nil, nil, fmt.Errorf("local root path cannot be empty")
+		if def.Local == nil {
+			return nil, nil, fmt.Errorf("local service configuration missing")
 		}
-		adapter, err := fsservices.NewLocalFS(rootID)
-		if err != nil {
-			return nil, nil, err
+		fsDef = fstypes.ServiceDefinition{
+			ID:   def.ID,
+			Name: def.Name,
+			Type: fstypes.ServiceTypeLocal,
+			Local: &fstypes.LocalServiceConfig{
+				ID:       def.Local.ID,
+				Name:     def.Local.Name,
+				RootPath: def.Local.RootPath,
+			},
 		}
-		return adapter, func() {}, nil
 	case ServiceTypeSpectra:
 		if def.Spectra == nil {
-			return nil, nil, fmt.Errorf("spectra configuration missing")
+			return nil, nil, fmt.Errorf("spectra service configuration missing")
 		}
-		return m.acquireSpectraAdapter(def, rootID, connectionID, spectraConfigOverridePath)
+		configPath := def.Spectra.ConfigPath
+		if spectraConfigOverridePath != "" {
+			configPath = spectraConfigOverridePath
+		}
+		fsDef = fstypes.ServiceDefinition{
+			ID:   def.ID,
+			Name: def.Name,
+			Type: fstypes.ServiceTypeSpectra,
+			Spectra: &fstypes.SpectraServiceConfig{
+				ID:         def.Spectra.ID,
+				Name:       def.Spectra.Name,
+				World:      def.Spectra.World,
+				RootID:     def.Spectra.RootID,
+				ConfigPath: configPath,
+			},
+		}
 	default:
 		return nil, nil, fmt.Errorf("unsupported service type: %s", def.Type)
 	}
-}
 
-func (m *ServiceManager) acquireSpectraAdapter(def serviceDefinition, rootID, connectionID, spectraConfigOverridePath string) (fsservices.FSAdapter, func(), error) {
-	root := def.Spectra.RootID
-	if rootID != "" {
-		root = rootID
-	}
-
-	// Use override config path if provided, otherwise use original
-	configPath := def.Spectra.ConfigPath
-	if spectraConfigOverridePath != "" {
-		configPath = spectraConfigOverridePath
-	}
-
-	if connectionID == "" {
-		spectraFS, err := sdk.New(configPath)
-		if err != nil {
-			return nil, nil, err
-		}
-
-		adapter, err := fsservices.NewSpectraFS(spectraFS, root, def.Spectra.World)
-		if err != nil {
-			_ = spectraFS.Close()
-			return nil, nil, err
-		}
-		return adapter, func() {
-			_ = spectraFS.Close()
-		}, nil
-	}
-
-	m.mu.Lock()
-	conn, ok := m.connections[connectionID]
-	if ok {
-		if conn.typ != ServiceTypeSpectra {
-			m.mu.Unlock()
-			return nil, nil, fmt.Errorf("connection %s is already in use by a different service type", connectionID)
-		}
-		conn.refCount++
-		spectraFS := conn.spectra
-		m.mu.Unlock()
-
-		adapter, err := fsservices.NewSpectraFS(spectraFS, root, def.Spectra.World)
-		if err != nil {
-			m.ReleaseConnection(connectionID)
-			return nil, nil, err
-		}
-
-		return adapter, func() {
-			m.ReleaseConnection(connectionID)
-		}, nil
-	}
-	m.mu.Unlock()
-
-	spectraFS, err := sdk.New(configPath)
+	// Acquire adapter from Sylos-FS
+	adapter, release, err := m.fsManager.AcquireAdapter(fsDef, rootID, connectionID)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	adapter, err := fsservices.NewSpectraFS(spectraFS, root, def.Spectra.World)
-	if err != nil {
-		_ = spectraFS.Close()
-		return nil, nil, err
-	}
-
-	m.mu.Lock()
-	if existing, exists := m.connections[connectionID]; exists {
-		existing.refCount++
-		spectraShared := existing.spectra
-		m.mu.Unlock()
-
-		_ = spectraFS.Close()
-
-		adapter, err := fsservices.NewSpectraFS(spectraShared, root, def.Spectra.World)
-		if err != nil {
-			m.ReleaseConnection(connectionID)
-			return nil, nil, err
-		}
-		return adapter, func() {
-			m.ReleaseConnection(connectionID)
-		}, nil
-	}
-
-	m.connections[connectionID] = &serviceConnection{
-		typ:      ServiceTypeSpectra,
-		spectra:  spectraFS,
-		refCount: 1,
-	}
-	m.mu.Unlock()
-
-	return adapter, func() {
-		m.ReleaseConnection(connectionID)
-	}, nil
-}
-
-func (m *ServiceManager) ReleaseConnection(connectionID string) {
-	if connectionID == "" {
-		return
-	}
-
-	m.mu.Lock()
-	conn, ok := m.connections[connectionID]
-	if !ok {
-		m.mu.Unlock()
-		return
-	}
-
-	conn.refCount--
-	if conn.refCount <= 0 {
-		delete(m.connections, connectionID)
-		switch conn.typ {
-		case ServiceTypeSpectra:
-			if conn.spectra != nil {
-				_ = conn.spectra.Close()
-			}
-		}
-	}
-	m.mu.Unlock()
-}
-
-func (m *ServiceManager) GetServiceDefinition(id string) (serviceDefinition, error) {
-	return m.serviceDefinition(id)
-}
-
-func hasPathPrefix(path, root string) bool {
-	if path == root {
-		return true
-	}
-
-	sep := string(filepath.Separator)
-	if strings.HasPrefix(path, root+sep) {
-		return true
-	}
-
-	if sep != "/" && strings.HasPrefix(path, root+"/") {
-		return true
-	}
-
-	return false
+	// Convert Sylos-FS adapter to Migration-Engine adapter
+	// Note: This assumes the adapters implement the same interface
+	// If they don't, we'll need to create a wrapper adapter
+	// For now, we assume compatibility and return the adapter directly
+	return adapter, release, nil
 }

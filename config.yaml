@@ -12,7 +12,7 @@ runtime:
   default_coordinator_lead: 4
 services:
   local:
-    - id: "local-default"
+    - id: "local"
       name: "Local Filesystem"
       root_path: "/path/to/allowlisted/root"
   spectra:

@@ -8,9 +8,9 @@ import (
 	"sync"
 
 	"github.com/Project-Sylos/Migration-Engine/pkg/db"
-	"github.com/Project-Sylos/Migration-Engine/pkg/fsservices"
 	"github.com/Project-Sylos/Migration-Engine/pkg/migration"
 	"github.com/Project-Sylos/Sylos-API/internal/corebridge/services"
+	fstypes "github.com/Project-Sylos/Sylos-FS/pkg/types"
 	"github.com/rs/xid"
 	"github.com/rs/zerolog"
 )
@@ -60,11 +60,11 @@ type Manager struct {
 type RootPlan struct {
 	HasSource               bool
 	SourceDefinition        services.ServiceDefinition
-	SourceRoot              fsservices.Folder
+	SourceRoot              fstypes.Folder
 	SourceConnectionID      string
 	HasDestination          bool
 	DestinationDefinition   services.ServiceDefinition
-	DestinationRoot         fsservices.Folder
+	DestinationRoot         fstypes.Folder
 	DestinationConnectionID string
 	DatabasePath            string
 	RootSummary             migration.RootSeedSummary
@@ -82,12 +82,12 @@ func NewManager(logger zerolog.Logger, dataDir string, serviceMgr *services.Serv
 	}
 }
 
-func FolderFromDescriptor(desc FolderDescriptor) (fsservices.Folder, error) {
+func FolderFromDescriptor(desc FolderDescriptor) (fstypes.Folder, error) {
 	if desc.ID == "" {
-		return fsservices.Folder{}, fmt.Errorf("folder id cannot be empty")
+		return fstypes.Folder{}, fmt.Errorf("folder id cannot be empty")
 	}
 
-	folder := fsservices.Folder{
+	folder := fstypes.Folder{
 		Id:           desc.ID,
 		ParentId:     desc.ParentID,
 		ParentPath:   desc.ParentPath,
@@ -99,13 +99,13 @@ func FolderFromDescriptor(desc FolderDescriptor) (fsservices.Folder, error) {
 	}
 
 	if folder.DisplayName == "" {
-		folder.DisplayName = folder.Id
+		folder.DisplayName = folder.ID()
 	}
 	if folder.LocationPath == "" {
 		folder.LocationPath = "/"
 	}
 	if folder.Type == "" {
-		folder.Type = fsservices.NodeTypeFolder
+		folder.Type = fstypes.NodeTypeFolder
 	}
 	// LastUpdated will be set by caller if needed
 
@@ -268,7 +268,10 @@ func (m *Manager) SeedPlanIfReady(migrationID string) (bool, migration.RootSeedS
 	// Check if database file already exists
 	if _, err := os.Stat(dbPath); err == nil {
 		// Database exists - validate schema to see if we should skip seeding
-		database, err := db.NewDB(dbPath)
+		options := db.Options{
+			Path: dbPath,
+		}
+		database, err := db.Open(options)
 		if err == nil {
 			// Validate schema - if valid, skip seeding and let LetsMigrate handle resume
 			if err := database.ValidateCoreSchema(); err == nil {
@@ -303,10 +306,10 @@ func (m *Manager) SeedPlanIfReady(migrationID string) (bool, migration.RootSeedS
 					plan.Seeding = false
 					if !plan.HasSource ||
 						plan.SourceDefinition.ID != sourceDef.ID ||
-						plan.SourceRoot.Id != sourceRoot.Id ||
+						plan.SourceRoot.ID() != sourceRoot.ID() ||
 						!plan.HasDestination ||
 						plan.DestinationDefinition.ID != destDef.ID ||
-						plan.DestinationRoot.Id != destRoot.Id {
+						plan.DestinationRoot.ID() != destRoot.ID() {
 						plan.Seeded = false
 						plan.DatabasePath = ""
 						plan.RootSummary = migration.RootSeedSummary{}
@@ -344,7 +347,7 @@ func (m *Manager) SeedPlanIfReady(migrationID string) (bool, migration.RootSeedS
 		return wasFresh, migration.RootSeedSummary{}, "", err
 	}
 
-	summary, seedErr := migration.SeedRootTasks(database, sourceRoot, destRoot)
+	summary, seedErr := migration.SeedRootTasks(sourceRoot, destRoot, database)
 	closeErr := database.Close()
 	if closeErr != nil {
 		m.logger.Warn().Err(closeErr).Msg("failed to close database after seeding roots")
@@ -368,10 +371,10 @@ func (m *Manager) SeedPlanIfReady(migrationID string) (bool, migration.RootSeedS
 	plan.Seeding = false
 	if !plan.HasSource ||
 		plan.SourceDefinition.ID != sourceDef.ID ||
-		plan.SourceRoot.Id != sourceRoot.Id ||
+		plan.SourceRoot.ID() != sourceRoot.ID() ||
 		!plan.HasDestination ||
 		plan.DestinationDefinition.ID != destDef.ID ||
-		plan.DestinationRoot.Id != destRoot.Id {
+		plan.DestinationRoot.ID() != destRoot.ID() {
 		plan.Seeded = false
 		plan.DatabasePath = ""
 		plan.RootSummary = migration.RootSeedSummary{}

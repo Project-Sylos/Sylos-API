@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/Project-Sylos/Migration-Engine/pkg/fsservices"
 	"github.com/Project-Sylos/Migration-Engine/pkg/migration"
 	"github.com/Project-Sylos/Sylos-API/internal/corebridge/database"
 	"github.com/Project-Sylos/Sylos-API/internal/corebridge/metadata"
@@ -71,13 +70,47 @@ func (m *Manager) ListSources(ctx context.Context) ([]Source, error) {
 	return result, nil
 }
 
-func (m *Manager) ListChildren(ctx context.Context, req ListChildrenRequest) (fsservices.ListResult, error) {
+func (m *Manager) ListChildren(ctx context.Context, req ListChildrenRequest) (ListChildrenResponse, error) {
 	svcReq := services.ListChildrenRequest{
-		ServiceID:  req.ServiceID,
-		Identifier: req.Identifier,
-		Role:       req.Role,
+		ServiceID:   req.ServiceID,
+		Identifier:  req.Identifier,
+		Role:        req.Role,
+		Offset:      req.Offset,
+		Limit:       req.Limit,
+		FoldersOnly: req.FoldersOnly,
 	}
-	return m.serviceMgr.ListChildren(ctx, svcReq)
+	result, pagination, err := m.serviceMgr.ListChildren(ctx, svcReq)
+	if err != nil {
+		return ListChildrenResponse{}, err
+	}
+	return ListChildrenResponse{
+		Folders: result.Folders,
+		Files:   result.Files,
+		Pagination: PaginationInfo{
+			Offset:       pagination.Offset,
+			Limit:        pagination.Limit,
+			Total:        pagination.Total,
+			TotalFolders: pagination.TotalFolders,
+			TotalFiles:   pagination.TotalFiles,
+			HasMore:      pagination.HasMore,
+		},
+	}, nil
+}
+
+func (m *Manager) ListDrives(ctx context.Context, serviceID string) ([]DriveInfo, error) {
+	drives, err := m.serviceMgr.ListDrives(ctx, serviceID)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]DriveInfo, len(drives))
+	for i, d := range drives {
+		result[i] = DriveInfo{
+			Path:        d.Path,
+			DisplayName: d.DisplayName,
+			Type:        d.Type,
+		}
+	}
+	return result, nil
 }
 
 func (m *Manager) SetRoot(ctx context.Context, req SetRootRequest) (SetRootResponse, error) {

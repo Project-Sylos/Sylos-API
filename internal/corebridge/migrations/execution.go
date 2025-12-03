@@ -4,28 +4,28 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/Project-Sylos/Migration-Engine/pkg/fsservices"
 	"github.com/Project-Sylos/Migration-Engine/pkg/logservice"
 	"github.com/Project-Sylos/Migration-Engine/pkg/migration"
 	"github.com/Project-Sylos/Migration-Engine/pkg/queue"
 	corebridgeDB "github.com/Project-Sylos/Sylos-API/internal/corebridge/database"
 	"github.com/Project-Sylos/Sylos-API/internal/corebridge/services"
+	fstypes "github.com/Project-Sylos/Sylos-FS/pkg/types"
 )
 
-func (m *Manager) ExecuteMigration(migrationID string, srcDef, dstDef services.ServiceDefinition, srcFolder, dstFolder fsservices.Folder, opts MigrationOptions, resolveDBPath func(path, migrationID string) (string, error), acquireAdapter func(services.ServiceDefinition, string, string) (fsservices.FSAdapter, func(), error)) (*migration.Result, error) {
+func (m *Manager) ExecuteMigration(migrationID string, srcDef, dstDef services.ServiceDefinition, srcFolder, dstFolder fstypes.Folder, opts MigrationOptions, resolveDBPath func(path, migrationID string) (string, error), acquireAdapter func(services.ServiceDefinition, string, string) (fstypes.FSAdapter, func(), error)) (*migration.Result, error) {
 	dbPath, err := resolveDBPath(opts.DatabasePath, migrationID)
 	if err != nil {
 		return nil, err
 	}
 
-	srcAdapter, _, err := acquireAdapter(srcDef, srcFolder.Id, opts.SourceConnectionID)
+	srcAdapter, _, err := acquireAdapter(srcDef, srcFolder.ID(), opts.SourceConnectionID)
 	if err != nil {
 		return nil, fmt.Errorf("source adapter: %w", err)
 	}
 	// Note: Cleanup functions are not used. Once migration.StartMigration() is called,
 	// the migration engine takes ownership of the adapters and handles cleanup itself.
 
-	dstAdapter, _, err := acquireAdapter(dstDef, dstFolder.Id, opts.DestinationConnectionID)
+	dstAdapter, _, err := acquireAdapter(dstDef, dstFolder.ID(), opts.DestinationConnectionID)
 	if err != nil {
 		return nil, fmt.Errorf("destination adapter: %w", err)
 	}
@@ -53,11 +53,7 @@ func (m *Manager) ExecuteMigration(migrationID string, srcDef, dstDef services.S
 		SkipListener:    !m.shouldEnableLoggingTerminal(opts), // SDK will spawn terminal when SkipListener is false
 		StartupDelay:    time.Duration(opts.StartupDelaySec) * time.Second,
 		ProgressTick:    time.Duration(opts.ProgressTickMillis) * time.Millisecond,
-		Verification: migration.VerifyOptions{
-			AllowPending:  opts.Verification.AllowPending,
-			AllowFailed:   opts.Verification.AllowFailed,
-			AllowNotOnSrc: opts.Verification.AllowNotOnSrc,
-		},
+		Verification:    m.selectVerificationOptions(opts.Verification),
 	}
 
 	if cfg.StartupDelay == 0 {
@@ -129,20 +125,20 @@ func (m *Manager) ExecuteMigration(migrationID string, srcDef, dstDef services.S
 // ExecuteMigrationWithController executes a migration and returns the controller for programmatic shutdown
 // This allows the caller to control when to shutdown the migration
 // The migration engine takes ownership of the adapters and handles cleanup
-func (m *Manager) ExecuteMigrationWithController(migrationID string, srcDef, dstDef services.ServiceDefinition, srcFolder, dstFolder fsservices.Folder, opts MigrationOptions, resolveDBPath func(path, migrationID string) (string, error), acquireAdapter func(services.ServiceDefinition, string, string) (fsservices.FSAdapter, func(), error)) (*migration.MigrationController, error) {
+func (m *Manager) ExecuteMigrationWithController(migrationID string, srcDef, dstDef services.ServiceDefinition, srcFolder, dstFolder fstypes.Folder, opts MigrationOptions, resolveDBPath func(path, migrationID string) (string, error), acquireAdapter func(services.ServiceDefinition, string, string) (fstypes.FSAdapter, func(), error)) (*migration.MigrationController, error) {
 	dbPath, err := resolveDBPath(opts.DatabasePath, migrationID)
 	if err != nil {
 		return nil, err
 	}
 
-	srcAdapter, _, err := acquireAdapter(srcDef, srcFolder.Id, opts.SourceConnectionID)
+	srcAdapter, _, err := acquireAdapter(srcDef, srcFolder.ID(), opts.SourceConnectionID)
 	if err != nil {
 		return nil, fmt.Errorf("source adapter: %w", err)
 	}
 	// Note: Cleanup functions are not used. Once migration.StartMigration() is called,
 	// the migration engine takes ownership of the adapters and handles cleanup itself.
 
-	dstAdapter, _, err := acquireAdapter(dstDef, dstFolder.Id, opts.DestinationConnectionID)
+	dstAdapter, _, err := acquireAdapter(dstDef, dstFolder.ID(), opts.DestinationConnectionID)
 	if err != nil {
 		return nil, fmt.Errorf("destination adapter: %w", err)
 	}
@@ -168,11 +164,7 @@ func (m *Manager) ExecuteMigrationWithController(migrationID string, srcDef, dst
 		SkipListener:    !m.shouldEnableLoggingTerminal(opts),
 		StartupDelay:    time.Duration(opts.StartupDelaySec) * time.Second,
 		ProgressTick:    time.Duration(opts.ProgressTickMillis) * time.Millisecond,
-		Verification: migration.VerifyOptions{
-			AllowPending:  opts.Verification.AllowPending,
-			AllowFailed:   opts.Verification.AllowFailed,
-			AllowNotOnSrc: opts.Verification.AllowNotOnSrc,
-		},
+		Verification:    m.selectVerificationOptions(opts.Verification),
 	}
 
 	if cfg.StartupDelay == 0 {
@@ -266,6 +258,45 @@ func (m *Manager) shouldEnableLoggingTerminal(opts MigrationOptions) bool {
 	}
 	// Otherwise use config default
 	return m.cfg.Runtime.EnableLoggingTerminal
+}
+
+// selectVerificationOptions sets default verification options
+// Defaults: AllowPending=false (not allowed), AllowFailed=true (allowed), AllowNotOnSrc=true (allowed)
+// These defaults apply to all migrations unless explicitly overridden
+func (m *Manager) selectVerificationOptions(opts VerificationOptions) migration.VerifyOptions {
+	// Start with defaults
+	verifyOpts := migration.VerifyOptions{
+		// Default: AllowPending is false (pending nodes should not be allowed)
+		AllowPending: false,
+		// Default: AllowFailed is true (failed nodes are allowed)
+		AllowFailed: true,
+		// Default: AllowNotOnSrc is true (nodes on dst but not on src are allowed)
+		AllowNotOnSrc: true,
+	}
+
+	// Apply user-provided options if they were explicitly set
+	// Note: Since Go booleans can't distinguish "not set" from "false", we use a heuristic:
+	// Defaults are: AllowPending=false, AllowFailed=true, AllowNotOnSrc=true
+	// Zero values (not provided) are: AllowPending=false, AllowFailed=false, AllowNotOnSrc=false
+	//
+	// We can detect user-provided options by checking if any value differs from zero values:
+	// - If AllowPending is true, user provided it (zero is false)
+	// - If AllowFailed is true, user provided it (zero is false, default is true)
+	// - If AllowNotOnSrc is true, user provided it (zero is false, default is true)
+	//
+	// If user provided any option, we use all their values (even if some match defaults)
+	// Otherwise, we use our defaults
+	userProvidedOptions := opts.AllowPending || opts.AllowFailed || opts.AllowNotOnSrc
+
+	if userProvidedOptions {
+		// User has provided explicit options, use their values
+		verifyOpts.AllowPending = opts.AllowPending
+		verifyOpts.AllowFailed = opts.AllowFailed
+		verifyOpts.AllowNotOnSrc = opts.AllowNotOnSrc
+	}
+	// Otherwise, use defaults (already set above)
+
+	return verifyOpts
 }
 
 func resultToView(res *migration.Result) *ResultView {

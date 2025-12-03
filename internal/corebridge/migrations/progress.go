@@ -4,9 +4,9 @@ import (
 	"context"
 	"time"
 
-	"github.com/Project-Sylos/Migration-Engine/pkg/fsservices"
 	"github.com/Project-Sylos/Migration-Engine/pkg/queue"
 	"github.com/Project-Sylos/Sylos-API/internal/corebridge/services"
+	fstypes "github.com/Project-Sylos/Sylos-FS/pkg/types"
 	"github.com/rs/xid"
 )
 
@@ -47,7 +47,7 @@ func (m *Manager) SubscribeProgress(ctx context.Context, id string) (<-chan Prog
 	return ch, cancel, nil
 }
 
-func (m *Manager) RunMigration(record *MigrationRecord, srcDef, dstDef services.ServiceDefinition, srcFolder, dstFolder fsservices.Folder, opts MigrationOptions, spectraConfigOverridePath string) {
+func (m *Manager) RunMigration(record *MigrationRecord, srcDef, dstDef services.ServiceDefinition, srcFolder, dstFolder fstypes.Folder, opts MigrationOptions, spectraConfigOverridePath string) {
 	m.logger.Info().
 		Str("migration_id", record.ID).
 		Str("source", srcDef.ID).
@@ -55,7 +55,7 @@ func (m *Manager) RunMigration(record *MigrationRecord, srcDef, dstDef services.
 		Msg("starting migration")
 
 	// Start migration with controller for programmatic shutdown
-	controller, err := m.ExecuteMigrationWithController(record.ID, srcDef, dstDef, srcFolder, dstFolder, opts, m.resolveDBPath, func(def services.ServiceDefinition, rootID, connID string) (fsservices.FSAdapter, func(), error) {
+	controller, err := m.ExecuteMigrationWithController(record.ID, srcDef, dstDef, srcFolder, dstFolder, opts, m.resolveDBPath, func(def services.ServiceDefinition, rootID, connID string) (fstypes.FSAdapter, func(), error) {
 		return m.serviceMgr.AcquireAdapterWithOverride(def, rootID, connID, spectraConfigOverridePath)
 	})
 	if err != nil {

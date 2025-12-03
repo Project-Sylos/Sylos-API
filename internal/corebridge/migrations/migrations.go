@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/Project-Sylos/Migration-Engine/pkg/db"
-	"github.com/Project-Sylos/Migration-Engine/pkg/fsservices"
 	"github.com/Project-Sylos/Migration-Engine/pkg/logservice"
 	"github.com/Project-Sylos/Migration-Engine/pkg/migration"
 	"github.com/Project-Sylos/Spectra/sdk"
@@ -18,6 +17,8 @@ import (
 	"github.com/Project-Sylos/Sylos-API/internal/corebridge/roots"
 	"github.com/Project-Sylos/Sylos-API/internal/corebridge/services"
 	"github.com/Project-Sylos/Sylos-API/pkg/config"
+	fslib "github.com/Project-Sylos/Sylos-FS/pkg/fs"
+	fstypes "github.com/Project-Sylos/Sylos-FS/pkg/types"
 	"github.com/rs/zerolog"
 )
 
@@ -331,7 +332,10 @@ func (m *Manager) StartMigration(ctx context.Context, req StartMigrationRequest)
 		}
 
 		// Check if DB has valid schema and get roots from it
-		database, err := db.NewDB(opts.DatabasePath)
+		options := db.Options{
+			Path: opts.DatabasePath,
+		}
+		database, err := db.Open(options)
 		if err != nil {
 			return Migration{}, fmt.Errorf("failed to open database: %w", err)
 		}
@@ -442,8 +446,8 @@ func (m *Manager) StartMigration(ctx context.Context, req StartMigrationRequest)
 		}
 
 		// Create minimal folder descriptors (not used when resuming from existing DB)
-		srcFolder := fsservices.Folder{Id: "root", LocationPath: "/"}
-		dstFolder := fsservices.Folder{Id: "root", LocationPath: "/"}
+		srcFolder := fstypes.Folder{Id: "root", LocationPath: "/"}
+		dstFolder := fstypes.Folder{Id: "root", LocationPath: "/"}
 
 		opts.UsePreseededDB = true
 		opts.RemoveExistingDB = false
@@ -552,22 +556,10 @@ func (m *Manager) StartMigration(ctx context.Context, req StartMigrationRequest)
 		m.logger.Info().Str("migration_id", migrationID).Msg("resuming existing migration")
 	}
 
-	if opts.SourceConnectionID == "" {
-		opts.SourceConnectionID = plan.SourceConnectionID
-	}
-	if opts.DestinationConnectionID == "" {
-		opts.DestinationConnectionID = plan.DestinationConnectionID
-	}
-	if opts.LogAddress == "" {
-		opts.LogAddress = m.cfg.Runtime.LogAddress
-	}
-	if opts.LogLevel == "" {
-		opts.LogLevel = m.cfg.Runtime.LogLevel
-	}
-
 	// Check if Spectra is used and create config override if needed
 	var spectraConfigPath string
 	isSpectraMigration := plan.SourceDefinition.Type == services.ServiceTypeSpectra || plan.DestinationDefinition.Type == services.ServiceTypeSpectra
+	bothSpectra := plan.SourceDefinition.Type == services.ServiceTypeSpectra && plan.DestinationDefinition.Type == services.ServiceTypeSpectra
 
 	if isSpectraMigration {
 		// Get the Spectra service definition (same for both src and dst)
@@ -584,6 +576,39 @@ func (m *Manager) StartMigration(ctx context.Context, req StartMigrationRequest)
 			return Migration{}, fmt.Errorf("failed to create Spectra config override: %w", err)
 		}
 		spectraConfigPath = overridePath
+
+		// If both source and destination are Spectra, they must share the same connection ID
+		// to use the same underlying SpectraFS instance (prevents BoltDB lock conflicts)
+		if bothSpectra {
+			// Generate a shared connection ID based on migration ID and config path
+			// This ensures both adapters use the same SpectraFS instance
+			sharedConnectionID := fmt.Sprintf("spectra-%s", migrationID)
+			opts.SourceConnectionID = sharedConnectionID
+			opts.DestinationConnectionID = sharedConnectionID
+		} else {
+			// Only one is Spectra, use individual connection IDs if provided
+			if opts.SourceConnectionID == "" {
+				opts.SourceConnectionID = plan.SourceConnectionID
+			}
+			if opts.DestinationConnectionID == "" {
+				opts.DestinationConnectionID = plan.DestinationConnectionID
+			}
+		}
+	} else {
+		// Neither is Spectra, use individual connection IDs if provided
+		if opts.SourceConnectionID == "" {
+			opts.SourceConnectionID = plan.SourceConnectionID
+		}
+		if opts.DestinationConnectionID == "" {
+			opts.DestinationConnectionID = plan.DestinationConnectionID
+		}
+	}
+
+	if opts.LogAddress == "" {
+		opts.LogAddress = m.cfg.Runtime.LogAddress
+	}
+	if opts.LogLevel == "" {
+		opts.LogLevel = m.cfg.Runtime.LogLevel
 	}
 
 	// Create Migration Engine YAML config file
@@ -850,7 +875,7 @@ func (m *Manager) updateMetadataForMigration(migrationID, name, configPath strin
 
 // createAdapterFactory creates an adapter factory for reconstructing adapters from YAML config
 func (m *Manager) createAdapterFactory(spectraConfigOverridePath string) migration.AdapterFactory {
-	return func(serviceType string, serviceCfg migration.ServiceConfigYAML, serviceConfigs map[string]interface{}) (fsservices.FSAdapter, error) {
+	return func(serviceType string, serviceCfg migration.ServiceConfigYAML, serviceConfigs map[string]interface{}) (fstypes.FSAdapter, error) {
 		switch strings.ToLower(serviceType) {
 		case "spectra":
 			// Use override config if provided, otherwise try to extract from serviceConfigs
@@ -905,7 +930,7 @@ func (m *Manager) createAdapterFactory(spectraConfigOverridePath string) migrati
 				}
 			}
 
-			adapter, err := fsservices.NewSpectraFS(spectraFS, rootID, world)
+			adapter, err := fslib.NewSpectraFS(spectraFS, rootID, world)
 			if err != nil {
 				_ = spectraFS.Close()
 				return nil, fmt.Errorf("failed to create SpectraFS adapter: %w", err)
@@ -920,7 +945,7 @@ func (m *Manager) createAdapterFactory(spectraConfigOverridePath string) migrati
 				return nil, fmt.Errorf("local service %s missing root path", serviceCfg.Name)
 			}
 
-			adapter, err := fsservices.NewLocalFS(rootPath)
+			adapter, err := fslib.NewLocalFS(rootPath)
 			if err != nil {
 				return nil, fmt.Errorf("failed to create LocalFS adapter: %w", err)
 			}

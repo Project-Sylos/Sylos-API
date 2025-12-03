@@ -5,8 +5,8 @@ import (
 	"errors"
 	"time"
 
-	"github.com/Project-Sylos/Migration-Engine/pkg/fsservices"
 	"github.com/Project-Sylos/Migration-Engine/pkg/migration"
+	fstypes "github.com/Project-Sylos/Sylos-FS/pkg/types"
 )
 
 var (
@@ -34,9 +34,36 @@ type Source struct {
 }
 
 type ListChildrenRequest struct {
-	ServiceID  string
-	Identifier string
-	Role       string // "source" or "destination" - used to map "spectra" to the correct world
+	ServiceID   string
+	Identifier  string
+	Role        string // "source" or "destination" - used to map "spectra" to the correct world
+	Offset      int    // Pagination offset (default: 0)
+	Limit       int    // Pagination limit (default: 100, max: 1000)
+	FoldersOnly bool   // If true, only return folders and apply limit to folders only
+}
+
+// ListChildrenResponse wraps the list result with pagination metadata
+type ListChildrenResponse struct {
+	Folders    []fstypes.Folder `json:"folders"`
+	Files      []fstypes.File   `json:"files"`
+	Pagination PaginationInfo   `json:"pagination"`
+}
+
+// PaginationInfo provides pagination metadata
+type PaginationInfo struct {
+	Offset       int  `json:"offset"`       // Current offset
+	Limit        int  `json:"limit"`        // Current limit
+	Total        int  `json:"total"`        // Total number of items (folders + files, or just folders if foldersOnly=true)
+	TotalFolders int  `json:"totalFolders"` // Total number of folders
+	TotalFiles   int  `json:"totalFiles"`   // Total number of files
+	HasMore      bool `json:"hasMore"`      // Whether there are more items beyond the current page
+}
+
+// DriveInfo represents information about a drive/volume
+type DriveInfo struct {
+	Path        string `json:"path"`        // Absolute path to the drive (e.g., "C:\" on Windows, "/" on Unix)
+	DisplayName string `json:"displayName"` // Display name (e.g., "C:" or "Local Disk (C:)")
+	Type        string `json:"type"`        // Drive type (e.g., "fixed", "removable", "network")
 }
 
 type FolderDescriptor struct {
@@ -200,7 +227,8 @@ type MigrationMetadata struct {
 
 type Bridge interface {
 	ListSources(ctx context.Context) ([]Source, error)
-	ListChildren(ctx context.Context, req ListChildrenRequest) (fsservices.ListResult, error)
+	ListChildren(ctx context.Context, req ListChildrenRequest) (ListChildrenResponse, error)
+	ListDrives(ctx context.Context, serviceID string) ([]DriveInfo, error)
 	SetRoot(ctx context.Context, req SetRootRequest) (SetRootResponse, error)
 	StartMigration(ctx context.Context, req StartMigrationRequest) (Migration, error)
 	GetMigrationStatus(ctx context.Context, id string) (Status, error)

@@ -161,8 +161,11 @@ func ConfigPathFromDatabasePath(dbPath string) string {
 }
 
 func InspectMigrationStatusFromDB(ctx context.Context, logger zerolog.Logger, dbPath string) (migration.MigrationStatus, error) {
+	options := db.Options{
+		Path: dbPath,
+	}
 	// Open database
-	database, err := db.NewDB(dbPath)
+	database, err := db.Open(options)
 	if err != nil {
 		return migration.MigrationStatus{}, fmt.Errorf("failed to open database: %w", err)
 	}
