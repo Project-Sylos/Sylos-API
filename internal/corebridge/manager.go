@@ -3,8 +3,11 @@ package corebridge
 import (
 	"context"
 	"fmt"
+	"os"
+	"strings"
 	"time"
 
+	"github.com/Project-Sylos/Migration-Engine/pkg/db"
 	"github.com/Project-Sylos/Migration-Engine/pkg/migration"
 	"github.com/Project-Sylos/Sylos-API/internal/corebridge/database"
 	"github.com/Project-Sylos/Sylos-API/internal/corebridge/metadata"
@@ -188,7 +191,7 @@ func (m *Manager) StartMigration(ctx context.Context, req StartMigrationRequest)
 			CoordinatorLead:         req.Options.CoordinatorLead,
 			LogAddress:              req.Options.LogAddress,
 			LogLevel:                req.Options.LogLevel,
-			EnableLoggingTerminal:   req.Options.EnableLoggingTerminal,
+			SkipListener:            req.Options.SkipListener,
 			StartupDelaySec:         req.Options.StartupDelaySec,
 			ProgressTickMillis:      req.Options.ProgressTickMillis,
 			Verification: migrations.VerificationOptions{
@@ -490,6 +493,213 @@ func convertResultToView(res *migration.Result) *ResultView {
 			DstNotOnSrc: res.Verification.DstNotOnSrc,
 		},
 	}
+}
+
+// GetQueueMetrics retrieves queue metrics for a migration
+func (m *Manager) GetQueueMetrics(ctx context.Context, migrationID string) (*QueueMetricsResponse, error) {
+	// First, check if we have a running migration with a DB instance
+	// This avoids opening a new connection (BoltDB only allows one connection at a time)
+	record := m.migrationsMgr.GetRecord(migrationID)
+	var boltDB *db.DB
+	if record != nil && record.DB != nil {
+		boltDB = record.DB
+	}
+
+	var dbMetrics *database.QueueMetricsResponse
+	var err error
+
+	if boltDB != nil {
+		// Use the shared DB instance from the running migration
+		dbMetrics, err = database.GetQueueMetricsFromDBInstance(ctx, m.logger, boltDB)
+		if err != nil {
+			// Check if this is a database not available error (non-critical for metrics/logs)
+			if isDatabaseNotAvailableError(err) {
+				return &QueueMetricsResponse{
+					Success:   false,
+					ErrorCode: "DATABASE_NOT_AVAILABLE",
+					Error:     "database instance is not available (migration may be initializing or completed)",
+				}, nil
+			}
+			return nil, fmt.Errorf("failed to get queue metrics from DB instance: %w", err)
+		}
+	} else {
+		// Fallback: migration not running or DB not available, open a new connection
+		// Get migration metadata to find the config path
+		metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
+		meta, err := metaMgr.GetMigrationMetadata(migrationID)
+		if err != nil {
+			return nil, ErrMigrationNotFound
+		}
+
+		// Derive database path from config path
+		// Config path is {db_path}.yaml, so DB path is {config_path sans .yaml}.db
+		dbPath := strings.TrimSuffix(meta.ConfigPath, ".yaml") + ".db"
+		if dbPath == ".db" {
+			// Fallback: try to resolve from migration ID
+			dbPath, err = database.ResolveDatabasePath(m.cfg.Runtime.DataDir, "", migrationID)
+			if err != nil {
+				return nil, fmt.Errorf("failed to resolve database path: %w", err)
+			}
+		}
+
+		// Check if database file exists
+		if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+			return nil, ErrMigrationNotFound
+		}
+
+		// Get queue metrics from database
+		dbMetrics, err = database.GetQueueMetricsFromDB(ctx, m.logger, dbPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get queue metrics: %w", err)
+		}
+	}
+
+	// Convert database.QueueMetricsResponse to corebridge.QueueMetricsResponse
+	metrics := &QueueMetricsResponse{
+		Success: true, // Operation succeeded
+	}
+	if dbMetrics.SrcTraversal != nil {
+		metrics.SrcTraversal = &QueueObserverMetrics{
+			QueueStats: QueueStats{
+				Name:         dbMetrics.SrcTraversal.Name,
+				Round:        dbMetrics.SrcTraversal.Round,
+				Pending:      dbMetrics.SrcTraversal.Pending,
+				InProgress:   dbMetrics.SrcTraversal.InProgress,
+				TotalTracked: dbMetrics.SrcTraversal.TotalTracked,
+				Workers:      dbMetrics.SrcTraversal.Workers,
+			},
+			AverageExecutionTime: dbMetrics.SrcTraversal.AverageExecutionTime,
+			TasksPerSecond:       dbMetrics.SrcTraversal.TasksPerSecond,
+			TotalCompleted:       dbMetrics.SrcTraversal.TotalCompleted,
+			LastPollTime:         dbMetrics.SrcTraversal.LastPollTime,
+		}
+	}
+	if dbMetrics.DstTraversal != nil {
+		metrics.DstTraversal = &QueueObserverMetrics{
+			QueueStats: QueueStats{
+				Name:         dbMetrics.DstTraversal.Name,
+				Round:        dbMetrics.DstTraversal.Round,
+				Pending:      dbMetrics.DstTraversal.Pending,
+				InProgress:   dbMetrics.DstTraversal.InProgress,
+				TotalTracked: dbMetrics.DstTraversal.TotalTracked,
+				Workers:      dbMetrics.DstTraversal.Workers,
+			},
+			AverageExecutionTime: dbMetrics.DstTraversal.AverageExecutionTime,
+			TasksPerSecond:       dbMetrics.DstTraversal.TasksPerSecond,
+			TotalCompleted:       dbMetrics.DstTraversal.TotalCompleted,
+			LastPollTime:         dbMetrics.DstTraversal.LastPollTime,
+		}
+	}
+	if dbMetrics.Copy != nil {
+		metrics.Copy = &QueueObserverMetrics{
+			QueueStats: QueueStats{
+				Name:         dbMetrics.Copy.Name,
+				Round:        dbMetrics.Copy.Round,
+				Pending:      dbMetrics.Copy.Pending,
+				InProgress:   dbMetrics.Copy.InProgress,
+				TotalTracked: dbMetrics.Copy.TotalTracked,
+				Workers:      dbMetrics.Copy.Workers,
+			},
+			AverageExecutionTime: dbMetrics.Copy.AverageExecutionTime,
+			TasksPerSecond:       dbMetrics.Copy.TasksPerSecond,
+			TotalCompleted:       dbMetrics.Copy.TotalCompleted,
+			LastPollTime:         dbMetrics.Copy.LastPollTime,
+		}
+	}
+
+	return metrics, nil
+}
+
+// isDatabaseNotAvailableError checks if an error indicates the database is not available
+// This includes errors like "database not open" from BoltDB
+func isDatabaseNotAvailableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "database not open") ||
+		strings.Contains(errStr, "database not available") ||
+		strings.Contains(errStr, "not open")
+}
+
+// GetLogs retrieves logs for a migration
+func (m *Manager) GetLogs(ctx context.Context, migrationID string, req GetLogsRequest) (*GetLogsResponse, error) {
+	// First, check if we have a running migration with a DB instance
+	// This avoids opening a new connection (BoltDB only allows one connection at a time)
+	record := m.migrationsMgr.GetRecord(migrationID)
+	var boltDB *db.DB
+	if record != nil && record.DB != nil {
+		boltDB = record.DB
+	}
+
+	var dbLogs map[string][]database.LogEntry
+	var err error
+
+	if boltDB != nil {
+		// Use the shared DB instance from the running migration
+		dbLogs, err = database.GetLogsFromDBInstance(ctx, m.logger, boltDB)
+		if err != nil {
+			// Check if this is a database not available error (non-critical for metrics/logs)
+			if isDatabaseNotAvailableError(err) {
+				return &GetLogsResponse{
+					Success:   false,
+					ErrorCode: "DATABASE_NOT_AVAILABLE",
+					Error:     "database instance is not available (migration may be initializing or completed)",
+					Logs:      make(map[string][]LogEntry),
+				}, nil
+			}
+			return nil, fmt.Errorf("failed to get logs from DB instance: %w", err)
+		}
+	} else {
+		// Fallback: migration not running or DB not available, open a new connection
+		// Get migration metadata to find the config path
+		metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
+		meta, err := metaMgr.GetMigrationMetadata(migrationID)
+		if err != nil {
+			return nil, ErrMigrationNotFound
+		}
+
+		// Derive database path from config path
+		// Config path is {db_path}.yaml, so DB path is {config_path sans .yaml}.db
+		dbPath := strings.TrimSuffix(meta.ConfigPath, ".yaml") + ".db"
+		if dbPath == ".db" {
+			// Fallback: try to resolve from migration ID
+			dbPath, err = database.ResolveDatabasePath(m.cfg.Runtime.DataDir, "", migrationID)
+			if err != nil {
+				return nil, fmt.Errorf("failed to resolve database path: %w", err)
+			}
+		}
+
+		// Check if database file exists
+		if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+			return nil, ErrMigrationNotFound
+		}
+
+		// Get logs from database
+		dbLogs, err = database.GetLogsFromDB(ctx, m.logger, dbPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get logs: %w", err)
+		}
+	}
+
+	// Convert database.LogEntry to corebridge.LogEntry
+	logs := make(map[string][]LogEntry)
+	for level, entries := range dbLogs {
+		logEntries := make([]LogEntry, len(entries))
+		for i, entry := range entries {
+			logEntries[i] = LogEntry{
+				ID:    entry.ID,
+				Level: entry.Level,
+				Data:  entry.Data,
+			}
+		}
+		logs[level] = logEntries
+	}
+
+	return &GetLogsResponse{
+		Success: true, // Operation succeeded
+		Logs:    logs,
+	}, nil
 }
 
 // convertMetadata converts internal metadata to public API metadata

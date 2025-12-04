@@ -50,7 +50,7 @@ func (m *Manager) ExecuteMigration(migrationID string, srcDef, dstDef services.S
 		CoordinatorLead: m.selectCoordinatorLead(opts.CoordinatorLead),
 		LogAddress:      m.selectLogAddress(opts.LogAddress),
 		LogLevel:        m.selectLogLevel(opts.LogLevel),
-		SkipListener:    !m.shouldEnableLoggingTerminal(opts), // SDK will spawn terminal when SkipListener is false
+		SkipListener:    m.selectSkipListener(opts), // Defaults to true (skip listener)
 		StartupDelay:    time.Duration(opts.StartupDelaySec) * time.Second,
 		ProgressTick:    time.Duration(opts.ProgressTickMillis) * time.Millisecond,
 		Verification:    m.selectVerificationOptions(opts.Verification),
@@ -161,7 +161,7 @@ func (m *Manager) ExecuteMigrationWithController(migrationID string, srcDef, dst
 		CoordinatorLead: m.selectCoordinatorLead(opts.CoordinatorLead),
 		LogAddress:      m.selectLogAddress(opts.LogAddress),
 		LogLevel:        m.selectLogLevel(opts.LogLevel),
-		SkipListener:    !m.shouldEnableLoggingTerminal(opts),
+		SkipListener:    m.selectSkipListener(opts), // Defaults to true (skip listener)
 		StartupDelay:    time.Duration(opts.StartupDelaySec) * time.Second,
 		ProgressTick:    time.Duration(opts.ProgressTickMillis) * time.Millisecond,
 		Verification:    m.selectVerificationOptions(opts.Verification),
@@ -251,13 +251,15 @@ func (m *Manager) selectLogLevel(value string) string {
 	return "info"
 }
 
-func (m *Manager) shouldEnableLoggingTerminal(opts MigrationOptions) bool {
-	// If explicitly set in options, use that
-	if opts.EnableLoggingTerminal {
-		return true
+// selectSkipListener determines whether to skip the log listener terminal
+// Defaults to true (skip listener) if not explicitly set, since we now have UI hooks for logs
+func (m *Manager) selectSkipListener(opts MigrationOptions) bool {
+	// If explicitly set in options, use that value
+	if opts.SkipListener != nil {
+		return *opts.SkipListener
 	}
-	// Otherwise use config default
-	return m.cfg.Runtime.EnableLoggingTerminal
+	// Default to true (skip listener) - UI can see logs via API hooks
+	return true
 }
 
 // selectVerificationOptions sets default verification options

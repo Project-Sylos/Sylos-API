@@ -2,6 +2,7 @@ package migrations
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/Project-Sylos/Migration-Engine/pkg/queue"
@@ -54,6 +55,34 @@ func (m *Manager) RunMigration(record *MigrationRecord, srcDef, dstDef services.
 		Str("destination", dstDef.ID).
 		Msg("starting migration")
 
+	// Ensure plan is seeded before starting migration (do this in goroutine to avoid blocking HTTP handler)
+	plan := m.rootsMgr.GetPlan(record.ID)
+	if plan != nil && !plan.Seeded {
+		_, _, _, err := m.rootsMgr.SeedPlanIfReady(record.ID)
+		if err != nil {
+			m.mu.Lock()
+			record.Status = MigrationStatusFailed
+			record.Error = fmt.Sprintf("failed to seed migration plan: %v", err)
+			finished := time.Now().UTC()
+			record.CompletedAt = &finished
+			m.mu.Unlock()
+
+			m.logger.Error().
+				Err(err).
+				Str("migration_id", record.ID).
+				Msg("failed to seed migration plan")
+
+			m.publishProgress(record.ID, "failed", nil, nil)
+			m.closeSubscribers(record.ID)
+			return
+		}
+		// Re-fetch plan to get updated database path
+		plan = m.rootsMgr.GetPlan(record.ID)
+		if plan != nil && plan.Seeded && plan.DatabasePath != "" {
+			opts.DatabasePath = plan.DatabasePath
+		}
+	}
+
 	// Start migration with controller for programmatic shutdown
 	controller, err := m.ExecuteMigrationWithController(record.ID, srcDef, dstDef, srcFolder, dstFolder, opts, m.resolveDBPath, func(def services.ServiceDefinition, rootID, connID string) (fstypes.FSAdapter, func(), error) {
 		return m.serviceMgr.AcquireAdapterWithOverride(def, rootID, connID, spectraConfigOverridePath)
@@ -81,9 +110,14 @@ func (m *Manager) RunMigration(record *MigrationRecord, srcDef, dstDef services.
 	// Calling cleanup here would cause double-close issues since adapters share the same
 	// underlying Spectra SDK instance.
 
-	// Store controller in record for programmatic shutdown
+	// Store controller and DB instance in record
+	// The DB instance allows us to query logs/metrics without opening a new connection
+	// (BoltDB only allows one connection at a time)
+	// Get the DB instance from the controller (BoltDB operations are thread-safe)
+	boltDB := controller.GetDB()
 	m.mu.Lock()
 	record.Controller = controller
+	record.DB = boltDB
 	m.mu.Unlock()
 
 	heartbeat := time.NewTicker(5 * time.Second)

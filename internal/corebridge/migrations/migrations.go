@@ -35,7 +35,7 @@ type MigrationOptions struct {
 	CoordinatorLead         int
 	LogAddress              string
 	LogLevel                string
-	EnableLoggingTerminal   bool
+	SkipListener            *bool
 	StartupDelaySec         int
 	ProgressTickMillis      int
 	Verification            VerificationOptions
@@ -155,6 +155,7 @@ type MigrationRecord struct {
 	Result        *migration.Result
 	Error         string
 	Controller    *migration.MigrationController // Controller for programmatic shutdown
+	DB            *db.DB                         // DB instance for querying logs/metrics (shared with migration engine)
 }
 
 const (
@@ -516,17 +517,22 @@ func (m *Manager) StartMigration(ctx context.Context, req StartMigrationRequest)
 		return Migration{}, fmt.Errorf("roots not fully configured for migration %s", migrationID)
 	}
 
-	if !plan.Seeded {
-		if _, _, _, err := m.rootsMgr.SeedPlanIfReady(migrationID); err != nil {
-			return Migration{}, err
+	// Don't block on seeding - do it in the goroutine
+	// Just check if plan exists and has both roots
+	// If plan is not seeded, we'll seed it in the goroutine to avoid blocking
+	// For now, we need to get the database path
+	// Get database path - if plan is not seeded, we'll seed it in the goroutine
+	// This prevents blocking the HTTP handler on database operations
+	if plan.Seeded {
+		opts.DatabasePath = plan.DatabasePath
+	} else {
+		// Plan not seeded yet - resolve path but seed in goroutine
+		dbPath, err := m.resolveDBPath("", migrationID)
+		if err != nil {
+			return Migration{}, fmt.Errorf("failed to resolve database path: %w", err)
 		}
-		plan = m.rootsMgr.GetPlan(migrationID)
-		if plan == nil || !plan.Seeded {
-			return Migration{}, fmt.Errorf("roots not fully configured for migration %s", migrationID)
-		}
+		opts.DatabasePath = dbPath
 	}
-
-	opts.DatabasePath = plan.DatabasePath
 
 	// Check if this is a new migration (not a resume)
 	// If IsNewMigration is true, we should start fresh (remove existing DB)
@@ -976,7 +982,7 @@ func (m *Manager) ExecuteMigrationFromConfig(cfg migration.Config, opts Migratio
 	if opts.LogLevel != "" {
 		cfg.LogLevel = opts.LogLevel
 	}
-	cfg.SkipListener = !m.shouldEnableLoggingTerminal(opts)
+	cfg.SkipListener = m.selectSkipListener(opts) // Defaults to true (skip listener)
 
 	// StartMigration runs the migration asynchronously and returns a controller
 	controller := migration.StartMigration(cfg)
@@ -1036,7 +1042,7 @@ func (m *Manager) ExecuteMigrationFromConfigWithController(cfg migration.Config,
 	if opts.LogLevel != "" {
 		cfg.LogLevel = opts.LogLevel
 	}
-	cfg.SkipListener = !m.shouldEnableLoggingTerminal(opts)
+	cfg.SkipListener = m.selectSkipListener(opts) // Defaults to true (skip listener)
 
 	// StartMigration runs the migration asynchronously and returns a controller
 	// It will automatically detect and resume from suspended state if DB exists
@@ -1073,9 +1079,14 @@ func (m *Manager) RunMigrationFromConfig(record *MigrationRecord, cfg migration.
 		return
 	}
 
-	// Store controller in record for programmatic shutdown
+	// Store controller and DB instance in record
+	// The DB instance allows us to query logs/metrics without opening a new connection
+	// (BoltDB only allows one connection at a time)
+	// Get the DB instance from the controller (BoltDB operations are thread-safe)
+	boltDB := controller.GetDB()
 	m.mu.Lock()
 	record.Controller = controller
+	record.DB = boltDB
 	m.mu.Unlock()
 
 	heartbeat := time.NewTicker(5 * time.Second)

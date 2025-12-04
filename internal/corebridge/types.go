@@ -10,8 +10,9 @@ import (
 )
 
 var (
-	ErrMigrationNotFound = errors.New("migration not found")
-	ErrServiceNotFound   = errors.New("service not found")
+	ErrMigrationNotFound    = errors.New("migration not found")
+	ErrServiceNotFound      = errors.New("service not found")
+	ErrDatabaseNotAvailable = errors.New("database not available")
 )
 
 type ServiceType string
@@ -101,7 +102,7 @@ type MigrationOptions struct {
 	CoordinatorLead         int                 `json:"coordinatorLead,omitempty"`
 	LogAddress              string              `json:"logAddress,omitempty"`
 	LogLevel                string              `json:"logLevel,omitempty"`
-	EnableLoggingTerminal   bool                `json:"enableLoggingTerminal,omitempty"`
+	SkipListener            *bool               `json:"skipListener,omitempty"` // If nil, defaults to true (skip listener)
 	StartupDelaySec         int                 `json:"startupDelaySeconds,omitempty"`
 	ProgressTickMillis      int                 `json:"progressTickMillis,omitempty"`
 	Verification            VerificationOptions `json:"verification,omitempty"`
@@ -189,6 +190,55 @@ type QueueStatsSnapshot struct {
 	Workers      int `json:"workers"`
 }
 
+// QueueStats represents basic queue statistics
+type QueueStats struct {
+	Name         string `json:"name"`
+	Round        int    `json:"round"`
+	Pending      int    `json:"pending"`
+	InProgress   int    `json:"inProgress"`
+	TotalTracked int    `json:"totalTracked"`
+	Workers      int    `json:"workers"`
+}
+
+// QueueObserverMetrics represents queue metrics from the migration engine observer
+type QueueObserverMetrics struct {
+	QueueStats
+	AverageExecutionTime time.Duration `json:"averageExecutionTime"` // in nanoseconds
+	TasksPerSecond       float64       `json:"tasksPerSecond"`
+	TotalCompleted       int           `json:"totalCompleted"`
+	LastPollTime         time.Time     `json:"lastPollTime"`
+}
+
+// QueueMetricsResponse represents all queue metrics for a migration
+type QueueMetricsResponse struct {
+	Success      bool                  `json:"success"`             // Whether the operation succeeded
+	ErrorCode    string                `json:"errorCode,omitempty"` // Error code if success is false (e.g., "DATABASE_NOT_AVAILABLE")
+	Error        string                `json:"error,omitempty"`     // Human-readable error message if success is false
+	SrcTraversal *QueueObserverMetrics `json:"srcTraversal,omitempty"`
+	DstTraversal *QueueObserverMetrics `json:"dstTraversal,omitempty"`
+	Copy         *QueueObserverMetrics `json:"copy,omitempty"`
+}
+
+// LogEntry represents a single log entry from the database
+type LogEntry struct {
+	ID    string                 `json:"id"`
+	Level string                 `json:"level"`
+	Data  map[string]interface{} `json:"data"`
+}
+
+// GetLogsRequest represents a request to get logs for a migration
+type GetLogsRequest struct {
+	// No fields - always returns up to 1K logs per level (newest first)
+}
+
+// GetLogsResponse represents the response containing logs for all levels
+type GetLogsResponse struct {
+	Success   bool                  `json:"success"`             // Whether the operation succeeded
+	ErrorCode string                `json:"errorCode,omitempty"` // Error code if success is false (e.g., "DATABASE_NOT_AVAILABLE")
+	Error     string                `json:"error,omitempty"`     // Human-readable error message if success is false
+	Logs      map[string][]LogEntry `json:"logs,omitempty"`      // Map of log level to array of log entries
+}
+
 type ProgressEvent struct {
 	Event       string             `json:"event"`
 	Timestamp   time.Time          `json:"timestamp"`
@@ -241,6 +291,8 @@ type Bridge interface {
 	ListAllMigrations(ctx context.Context) ([]MigrationMetadata, error)
 	LoadMigration(ctx context.Context, migrationID string) (Migration, error)
 	StopMigration(ctx context.Context, migrationID string) (Status, error)
+	GetQueueMetrics(ctx context.Context, migrationID string) (*QueueMetricsResponse, error)
+	GetLogs(ctx context.Context, migrationID string, req GetLogsRequest) (*GetLogsResponse, error)
 }
 
 const (
