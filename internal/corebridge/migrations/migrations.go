@@ -143,6 +143,7 @@ type Manager struct {
 	rootsMgr      *roots.Manager
 	metadataMgr   *metadata.Manager
 	resolveDBPath func(path, migrationID string) (string, error)
+	dbPool        *DBPool // API-owned database connection pool
 }
 
 type MigrationRecord struct {
@@ -175,6 +176,7 @@ func NewManager(logger zerolog.Logger, cfg config.Config, serviceMgr *services.S
 		rootsMgr:      rootsMgr,
 		metadataMgr:   metadata.NewManager(cfg.Runtime.DataDir),
 		resolveDBPath: resolveDBPath,
+		dbPool:        NewDBPool(logger),
 	}
 }
 
@@ -850,6 +852,36 @@ func (m *Manager) GetRecord(migrationID string) *MigrationRecord {
 	return m.migrations[migrationID]
 }
 
+// GetDB retrieves the database instance for a migration
+// Tries record.DB first, then falls back to pool
+// Returns nil if DB is not available
+func (m *Manager) GetDB(migrationID string) *db.DB {
+	m.mu.RLock()
+	record := m.migrations[migrationID]
+	m.mu.RUnlock()
+
+	if record != nil && record.DB != nil {
+		return record.DB
+	}
+
+	// Fallback to pool
+	return m.dbPool.Get(migrationID)
+}
+
+// CloseDB closes the database connection for a migration
+// API decides when to close - only called when migration is fully done/archived
+func (m *Manager) CloseDB(migrationID string) error {
+	// Clear DB from record
+	m.mu.Lock()
+	if record := m.migrations[migrationID]; record != nil {
+		record.DB = nil
+	}
+	m.mu.Unlock()
+
+	// Close in pool (pool handles if not in pool)
+	return m.dbPool.Close(migrationID)
+}
+
 func (m *Manager) SetRecord(migrationID string, record *MigrationRecord) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1018,9 +1050,17 @@ func (m *Manager) ExecuteMigrationFromConfig(cfg migration.Config, opts Migratio
 
 // ExecuteMigrationFromConfigWithController executes a migration using a pre-constructed migration.Config
 // and returns the controller for programmatic shutdown
-func (m *Manager) ExecuteMigrationFromConfigWithController(cfg migration.Config, opts MigrationOptions) (*migration.MigrationController, error) {
+// dbInstance must be pre-opened by the API - the migration engine does not open databases
+func (m *Manager) ExecuteMigrationFromConfigWithController(cfg migration.Config, opts MigrationOptions, dbInstance *db.DB) (*migration.MigrationController, error) {
+	if dbInstance == nil {
+		return nil, fmt.Errorf("database instance is required - migration engine does not open databases")
+	}
+
 	// CRITICAL: Always force RemoveExisting to false (anti-pattern to remove existing DB)
 	cfg.Database.RemoveExisting = false
+
+	// REQUIRED: Pass the pre-opened DB instance (API owns lifecycle)
+	cfg.DatabaseInstance = dbInstance
 
 	// CRITICAL: Ensure SeedRoots is set (same as test logic)
 	// StartMigration will only use it if DB is empty, so it's safe to set to true
@@ -1059,8 +1099,49 @@ func (m *Manager) RunMigrationFromConfig(record *MigrationRecord, cfg migration.
 		Str("destination", cfg.Destination.Name).
 		Msg("resuming migration from config")
 
+	// Extract database path from config
+	dbPath := cfg.Database.Path
+	if dbPath == "" {
+		m.mu.Lock()
+		record.Status = MigrationStatusFailed
+		record.Error = "migration config has no database path"
+		finished := time.Now().UTC()
+		record.CompletedAt = &finished
+		m.mu.Unlock()
+
+		m.logger.Error().
+			Str("migration_id", record.ID).
+			Msg("migration config has no database path")
+
+		m.publishProgress(record.ID, "failed", nil, nil)
+		m.closeSubscribers(record.ID)
+		return
+	}
+
+	// API owns DB lifecycle - open DB in pool BEFORE starting migration
+	dbInstance, err := m.dbPool.Open(record.ID, dbPath)
+	if err != nil {
+		m.mu.Lock()
+		record.Status = MigrationStatusFailed
+		record.Error = fmt.Sprintf("failed to open database: %v", err)
+		finished := time.Now().UTC()
+		record.CompletedAt = &finished
+		m.mu.Unlock()
+
+		m.logger.Error().
+			Err(err).
+			Str("migration_id", record.ID).
+			Str("db_path", dbPath).
+			Msg("failed to open database in pool")
+
+		m.publishProgress(record.ID, "failed", nil, nil)
+		m.closeSubscribers(record.ID)
+		return
+	}
+
 	// Start migration with controller for programmatic shutdown
-	controller, err := m.ExecuteMigrationFromConfigWithController(cfg, opts)
+	// Pass the pre-opened DB instance (API owns lifecycle)
+	controller, err := m.ExecuteMigrationFromConfigWithController(cfg, opts, dbInstance)
 	if err != nil {
 		m.mu.Lock()
 		record.Status = MigrationStatusFailed
@@ -1080,13 +1161,12 @@ func (m *Manager) RunMigrationFromConfig(record *MigrationRecord, cfg migration.
 	}
 
 	// Store controller and DB instance in record
+	// Use the DB instance from the pool (API owns lifecycle, not the controller)
 	// The DB instance allows us to query logs/metrics without opening a new connection
 	// (BoltDB only allows one connection at a time)
-	// Get the DB instance from the controller (BoltDB operations are thread-safe)
-	boltDB := controller.GetDB()
 	m.mu.Lock()
 	record.Controller = controller
-	record.DB = boltDB
+	record.DB = dbInstance // Use DB from pool, not from controller
 	m.mu.Unlock()
 
 	heartbeat := time.NewTicker(5 * time.Second)

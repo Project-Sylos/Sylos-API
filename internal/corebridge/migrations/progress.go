@@ -83,8 +83,54 @@ func (m *Manager) RunMigration(record *MigrationRecord, srcDef, dstDef services.
 		}
 	}
 
+	// Get or resolve database path
+	dbPath := opts.DatabasePath
+	if dbPath == "" {
+		var err error
+		dbPath, err = m.resolveDBPath("", record.ID)
+		if err != nil {
+			m.mu.Lock()
+			record.Status = MigrationStatusFailed
+			record.Error = fmt.Sprintf("failed to resolve database path: %v", err)
+			finished := time.Now().UTC()
+			record.CompletedAt = &finished
+			m.mu.Unlock()
+
+			m.logger.Error().
+				Err(err).
+				Str("migration_id", record.ID).
+				Msg("failed to resolve database path")
+
+			m.publishProgress(record.ID, "failed", nil, nil)
+			m.closeSubscribers(record.ID)
+			return
+		}
+	}
+
+	// API owns DB lifecycle - open DB in pool BEFORE starting migration
+	dbInstance, err := m.dbPool.Open(record.ID, dbPath)
+	if err != nil {
+		m.mu.Lock()
+		record.Status = MigrationStatusFailed
+		record.Error = fmt.Sprintf("failed to open database: %v", err)
+		finished := time.Now().UTC()
+		record.CompletedAt = &finished
+		m.mu.Unlock()
+
+		m.logger.Error().
+			Err(err).
+			Str("migration_id", record.ID).
+			Str("db_path", dbPath).
+			Msg("failed to open database in pool")
+
+		m.publishProgress(record.ID, "failed", nil, nil)
+		m.closeSubscribers(record.ID)
+		return
+	}
+
 	// Start migration with controller for programmatic shutdown
-	controller, err := m.ExecuteMigrationWithController(record.ID, srcDef, dstDef, srcFolder, dstFolder, opts, m.resolveDBPath, func(def services.ServiceDefinition, rootID, connID string) (fstypes.FSAdapter, func(), error) {
+	// Pass the pre-opened DB instance (API owns lifecycle)
+	controller, err := m.ExecuteMigrationWithController(record.ID, srcDef, dstDef, srcFolder, dstFolder, opts, dbInstance, m.resolveDBPath, func(def services.ServiceDefinition, rootID, connID string) (fstypes.FSAdapter, func(), error) {
 		return m.serviceMgr.AcquireAdapterWithOverride(def, rootID, connID, spectraConfigOverridePath)
 	})
 	if err != nil {
@@ -111,13 +157,12 @@ func (m *Manager) RunMigration(record *MigrationRecord, srcDef, dstDef services.
 	// underlying Spectra SDK instance.
 
 	// Store controller and DB instance in record
+	// Use the DB instance from the pool (API owns lifecycle, not the controller)
 	// The DB instance allows us to query logs/metrics without opening a new connection
 	// (BoltDB only allows one connection at a time)
-	// Get the DB instance from the controller (BoltDB operations are thread-safe)
-	boltDB := controller.GetDB()
 	m.mu.Lock()
 	record.Controller = controller
-	record.DB = boltDB
+	record.DB = dbInstance // Use DB from pool, not from controller
 	m.mu.Unlock()
 
 	heartbeat := time.NewTicker(5 * time.Second)

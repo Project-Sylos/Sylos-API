@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/Project-Sylos/Migration-Engine/pkg/db"
 	"github.com/Project-Sylos/Migration-Engine/pkg/logservice"
 	"github.com/Project-Sylos/Migration-Engine/pkg/migration"
 	"github.com/Project-Sylos/Migration-Engine/pkg/queue"
@@ -125,10 +126,15 @@ func (m *Manager) ExecuteMigration(migrationID string, srcDef, dstDef services.S
 // ExecuteMigrationWithController executes a migration and returns the controller for programmatic shutdown
 // This allows the caller to control when to shutdown the migration
 // The migration engine takes ownership of the adapters and handles cleanup
-func (m *Manager) ExecuteMigrationWithController(migrationID string, srcDef, dstDef services.ServiceDefinition, srcFolder, dstFolder fstypes.Folder, opts MigrationOptions, resolveDBPath func(path, migrationID string) (string, error), acquireAdapter func(services.ServiceDefinition, string, string) (fstypes.FSAdapter, func(), error)) (*migration.MigrationController, error) {
+// dbInstance must be pre-opened by the API - the migration engine does not open databases
+func (m *Manager) ExecuteMigrationWithController(migrationID string, srcDef, dstDef services.ServiceDefinition, srcFolder, dstFolder fstypes.Folder, opts MigrationOptions, dbInstance *db.DB, resolveDBPath func(path, migrationID string) (string, error), acquireAdapter func(services.ServiceDefinition, string, string) (fstypes.FSAdapter, func(), error)) (*migration.MigrationController, error) {
 	dbPath, err := resolveDBPath(opts.DatabasePath, migrationID)
 	if err != nil {
 		return nil, err
+	}
+
+	if dbInstance == nil {
+		return nil, fmt.Errorf("database instance is required - migration engine does not open databases")
 	}
 
 	srcAdapter, _, err := acquireAdapter(srcDef, srcFolder.ID(), opts.SourceConnectionID)
@@ -144,6 +150,9 @@ func (m *Manager) ExecuteMigrationWithController(migrationID string, srcDef, dst
 	}
 
 	cfg := migration.Config{
+		// REQUIRED: Pass the pre-opened DB instance (API owns lifecycle)
+		DatabaseInstance: dbInstance,
+		// Database config kept for path info, but ME doesn't use it to open DB
 		Database: migration.DatabaseConfig{
 			Path:           dbPath,
 			RemoveExisting: opts.RemoveExistingDB,

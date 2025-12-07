@@ -275,6 +275,39 @@ type MigrationMetadata struct {
 	IsNewMigration bool      `json:"isNewMigration"` // Flag to indicate this is a new migration (not a resume)
 }
 
+// ListChildrenDiffsRequest represents a request to list children diffs from migration database
+type ListChildrenDiffsRequest struct {
+	MigrationID string
+	Path        string // Optional, defaults to "/"
+	Offset      int    // Pagination offset (default: 0)
+	Limit       int    // Pagination limit (default: 100, max: 1000)
+	FoldersOnly bool   // If true, only return folders and apply limit to folders only
+}
+
+// DiffItem represents a folder or file with status information from both queues
+type DiffItem struct {
+	Id              string `json:"id"`
+	ParentId        string `json:"parentId,omitempty"`
+	ParentPath      string `json:"parentPath,omitempty"`
+	DisplayName     string `json:"displayName"`
+	LocationPath    string `json:"locationPath"`
+	LastUpdated     string `json:"lastUpdated,omitempty"`
+	DepthLevel      int    `json:"depthLevel"`
+	Type            string `json:"type"`                 // "folder" or "file"
+	Size            int64  `json:"size,omitempty"`       // Only for files
+	TraversalStatus string `json:"traversalStatus"`      // "pending", "successful", "failed", "not_on_src"
+	CopyStatus      string `json:"copyStatus,omitempty"` // "pending", "successful", "failed" (for future copy phase)
+	InSrc           bool   `json:"inSrc"`                // Whether item exists in source queue
+	InDst           bool   `json:"inDst"`                // Whether item exists in destination queue
+}
+
+// ListChildrenDiffsResponse wraps the diff result with pagination metadata
+type ListChildrenDiffsResponse struct {
+	Folders    []DiffItem     `json:"folders"`
+	Files      []DiffItem     `json:"files"`
+	Pagination PaginationInfo `json:"pagination"`
+}
+
 type Bridge interface {
 	ListSources(ctx context.Context) ([]Source, error)
 	ListChildren(ctx context.Context, req ListChildrenRequest) (ListChildrenResponse, error)
@@ -293,6 +326,7 @@ type Bridge interface {
 	StopMigration(ctx context.Context, migrationID string) (Status, error)
 	GetQueueMetrics(ctx context.Context, migrationID string) (*QueueMetricsResponse, error)
 	GetLogs(ctx context.Context, migrationID string, req GetLogsRequest) (*GetLogsResponse, error)
+	ListChildrenDiffs(ctx context.Context, req ListChildrenDiffsRequest) (ListChildrenDiffsResponse, error)
 }
 
 const (

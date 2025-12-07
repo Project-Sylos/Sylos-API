@@ -34,6 +34,7 @@ func Register(router chi.Router, logger zerolog.Logger, core corebridge.Bridge, 
 	router.Get("/migrations/{migrationID}/inspect", middleware.NoBody(mw, h.inspect))
 	router.Get("/migrations/{migrationID}/queue-metrics", middleware.NoBody(mw, h.queueMetrics))
 	router.Post("/migrations/{migrationID}/logs", middleware.JSON(mw, h.getLogs))
+	router.Get("/migrations/{migrationID}/diffs", middleware.NoBody(mw, h.listDiffs))
 	router.Get("/migrations/{migrationID}/stream", h.handleStream)
 	router.Get("/migrate/status/{migrationID}/stream", h.handleStream) // legacy alias
 }

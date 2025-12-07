@@ -7,7 +7,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Project-Sylos/Migration-Engine/pkg/db"
 	"github.com/Project-Sylos/Migration-Engine/pkg/migration"
 	"github.com/Project-Sylos/Sylos-API/internal/corebridge/database"
 	"github.com/Project-Sylos/Sylos-API/internal/corebridge/metadata"
@@ -497,23 +496,24 @@ func convertResultToView(res *migration.Result) *ResultView {
 
 // GetQueueMetrics retrieves queue metrics for a migration
 func (m *Manager) GetQueueMetrics(ctx context.Context, migrationID string) (*QueueMetricsResponse, error) {
-	// First, check if we have a running migration with a DB instance
-	// This avoids opening a new connection (BoltDB only allows one connection at a time)
-	record := m.migrationsMgr.GetRecord(migrationID)
-	var boltDB *db.DB
-	if record != nil && record.DB != nil {
-		boltDB = record.DB
-	}
+	// Get DB instance - tries record.DB first, then pool
+	boltDB := m.migrationsMgr.GetDB(migrationID)
 
 	var dbMetrics *database.QueueMetricsResponse
 	var err error
 
 	if boltDB != nil {
-		// Use the shared DB instance from the running migration
+		// Use the shared DB instance from the pool
 		dbMetrics, err = database.GetQueueMetricsFromDBInstance(ctx, m.logger, boltDB)
 		if err != nil {
-			// Check if this is a database not available error (non-critical for metrics/logs)
+			// Check if this is a database not available error - indicates DB was closed unexpectedly
 			if isDatabaseNotAvailableError(err) {
+				// CRITICAL: DB was closed unexpectedly - this indicates a lifecycle violation
+				m.logger.Error().
+					Err(err).
+					Str("migration_id", migrationID).
+					Msg("CRITICAL: DB for migration was closed unexpectedly — this indicates an ME lifecycle violation")
+
 				return &QueueMetricsResponse{
 					Success:   false,
 					ErrorCode: "DATABASE_NOT_AVAILABLE",
@@ -624,23 +624,24 @@ func isDatabaseNotAvailableError(err error) bool {
 
 // GetLogs retrieves logs for a migration
 func (m *Manager) GetLogs(ctx context.Context, migrationID string, req GetLogsRequest) (*GetLogsResponse, error) {
-	// First, check if we have a running migration with a DB instance
-	// This avoids opening a new connection (BoltDB only allows one connection at a time)
-	record := m.migrationsMgr.GetRecord(migrationID)
-	var boltDB *db.DB
-	if record != nil && record.DB != nil {
-		boltDB = record.DB
-	}
+	// Get DB instance - tries record.DB first, then pool
+	boltDB := m.migrationsMgr.GetDB(migrationID)
 
 	var dbLogs map[string][]database.LogEntry
 	var err error
 
 	if boltDB != nil {
-		// Use the shared DB instance from the running migration
+		// Use the shared DB instance from the pool
 		dbLogs, err = database.GetLogsFromDBInstance(ctx, m.logger, boltDB)
 		if err != nil {
-			// Check if this is a database not available error (non-critical for metrics/logs)
+			// Check if this is a database not available error - indicates DB was closed unexpectedly
 			if isDatabaseNotAvailableError(err) {
+				// CRITICAL: DB was closed unexpectedly - this indicates a lifecycle violation
+				m.logger.Error().
+					Err(err).
+					Str("migration_id", migrationID).
+					Msg("CRITICAL: DB for migration was closed unexpectedly — this indicates an ME lifecycle violation")
+
 				return &GetLogsResponse{
 					Success:   false,
 					ErrorCode: "DATABASE_NOT_AVAILABLE",
@@ -699,6 +700,117 @@ func (m *Manager) GetLogs(ctx context.Context, migrationID string, req GetLogsRe
 	return &GetLogsResponse{
 		Success: true, // Operation succeeded
 		Logs:    logs,
+	}, nil
+}
+
+// ListChildrenDiffs retrieves merged children from both SRC and DST queues with status information
+func (m *Manager) ListChildrenDiffs(ctx context.Context, req ListChildrenDiffsRequest) (ListChildrenDiffsResponse, error) {
+	// Get DB instance - tries record.DB first, then pool
+	boltDB := m.migrationsMgr.GetDB(req.MigrationID)
+
+	var dbFolders []database.DiffItem
+	var dbFiles []database.DiffItem
+	var dbPagination database.PaginationInfo
+	var err error
+
+	if boltDB != nil {
+		// Use the shared DB instance from the pool
+		dbFolders, dbFiles, dbPagination, err = database.GetChildrenDiffsFromDBInstance(ctx, m.logger, boltDB, req.Path, req.Offset, req.Limit, req.FoldersOnly)
+		if err != nil {
+			// Check if this is a database not available error - indicates DB was closed unexpectedly
+			if isDatabaseNotAvailableError(err) {
+				// CRITICAL: DB was closed unexpectedly - this indicates a lifecycle violation
+				m.logger.Error().
+					Err(err).
+					Str("migration_id", req.MigrationID).
+					Msg("CRITICAL: DB for migration was closed unexpectedly — this indicates an ME lifecycle violation")
+
+				return ListChildrenDiffsResponse{}, ErrDatabaseNotAvailable
+			}
+			return ListChildrenDiffsResponse{}, fmt.Errorf("failed to get children diffs from DB instance: %w", err)
+		}
+	} else {
+		// Fallback: migration not running or DB not available, open a new connection
+		// Get migration metadata to find the config path
+		metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
+		meta, err := metaMgr.GetMigrationMetadata(req.MigrationID)
+		if err != nil {
+			return ListChildrenDiffsResponse{}, ErrMigrationNotFound
+		}
+
+		// Derive database path from config path
+		// Config path is {db_path}.yaml, so DB path is {config_path sans .yaml}.db
+		dbPath := strings.TrimSuffix(meta.ConfigPath, ".yaml") + ".db"
+		if dbPath == ".db" {
+			// Fallback: try to resolve from migration ID
+			dbPath, err = database.ResolveDatabasePath(m.cfg.Runtime.DataDir, "", req.MigrationID)
+			if err != nil {
+				return ListChildrenDiffsResponse{}, fmt.Errorf("failed to resolve database path: %w", err)
+			}
+		}
+
+		// Check if database file exists
+		if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+			return ListChildrenDiffsResponse{}, ErrMigrationNotFound
+		}
+
+		// Get children diffs from database
+		dbFolders, dbFiles, dbPagination, err = database.GetChildrenDiffsFromDB(ctx, m.logger, dbPath, req.Path, req.Offset, req.Limit, req.FoldersOnly)
+		if err != nil {
+			return ListChildrenDiffsResponse{}, fmt.Errorf("failed to get children diffs: %w", err)
+		}
+	}
+
+	// Convert database types to corebridge types
+	folders := make([]DiffItem, len(dbFolders))
+	for i, item := range dbFolders {
+		folders[i] = DiffItem{
+			Id:              item.Id,
+			ParentId:        item.ParentId,
+			ParentPath:      item.ParentPath,
+			DisplayName:     item.DisplayName,
+			LocationPath:    item.LocationPath,
+			LastUpdated:     item.LastUpdated,
+			DepthLevel:      item.DepthLevel,
+			Type:            item.Type,
+			Size:            item.Size,
+			TraversalStatus: item.TraversalStatus,
+			CopyStatus:      item.CopyStatus,
+			InSrc:           item.InSrc,
+			InDst:           item.InDst,
+		}
+	}
+
+	files := make([]DiffItem, len(dbFiles))
+	for i, item := range dbFiles {
+		files[i] = DiffItem{
+			Id:              item.Id,
+			ParentId:        item.ParentId,
+			ParentPath:      item.ParentPath,
+			DisplayName:     item.DisplayName,
+			LocationPath:    item.LocationPath,
+			LastUpdated:     item.LastUpdated,
+			DepthLevel:      item.DepthLevel,
+			Type:            item.Type,
+			Size:            item.Size,
+			TraversalStatus: item.TraversalStatus,
+			CopyStatus:      item.CopyStatus,
+			InSrc:           item.InSrc,
+			InDst:           item.InDst,
+		}
+	}
+
+	return ListChildrenDiffsResponse{
+		Folders: folders,
+		Files:   files,
+		Pagination: PaginationInfo{
+			Offset:       dbPagination.Offset,
+			Limit:        dbPagination.Limit,
+			Total:        dbPagination.Total,
+			TotalFolders: dbPagination.TotalFolders,
+			TotalFiles:   dbPagination.TotalFiles,
+			HasMore:      dbPagination.HasMore,
+		},
 	}, nil
 }
 
