@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Project-Sylos/Migration-Engine/pkg/migration"
+	"github.com/Project-Sylos/Spectra/sdk"
 	"github.com/Project-Sylos/Sylos-API/internal/corebridge/database"
 	"github.com/Project-Sylos/Sylos-API/internal/corebridge/metadata"
 	"github.com/Project-Sylos/Sylos-API/internal/corebridge/migrations"
@@ -15,6 +16,8 @@ import (
 	"github.com/Project-Sylos/Sylos-API/internal/corebridge/services"
 	"github.com/Project-Sylos/Sylos-API/internal/corebridge/terminal"
 	"github.com/Project-Sylos/Sylos-API/pkg/config"
+	fslib "github.com/Project-Sylos/Sylos-FS/pkg/fs"
+	fstypes "github.com/Project-Sylos/Sylos-FS/pkg/types"
 	"github.com/rs/zerolog"
 )
 
@@ -213,11 +216,65 @@ func (m *Manager) StartMigration(ctx context.Context, req StartMigrationRequest)
 	}, nil
 }
 
+// ChangePhase changes the migration phase (traversal or copy) with pending work validation
+func (m *Manager) ChangePhase(ctx context.Context, migrationID string, phase string, req StartMigrationRequest) (Migration, error) {
+	// Validate phase
+	if phase != "traversal" && phase != "copy" {
+		return Migration{}, fmt.Errorf("invalid phase: %s (must be 'traversal' or 'copy')", phase)
+	}
+
+	// Check pending work
+	pendingWork, err := m.CheckPendingWork(ctx, migrationID)
+	if err != nil {
+		return Migration{}, fmt.Errorf("failed to check pending work: %w", err)
+	}
+
+	// Block copy phase if there are pending retries
+	if phase == "copy" && pendingWork.HasPendingRetries {
+		return Migration{}, fmt.Errorf("cannot start copy phase: there are pending retries. Please run traversal phase first")
+	}
+
+	// Run exclusion sweep if there are pending exclusions (blocking)
+	if pendingWork.HasPendingExclusions {
+		m.logger.Info().
+			Str("migration_id", migrationID).
+			Str("phase", phase).
+			Msg("running exclusion sweep before phase change")
+
+		// Run exclusion sweep synchronously before starting the phase
+		_, err := m.TriggerExclusionSweep(ctx, migrationID, SweepConfigRequest{})
+		if err != nil {
+			return Migration{}, fmt.Errorf("failed to run exclusion sweep: %w", err)
+		}
+
+		m.logger.Info().
+			Str("migration_id", migrationID).
+			Msg("exclusion sweep completed, proceeding with phase change")
+	}
+
+	// Start the migration (which will handle the phase based on checkpoint state)
+	// The Migration Engine will automatically handle traversal vs copy based on checkpoint state
+	return m.StartMigration(ctx, req)
+}
+
 func (m *Manager) GetMigrationStatus(ctx context.Context, id string) (Status, error) {
 	migStatus, err := m.migrationsMgr.GetMigrationStatus(ctx, id)
 	if err != nil {
 		return Status{}, err
 	}
+
+	// Get checkpoint status from YAML config
+	var checkpointStatus string
+	metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
+	meta, err := metaMgr.GetMigrationMetadata(id)
+	if err == nil && meta.ConfigPath != "" {
+		// Try to load YAML config to get checkpoint state
+		yamlCfg, err := migration.LoadMigrationConfig(meta.ConfigPath)
+		if err == nil {
+			checkpointStatus = yamlCfg.State.Status
+		}
+	}
+
 	return Status{
 		Migration: Migration{
 			ID:            migStatus.ID,
@@ -226,9 +283,10 @@ func (m *Manager) GetMigrationStatus(ctx context.Context, id string) (Status, er
 			StartedAt:     migStatus.StartedAt,
 			Status:        migStatus.Status,
 		},
-		CompletedAt: migStatus.CompletedAt,
-		Error:       migStatus.Error,
-		Result:      convertResultView(migStatus.Result),
+		CompletedAt:      migStatus.CompletedAt,
+		Error:            migStatus.Error,
+		Result:           convertResultView(migStatus.Result),
+		CheckpointStatus: checkpointStatus,
 	}, nil
 }
 
@@ -708,14 +766,13 @@ func (m *Manager) ListChildrenDiffs(ctx context.Context, req ListChildrenDiffsRe
 	// Get DB instance - tries record.DB first, then pool
 	boltDB := m.migrationsMgr.GetDB(req.MigrationID)
 
-	var dbFolders []database.DiffItem
-	var dbFiles []database.DiffItem
+	var dbItems map[string]database.PathNodes
 	var dbPagination database.PaginationInfo
 	var err error
 
 	if boltDB != nil {
 		// Use the shared DB instance from the pool
-		dbFolders, dbFiles, dbPagination, err = database.GetChildrenDiffsFromDBInstance(ctx, m.logger, boltDB, req.Path, req.Offset, req.Limit, req.FoldersOnly)
+		dbItems, dbPagination, err = database.GetChildrenDiffsFromDBInstance(ctx, m.logger, boltDB, req.Path, req.Offset, req.Limit, req.FoldersOnly)
 		if err != nil {
 			// Check if this is a database not available error - indicates DB was closed unexpectedly
 			if isDatabaseNotAvailableError(err) {
@@ -755,54 +812,56 @@ func (m *Manager) ListChildrenDiffs(ctx context.Context, req ListChildrenDiffsRe
 		}
 
 		// Get children diffs from database
-		dbFolders, dbFiles, dbPagination, err = database.GetChildrenDiffsFromDB(ctx, m.logger, dbPath, req.Path, req.Offset, req.Limit, req.FoldersOnly)
+		dbItems, dbPagination, err = database.GetChildrenDiffsFromDB(ctx, m.logger, dbPath, req.Path, req.Offset, req.Limit, req.FoldersOnly)
 		if err != nil {
 			return ListChildrenDiffsResponse{}, fmt.Errorf("failed to get children diffs: %w", err)
 		}
 	}
 
 	// Convert database types to corebridge types
-	folders := make([]DiffItem, len(dbFolders))
-	for i, item := range dbFolders {
-		folders[i] = DiffItem{
-			Id:              item.Id,
-			ParentId:        item.ParentId,
-			ParentPath:      item.ParentPath,
-			DisplayName:     item.DisplayName,
-			LocationPath:    item.LocationPath,
-			LastUpdated:     item.LastUpdated,
-			DepthLevel:      item.DepthLevel,
-			Type:            item.Type,
-			Size:            item.Size,
-			TraversalStatus: item.TraversalStatus,
-			CopyStatus:      item.CopyStatus,
-			InSrc:           item.InSrc,
-			InDst:           item.InDst,
-		}
-	}
+	items := make(map[string]PathNodes, len(dbItems))
+	for path, dbPathNodes := range dbItems {
+		pathNodes := PathNodes{}
 
-	files := make([]DiffItem, len(dbFiles))
-	for i, item := range dbFiles {
-		files[i] = DiffItem{
-			Id:              item.Id,
-			ParentId:        item.ParentId,
-			ParentPath:      item.ParentPath,
-			DisplayName:     item.DisplayName,
-			LocationPath:    item.LocationPath,
-			LastUpdated:     item.LastUpdated,
-			DepthLevel:      item.DepthLevel,
-			Type:            item.Type,
-			Size:            item.Size,
-			TraversalStatus: item.TraversalStatus,
-			CopyStatus:      item.CopyStatus,
-			InSrc:           item.InSrc,
-			InDst:           item.InDst,
+		if dbPathNodes.Src != nil {
+			pathNodes.Src = &PathNodeItem{
+				Queue:           dbPathNodes.Src.Queue,
+				Id:              dbPathNodes.Src.Id,
+				ParentId:        dbPathNodes.Src.ParentId,
+				ParentPath:      dbPathNodes.Src.ParentPath,
+				DisplayName:     dbPathNodes.Src.DisplayName,
+				LocationPath:    dbPathNodes.Src.LocationPath,
+				LastUpdated:     dbPathNodes.Src.LastUpdated,
+				DepthLevel:      dbPathNodes.Src.DepthLevel,
+				Type:            dbPathNodes.Src.Type,
+				Size:            dbPathNodes.Src.Size,
+				TraversalStatus: dbPathNodes.Src.TraversalStatus,
+				CopyStatus:      dbPathNodes.Src.CopyStatus,
+			}
 		}
+
+		if dbPathNodes.Dst != nil {
+			pathNodes.Dst = &PathNodeItem{
+				Queue:           dbPathNodes.Dst.Queue,
+				Id:              dbPathNodes.Dst.Id,
+				ParentId:        dbPathNodes.Dst.ParentId,
+				ParentPath:      dbPathNodes.Dst.ParentPath,
+				DisplayName:     dbPathNodes.Dst.DisplayName,
+				LocationPath:    dbPathNodes.Dst.LocationPath,
+				LastUpdated:     dbPathNodes.Dst.LastUpdated,
+				DepthLevel:      dbPathNodes.Dst.DepthLevel,
+				Type:            dbPathNodes.Dst.Type,
+				Size:            dbPathNodes.Dst.Size,
+				TraversalStatus: dbPathNodes.Dst.TraversalStatus,
+				CopyStatus:      dbPathNodes.Dst.CopyStatus,
+			}
+		}
+
+		items[path] = pathNodes
 	}
 
 	return ListChildrenDiffsResponse{
-		Folders: folders,
-		Files:   files,
+		Items: items,
 		Pagination: PaginationInfo{
 			Offset:       dbPagination.Offset,
 			Limit:        dbPagination.Limit,
@@ -811,6 +870,850 @@ func (m *Manager) ListChildrenDiffs(ctx context.Context, req ListChildrenDiffsRe
 			TotalFiles:   dbPagination.TotalFiles,
 			HasMore:      dbPagination.HasMore,
 		},
+	}, nil
+}
+
+// ExcludeNode excludes a node and queues its children for exclusion propagation
+func (m *Manager) ExcludeNode(ctx context.Context, migrationID string, nodeID string) (*ExclusionResponse, error) {
+	// Get DB instance
+	boltDB := m.migrationsMgr.GetDB(migrationID)
+	if boltDB == nil {
+		// Try to get DB path and open it
+		metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
+		meta, err := metaMgr.GetMigrationMetadata(migrationID)
+		if err != nil {
+			return &ExclusionResponse{
+				Success: false,
+				Error:   "migration not found",
+			}, ErrMigrationNotFound
+		}
+
+		// Derive database path from config path
+		dbPath := strings.TrimSuffix(meta.ConfigPath, ".yaml") + ".db"
+		if dbPath == ".db" {
+			dbPath, err = database.ResolveDatabasePath(m.cfg.Runtime.DataDir, "", migrationID)
+			if err != nil {
+				return &ExclusionResponse{
+					Success: false,
+					Error:   "failed to resolve database path",
+				}, fmt.Errorf("failed to resolve database path: %w", err)
+			}
+		}
+
+		// Check if database file exists
+		if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+			return &ExclusionResponse{
+				Success: false,
+				Error:   "migration database not found",
+			}, ErrMigrationNotFound
+		}
+
+		// Open database for update
+		var errOpen error
+		boltDB, _, errOpen = migration.SetupDatabase(migration.DatabaseConfig{
+			Path:           dbPath,
+			RemoveExisting: false,
+		})
+		if errOpen != nil {
+			return &ExclusionResponse{
+				Success: false,
+				Error:   "failed to open database",
+			}, fmt.Errorf("failed to open database: %w", errOpen)
+		}
+		defer func() {
+			if err := boltDB.Close(); err != nil {
+				m.logger.Warn().Err(err).Str("migration_id", migrationID).Msg("failed to close database after exclusion")
+			}
+		}()
+	}
+
+	// Perform exclusion
+	err := database.SetNodeExclusion(ctx, m.logger, boltDB, nodeID, true)
+	if err != nil {
+		m.logger.Error().Err(err).Str("migration_id", migrationID).Str("node_id", nodeID).Msg("failed to exclude node")
+		return &ExclusionResponse{
+			Success: false,
+			Error:   err.Error(),
+		}, err
+	}
+
+	// Mark that user made changes during path review
+	if err := m.markPathReviewChanges(migrationID, true); err != nil {
+		m.logger.Warn().Err(err).Str("migration_id", migrationID).Msg("failed to mark path review changes")
+		// Don't fail the exclusion, just log the warning
+	}
+
+	return &ExclusionResponse{
+		Success: true,
+	}, nil
+}
+
+// UnexcludeNode unexcludes a node and queues its children for unexclusion propagation
+func (m *Manager) UnexcludeNode(ctx context.Context, migrationID string, nodeID string) (*ExclusionResponse, error) {
+	// Get DB instance
+	boltDB := m.migrationsMgr.GetDB(migrationID)
+	if boltDB == nil {
+		// Try to get DB path and open it
+		metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
+		meta, err := metaMgr.GetMigrationMetadata(migrationID)
+		if err != nil {
+			return &ExclusionResponse{
+				Success: false,
+				Error:   "migration not found",
+			}, ErrMigrationNotFound
+		}
+
+		// Derive database path from config path
+		dbPath := strings.TrimSuffix(meta.ConfigPath, ".yaml") + ".db"
+		if dbPath == ".db" {
+			dbPath, err = database.ResolveDatabasePath(m.cfg.Runtime.DataDir, "", migrationID)
+			if err != nil {
+				return &ExclusionResponse{
+					Success: false,
+					Error:   "failed to resolve database path",
+				}, fmt.Errorf("failed to resolve database path: %w", err)
+			}
+		}
+
+		// Check if database file exists
+		if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+			return &ExclusionResponse{
+				Success: false,
+				Error:   "migration database not found",
+			}, ErrMigrationNotFound
+		}
+
+		// Open database for update
+		var errOpen error
+		boltDB, _, errOpen = migration.SetupDatabase(migration.DatabaseConfig{
+			Path:           dbPath,
+			RemoveExisting: false,
+		})
+		if errOpen != nil {
+			return &ExclusionResponse{
+				Success: false,
+				Error:   "failed to open database",
+			}, fmt.Errorf("failed to open database: %w", errOpen)
+		}
+		defer func() {
+			if err := boltDB.Close(); err != nil {
+				m.logger.Warn().Err(err).Str("migration_id", migrationID).Msg("failed to close database after unexclusion")
+			}
+		}()
+	}
+
+	// Perform unexclusion
+	err := database.SetNodeExclusion(ctx, m.logger, boltDB, nodeID, false)
+	if err != nil {
+		m.logger.Error().Err(err).Str("migration_id", migrationID).Str("node_id", nodeID).Msg("failed to unexclude node")
+		return &ExclusionResponse{
+			Success: false,
+			Error:   err.Error(),
+		}, err
+	}
+
+	// Mark that user made changes during path review
+	if err := m.markPathReviewChanges(migrationID, true); err != nil {
+		m.logger.Warn().Err(err).Str("migration_id", migrationID).Msg("failed to mark path review changes")
+		// Don't fail the unexclusion, just log the warning
+	}
+
+	return &ExclusionResponse{
+		Success: true,
+	}, nil
+}
+
+// TriggerExclusionSweep triggers an exclusion sweep for a migration
+func (m *Manager) TriggerExclusionSweep(ctx context.Context, migrationID string, config SweepConfigRequest) (SweepResponse, error) {
+	// Get metadata to find config path
+	metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
+	meta, err := metaMgr.GetMigrationMetadata(migrationID)
+	if err != nil {
+		return SweepResponse{
+			Success: false,
+			Error:   "migration not found",
+		}, ErrMigrationNotFound
+	}
+
+	// Check if config path exists
+	configPath := meta.ConfigPath
+	if configPath == "" {
+		// Try to derive from migration ID
+		dbPath, err := database.ResolveDatabasePath(m.cfg.Runtime.DataDir, "", migrationID)
+		if err != nil {
+			return SweepResponse{
+				Success: false,
+				Error:   "failed to resolve database path",
+			}, fmt.Errorf("failed to resolve database path: %w", err)
+		}
+		configPath = database.ConfigPathFromDatabasePath(dbPath)
+	}
+
+	// Check if config file exists
+	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+		return SweepResponse{
+			Success: false,
+			Error:   fmt.Sprintf("migration config file not found: %s", configPath),
+		}, fmt.Errorf("migration config file not found: %s", configPath)
+	}
+
+	// Check if Spectra override config exists
+	overridePath, exists, _ := services.LoadSpectraConfigOverride(m.cfg.Runtime.DataDir, migrationID)
+	var spectraConfigPath string
+	if exists {
+		spectraConfigPath = overridePath
+	}
+
+	// Load YAML config and reconstruct adapters
+	adapterFactory := m.createAdapterFactoryForSweep(spectraConfigPath)
+	migrationCfg, err := migration.LoadMigrationConfigFromYAML(configPath, adapterFactory)
+	if err != nil {
+		return SweepResponse{
+			Success: false,
+			Error:   fmt.Sprintf("failed to load migration config: %v", err),
+		}, fmt.Errorf("failed to load migration config: %w", err)
+	}
+
+	// Get or open DB instance
+	dbInstance := m.migrationsMgr.GetDB(migrationID)
+	if dbInstance == nil {
+		// Try to open DB
+		dbPath := migrationCfg.Database.Path
+		if dbPath == "" {
+			return SweepResponse{
+				Success: false,
+				Error:   "database path not found in config",
+			}, fmt.Errorf("database path not found in config")
+		}
+
+		// Open database using migration.SetupDatabase (same pattern as ExcludeNode)
+		var errOpen error
+		dbInstance, _, errOpen = migration.SetupDatabase(migration.DatabaseConfig{
+			Path:           dbPath,
+			RemoveExisting: false,
+		})
+		if errOpen != nil {
+			return SweepResponse{
+				Success: false,
+				Error:   "failed to open database",
+			}, fmt.Errorf("failed to open database: %w", errOpen)
+		}
+	}
+
+	// Build sweep config with defaults and overrides
+	sweepCfg := migration.SweepConfig{
+		BoltDB:      dbInstance,
+		SrcAdapter:  migrationCfg.Source.Adapter,
+		DstAdapter:  migrationCfg.Destination.Adapter,
+		WorkerCount: m.selectWorkerCountForSweep(config.WorkerCount),
+		MaxRetries:  m.selectMaxRetriesForSweep(config.MaxRetries),
+	}
+
+	// Apply optional config overrides
+	if config.LogAddress != "" {
+		sweepCfg.LogAddress = config.LogAddress
+	} else if m.cfg.Runtime.LogAddress != "" {
+		sweepCfg.LogAddress = m.cfg.Runtime.LogAddress
+	}
+
+	if config.LogLevel != "" {
+		sweepCfg.LogLevel = config.LogLevel
+	} else if m.cfg.Runtime.LogLevel != "" {
+		sweepCfg.LogLevel = m.cfg.Runtime.LogLevel
+	} else {
+		sweepCfg.LogLevel = "info"
+	}
+
+	if config.SkipListener != nil {
+		sweepCfg.SkipListener = *config.SkipListener
+	} else {
+		sweepCfg.SkipListener = true // Default to skip listener
+	}
+
+	if config.StartupDelaySec > 0 {
+		sweepCfg.StartupDelay = time.Duration(config.StartupDelaySec) * time.Second
+	} else {
+		sweepCfg.StartupDelay = 500 * time.Millisecond
+	}
+
+	if config.ProgressTickMillis > 0 {
+		sweepCfg.ProgressTick = time.Duration(config.ProgressTickMillis) * time.Millisecond
+	} else {
+		sweepCfg.ProgressTick = 1 * time.Second
+	}
+
+	// Use request context for shutdown if needed
+	sweepCfg.ShutdownContext = ctx
+
+	// Start sweep in goroutine (hybrid async pattern)
+	go func() {
+		stats, err := migration.RunExclusionSweep(sweepCfg)
+		if err != nil {
+			m.logger.Error().
+				Err(err).
+				Str("migration_id", migrationID).
+				Msg("exclusion sweep failed")
+			return
+		}
+
+		m.logger.Info().
+			Str("migration_id", migrationID).
+			Dur("duration", stats.Duration).
+			Int("src_round", stats.Src.Round).
+			Int("src_pending", stats.Src.Pending).
+			Int("dst_round", stats.Dst.Round).
+			Int("dst_pending", stats.Dst.Pending).
+			Msg("exclusion sweep completed")
+
+		// Clear path review changes flag on successful sweep completion
+		if err := m.markPathReviewChanges(migrationID, false); err != nil {
+			m.logger.Warn().Err(err).Str("migration_id", migrationID).Msg("failed to clear path review changes flag")
+		}
+	}()
+
+	return SweepResponse{
+		Success: true,
+		Message: "Exclusion sweep started",
+	}, nil
+}
+
+// TriggerRetrySweep triggers a retry sweep for a migration
+func (m *Manager) TriggerRetrySweep(ctx context.Context, migrationID string, config SweepConfigRequest) (SweepResponse, error) {
+	// Get metadata to find config path
+	metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
+	meta, err := metaMgr.GetMigrationMetadata(migrationID)
+	if err != nil {
+		return SweepResponse{
+			Success: false,
+			Error:   "migration not found",
+		}, ErrMigrationNotFound
+	}
+
+	// Check if config path exists
+	configPath := meta.ConfigPath
+	if configPath == "" {
+		// Try to derive from migration ID
+		dbPath, err := database.ResolveDatabasePath(m.cfg.Runtime.DataDir, "", migrationID)
+		if err != nil {
+			return SweepResponse{
+				Success: false,
+				Error:   "failed to resolve database path",
+			}, fmt.Errorf("failed to resolve database path: %w", err)
+		}
+		configPath = database.ConfigPathFromDatabasePath(dbPath)
+	}
+
+	// Check if config file exists
+	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+		return SweepResponse{
+			Success: false,
+			Error:   fmt.Sprintf("migration config file not found: %s", configPath),
+		}, fmt.Errorf("migration config file not found: %s", configPath)
+	}
+
+	// Check if Spectra override config exists
+	overridePath, exists, _ := services.LoadSpectraConfigOverride(m.cfg.Runtime.DataDir, migrationID)
+	var spectraConfigPath string
+	if exists {
+		spectraConfigPath = overridePath
+	}
+
+	// Load YAML config to update checkpoint state (without adapters, just for state)
+	yamlCfg, err := migration.LoadMigrationConfig(configPath)
+	if err != nil {
+		return SweepResponse{
+			Success: false,
+			Error:   fmt.Sprintf("failed to load migration config: %v", err),
+		}, fmt.Errorf("failed to load migration config: %w", err)
+	}
+
+	// Set MaxKnownDepth (default to -1 for auto-detect if not specified)
+	maxKnownDepth := config.MaxKnownDepth
+	if maxKnownDepth == 0 {
+		maxKnownDepth = -1
+	}
+
+	// Step 1: Update checkpoint state to Filters-Set with retry metadata
+	// This must be done before running the retry sweep
+	// TODO: Use migration.SetStatusFiltersSet(yamlCfg, true, maxKnownDepth) when SDK is updated
+	// For now, set state directly (SDK may not have SetStatusFiltersSet yet)
+	yamlCfg.State.Status = "Filters-Set"
+	// Note: IsRetrySweep and MaxKnownDepth fields may need to be set once SDK is updated
+	// These fields should be in StateConfig: IsRetrySweep *bool, MaxKnownDepth *int
+
+	if err := migration.SaveMigrationConfig(configPath, yamlCfg); err != nil {
+		return SweepResponse{
+			Success: false,
+			Error:   fmt.Sprintf("failed to update checkpoint state: %v", err),
+		}, fmt.Errorf("failed to save migration config: %w", err)
+	}
+
+	m.logger.Info().
+		Str("migration_id", migrationID).
+		Str("checkpoint_status", "Filters-Set").
+		Int("max_known_depth", maxKnownDepth).
+		Msg("updated checkpoint state to Filters-Set for retry sweep")
+
+	// Load full config with adapters for sweep execution
+	adapterFactory := m.createAdapterFactoryForSweep(spectraConfigPath)
+	migrationCfg, err := migration.LoadMigrationConfigFromYAML(configPath, adapterFactory)
+	if err != nil {
+		return SweepResponse{
+			Success: false,
+			Error:   fmt.Sprintf("failed to load migration config with adapters: %v", err),
+		}, fmt.Errorf("failed to load migration config: %w", err)
+	}
+
+	// Get or open DB instance
+	dbInstance := m.migrationsMgr.GetDB(migrationID)
+	if dbInstance == nil {
+		// Try to open DB
+		dbPath := migrationCfg.Database.Path
+		if dbPath == "" {
+			return SweepResponse{
+				Success: false,
+				Error:   "database path not found in config",
+			}, fmt.Errorf("database path not found in config")
+		}
+
+		// Open database using migration.SetupDatabase (same pattern as ExcludeNode)
+		var errOpen error
+		dbInstance, _, errOpen = migration.SetupDatabase(migration.DatabaseConfig{
+			Path:           dbPath,
+			RemoveExisting: false,
+		})
+		if errOpen != nil {
+			return SweepResponse{
+				Success: false,
+				Error:   "failed to open database",
+			}, fmt.Errorf("failed to open database: %w", errOpen)
+		}
+	}
+
+	// Build sweep config with defaults and overrides
+	sweepCfg := migration.SweepConfig{
+		BoltDB:        dbInstance,
+		SrcAdapter:    migrationCfg.Source.Adapter,
+		DstAdapter:    migrationCfg.Destination.Adapter,
+		WorkerCount:   m.selectWorkerCountForSweep(config.WorkerCount),
+		MaxRetries:    m.selectMaxRetriesForSweep(config.MaxRetries),
+		MaxKnownDepth: maxKnownDepth,
+	}
+
+	// Apply optional config overrides
+	if config.LogAddress != "" {
+		sweepCfg.LogAddress = config.LogAddress
+	} else if m.cfg.Runtime.LogAddress != "" {
+		sweepCfg.LogAddress = m.cfg.Runtime.LogAddress
+	}
+
+	if config.LogLevel != "" {
+		sweepCfg.LogLevel = config.LogLevel
+	} else if m.cfg.Runtime.LogLevel != "" {
+		sweepCfg.LogLevel = m.cfg.Runtime.LogLevel
+	} else {
+		sweepCfg.LogLevel = "info"
+	}
+
+	if config.SkipListener != nil {
+		sweepCfg.SkipListener = *config.SkipListener
+	} else {
+		sweepCfg.SkipListener = true // Default to skip listener
+	}
+
+	if config.StartupDelaySec > 0 {
+		sweepCfg.StartupDelay = time.Duration(config.StartupDelaySec) * time.Second
+	} else {
+		sweepCfg.StartupDelay = 500 * time.Millisecond
+	}
+
+	if config.ProgressTickMillis > 0 {
+		sweepCfg.ProgressTick = time.Duration(config.ProgressTickMillis) * time.Millisecond
+	} else {
+		sweepCfg.ProgressTick = 1 * time.Second
+	}
+
+	// Use request context for shutdown if needed
+	sweepCfg.ShutdownContext = ctx
+
+	// Start sweep in goroutine (hybrid async pattern)
+	go func() {
+		stats, err := migration.RunRetrySweep(sweepCfg)
+		if err != nil {
+			m.logger.Error().
+				Err(err).
+				Str("migration_id", migrationID).
+				Msg("retry sweep failed")
+			return
+		}
+
+		m.logger.Info().
+			Str("migration_id", migrationID).
+			Dur("duration", stats.Duration).
+			Int("src_round", stats.Src.Round).
+			Int("src_pending", stats.Src.Pending).
+			Int("src_in_progress", stats.Src.InProgress).
+			Int("dst_round", stats.Dst.Round).
+			Int("dst_pending", stats.Dst.Pending).
+			Int("dst_in_progress", stats.Dst.InProgress).
+			Msg("retry sweep completed")
+
+		// Clear path review changes flag on successful sweep completion
+		if err := m.markPathReviewChanges(migrationID, false); err != nil {
+			m.logger.Warn().Err(err).Str("migration_id", migrationID).Msg("failed to clear path review changes flag")
+		}
+	}()
+
+	return SweepResponse{
+		Success: true,
+		Message: "Retry sweep started",
+	}, nil
+}
+
+// Helper methods for selecting defaults
+func (m *Manager) selectWorkerCountForSweep(value int) int {
+	if value > 0 {
+		return value
+	}
+	if m.cfg.Runtime.DefaultWorkerCount > 0 {
+		return m.cfg.Runtime.DefaultWorkerCount
+	}
+	return 10
+}
+
+func (m *Manager) selectMaxRetriesForSweep(value int) int {
+	if value > 0 {
+		return value
+	}
+	if m.cfg.Runtime.DefaultMaxRetries > 0 {
+		return m.cfg.Runtime.DefaultMaxRetries
+	}
+	return 3
+}
+
+// createAdapterFactoryForSweep creates an adapter factory for reconstructing adapters from YAML config
+// This mirrors the logic in migrations.Manager.createAdapterFactory
+func (m *Manager) createAdapterFactoryForSweep(spectraConfigOverridePath string) migration.AdapterFactory {
+	return func(serviceType string, serviceCfg migration.ServiceConfigYAML, serviceConfigs map[string]interface{}) (fstypes.FSAdapter, error) {
+		switch strings.ToLower(serviceType) {
+		case "spectra":
+			// Use override config if provided, otherwise try to extract from serviceConfigs
+			configPath := spectraConfigOverridePath
+			if configPath == "" {
+				// Try to get original config path from service name
+				def, err := m.serviceMgr.GetServiceDefinition(serviceCfg.Name)
+				if err == nil && def.Spectra != nil {
+					configPath = def.Spectra.ConfigPath
+				} else {
+					// Try to find by world if name lookup fails
+					world := "primary"
+					if strings.Contains(strings.ToLower(serviceCfg.Name), "s1") {
+						world = "s1"
+					}
+					def, err := m.serviceMgr.GetServiceDefinitionByWorld(world)
+					if err == nil && def.Spectra != nil {
+						configPath = def.Spectra.ConfigPath
+					} else {
+						return nil, fmt.Errorf("spectra config path not found for service %s", serviceCfg.Name)
+					}
+				}
+			}
+
+			spectraFS, err := sdk.New(configPath)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create SpectraFS: %w", err)
+			}
+
+			rootID := serviceCfg.RootID
+			if rootID == "" {
+				rootID = "root"
+			}
+
+			// Extract world from service name or use default
+			world := "primary"
+			if strings.Contains(strings.ToLower(serviceCfg.Name), "s1") {
+				world = "s1"
+			} else {
+				// Try to get world from service definition
+				def, err := m.serviceMgr.GetServiceDefinition(serviceCfg.Name)
+				if err == nil && def.Spectra != nil {
+					world = def.Spectra.World
+				} else {
+					// Try to find by world
+					def, err := m.serviceMgr.GetServiceDefinitionByWorld(world)
+					if err == nil && def.Spectra != nil {
+						world = def.Spectra.World
+					}
+				}
+			}
+
+			adapter, err := fslib.NewSpectraFS(spectraFS, rootID, world)
+			if err != nil {
+				_ = spectraFS.Close()
+				return nil, fmt.Errorf("failed to create SpectraFS adapter: %w", err)
+			}
+
+			return adapter, nil
+
+		case "local":
+			// For local services, use RootPath
+			rootPath := serviceCfg.RootPath
+			if rootPath == "" {
+				return nil, fmt.Errorf("local service %s missing root path", serviceCfg.Name)
+			}
+
+			adapter, err := fslib.NewLocalFS(rootPath)
+			if err != nil {
+				return nil, fmt.Errorf("failed to create LocalFS adapter: %w", err)
+			}
+
+			return adapter, nil
+
+		default:
+			return nil, fmt.Errorf("unsupported service type: %s", serviceType)
+		}
+	}
+}
+
+// markPathReviewChanges updates the HasPathReviewChanges flag in migration metadata
+// This flag tracks if the user made changes (exclusions, retries) during path review
+// Set to true when user makes changes, false when sweeps complete successfully
+func (m *Manager) markPathReviewChanges(migrationID string, hasChanges bool) error {
+	metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
+	meta, err := metaMgr.GetMigrationMetadata(migrationID)
+	if err != nil {
+		// If metadata doesn't exist yet, create it
+		meta = metadata.MigrationMetadata{
+			ID:                   migrationID,
+			Name:                 migrationID,
+			HasPathReviewChanges: hasChanges,
+		}
+	} else {
+		// Update existing metadata
+		meta.HasPathReviewChanges = hasChanges
+	}
+
+	return metaMgr.UpdateMigrationMetadata(meta)
+}
+
+// CheckPendingWork checks if there are pending exclusions or retries for a migration
+func (m *Manager) CheckPendingWork(ctx context.Context, migrationID string) (PendingWorkResponse, error) {
+	// Get DB instance
+	dbInstance := m.migrationsMgr.GetDB(migrationID)
+	if dbInstance == nil {
+		// Try to get DB path and open it
+		metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
+		meta, err := metaMgr.GetMigrationMetadata(migrationID)
+		if err != nil {
+			return PendingWorkResponse{}, ErrMigrationNotFound
+		}
+
+		// Derive database path from config path
+		dbPath := strings.TrimSuffix(meta.ConfigPath, ".yaml") + ".db"
+		if dbPath == ".db" {
+			dbPath, err = database.ResolveDatabasePath(m.cfg.Runtime.DataDir, "", migrationID)
+			if err != nil {
+				return PendingWorkResponse{}, fmt.Errorf("failed to resolve database path: %w", err)
+			}
+		}
+
+		// Check if database file exists
+		if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+			return PendingWorkResponse{}, ErrMigrationNotFound
+		}
+
+		// Open database for read
+		var errOpen error
+		dbInstance, _, errOpen = migration.SetupDatabase(migration.DatabaseConfig{
+			Path:           dbPath,
+			RemoveExisting: false,
+		})
+		if errOpen != nil {
+			return PendingWorkResponse{}, fmt.Errorf("failed to open database: %w", errOpen)
+		}
+		defer func() {
+			if err := dbInstance.Close(); err != nil {
+				m.logger.Warn().Err(err).Str("migration_id", migrationID).Msg("failed to close database after checking pending work")
+			}
+		}()
+	}
+
+	// Count pending exclusions
+	exclusionsCount, err := database.CountPendingExclusions(ctx, m.logger, dbInstance)
+	if err != nil {
+		return PendingWorkResponse{}, fmt.Errorf("failed to count pending exclusions: %w", err)
+	}
+
+	// Count pending retries
+	retriesCount, err := database.CountPendingRetries(ctx, m.logger, dbInstance)
+	if err != nil {
+		return PendingWorkResponse{}, fmt.Errorf("failed to count pending retries: %w", err)
+	}
+
+	// Check if user made changes during path review (from metadata)
+	metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
+	meta, err := metaMgr.GetMigrationMetadata(migrationID)
+	hasUnsavedChanges := false
+	if err == nil {
+		hasUnsavedChanges = meta.HasPathReviewChanges
+	}
+
+	return PendingWorkResponse{
+		HasPendingExclusions:   exclusionsCount > 0,
+		HasPendingRetries:      retriesCount > 0,
+		HasPathReviewChanges:   hasUnsavedChanges,
+		PendingExclusionsCount: exclusionsCount,
+		PendingRetriesCount:    retriesCount,
+	}, nil
+}
+
+// MarkNodeForRetry marks a failed node for retry
+func (m *Manager) MarkNodeForRetry(ctx context.Context, migrationID string, nodeID string) (*MarkRetryResponse, error) {
+	// Get DB instance
+	dbInstance := m.migrationsMgr.GetDB(migrationID)
+	if dbInstance == nil {
+		// Try to get DB path and open it
+		metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
+		meta, err := metaMgr.GetMigrationMetadata(migrationID)
+		if err != nil {
+			return &MarkRetryResponse{
+				Success: false,
+				Error:   "migration not found",
+			}, ErrMigrationNotFound
+		}
+
+		// Derive database path from config path
+		dbPath := strings.TrimSuffix(meta.ConfigPath, ".yaml") + ".db"
+		if dbPath == ".db" {
+			dbPath, err = database.ResolveDatabasePath(m.cfg.Runtime.DataDir, "", migrationID)
+			if err != nil {
+				return &MarkRetryResponse{
+					Success: false,
+					Error:   "failed to resolve database path",
+				}, fmt.Errorf("failed to resolve database path: %w", err)
+			}
+		}
+
+		// Check if database file exists
+		if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+			return &MarkRetryResponse{
+				Success: false,
+				Error:   "migration database not found",
+			}, ErrMigrationNotFound
+		}
+
+		// Open database for update
+		var errOpen error
+		dbInstance, _, errOpen = migration.SetupDatabase(migration.DatabaseConfig{
+			Path:           dbPath,
+			RemoveExisting: false,
+		})
+		if errOpen != nil {
+			return &MarkRetryResponse{
+				Success: false,
+				Error:   "failed to open database",
+			}, fmt.Errorf("failed to open database: %w", errOpen)
+		}
+		defer func() {
+			if err := dbInstance.Close(); err != nil {
+				m.logger.Warn().Err(err).Str("migration_id", migrationID).Msg("failed to close database after marking node for retry")
+			}
+		}()
+	}
+
+	// Mark node for retry
+	err := database.MarkNodeForRetry(ctx, m.logger, dbInstance, nodeID)
+	if err != nil {
+		m.logger.Error().Err(err).Str("migration_id", migrationID).Str("node_id", nodeID).Msg("failed to mark node for retry")
+		return &MarkRetryResponse{
+			Success: false,
+			Error:   err.Error(),
+		}, err
+	}
+
+	// Mark that user made changes during path review
+	if err := m.markPathReviewChanges(migrationID, true); err != nil {
+		m.logger.Warn().Err(err).Str("migration_id", migrationID).Msg("failed to mark path review changes")
+		// Don't fail the retry marking, just log the warning
+	}
+
+	return &MarkRetryResponse{
+		Success: true,
+	}, nil
+}
+
+// UnmarkNodeForRetry unmarks a pending node for retry (changes status back to failed)
+func (m *Manager) UnmarkNodeForRetry(ctx context.Context, migrationID string, nodeID string) (*MarkRetryResponse, error) {
+	// Get DB instance
+	dbInstance := m.migrationsMgr.GetDB(migrationID)
+	if dbInstance == nil {
+		// Try to get DB path and open it
+		metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
+		meta, err := metaMgr.GetMigrationMetadata(migrationID)
+		if err != nil {
+			return &MarkRetryResponse{
+				Success: false,
+				Error:   "migration not found",
+			}, ErrMigrationNotFound
+		}
+
+		// Derive database path from config path
+		dbPath := strings.TrimSuffix(meta.ConfigPath, ".yaml") + ".db"
+		if dbPath == ".db" {
+			dbPath, err = database.ResolveDatabasePath(m.cfg.Runtime.DataDir, "", migrationID)
+			if err != nil {
+				return &MarkRetryResponse{
+					Success: false,
+					Error:   "failed to resolve database path",
+				}, fmt.Errorf("failed to resolve database path: %w", err)
+			}
+		}
+
+		// Check if database file exists
+		if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+			return &MarkRetryResponse{
+				Success: false,
+				Error:   "migration database not found",
+			}, ErrMigrationNotFound
+		}
+
+		// Open database for update
+		var errOpen error
+		dbInstance, _, errOpen = migration.SetupDatabase(migration.DatabaseConfig{
+			Path:           dbPath,
+			RemoveExisting: false,
+		})
+		if errOpen != nil {
+			return &MarkRetryResponse{
+				Success: false,
+				Error:   "failed to open database",
+			}, fmt.Errorf("failed to open database: %w", errOpen)
+		}
+		defer func() {
+			if err := dbInstance.Close(); err != nil {
+				m.logger.Warn().Err(err).Str("migration_id", migrationID).Msg("failed to close database after unmarking node for retry")
+			}
+		}()
+	}
+
+	// Unmark node for retry
+	err := database.UnmarkNodeForRetry(ctx, m.logger, dbInstance, nodeID)
+	if err != nil {
+		m.logger.Error().Err(err).Str("migration_id", migrationID).Str("node_id", nodeID).Msg("failed to unmark node for retry")
+		return &MarkRetryResponse{
+			Success: false,
+			Error:   err.Error(),
+		}, err
+	}
+
+	// Mark that user made changes during path review
+	if err := m.markPathReviewChanges(migrationID, true); err != nil {
+		m.logger.Warn().Err(err).Str("migration_id", migrationID).Msg("failed to mark path review changes")
+		// Don't fail the unretry marking, just log the warning
+	}
+
+	return &MarkRetryResponse{
+		Success: true,
 	}, nil
 }
 

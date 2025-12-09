@@ -13,11 +13,12 @@ import (
 // MigrationMetadata represents minimal metadata for a migration
 // The Migration Engine's YAML config file contains all the detailed state
 type MigrationMetadata struct {
-	ID             string    `yaml:"id"`
-	Name           string    `yaml:"name"`
-	ConfigPath     string    `yaml:"configPath"` // Path to the Migration Engine's YAML config file
-	CreatedAt      time.Time `yaml:"createdAt"`
-	IsNewMigration bool      `yaml:"isNewMigration"` // Flag to indicate this is a new migration (not a resume)
+	ID                   string    `yaml:"id"`
+	Name                 string    `yaml:"name"`
+	ConfigPath           string    `yaml:"configPath"` // Path to the Migration Engine's YAML config file
+	CreatedAt            time.Time `yaml:"createdAt"`
+	IsNewMigration       bool      `yaml:"isNewMigration"`       // Flag to indicate this is a new migration (not a resume)
+	HasPathReviewChanges bool      `yaml:"hasPathReviewChanges"` // Flag to track if user made changes during path review (exclusions, retries)
 }
 
 // MigrationsMetadata is the root structure for all migrations

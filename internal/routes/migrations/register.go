@@ -22,7 +22,7 @@ func Register(router chi.Router, logger zerolog.Logger, core corebridge.Bridge, 
 
 	router.Post("/migrations/roots", middleware.JSON(mw, h.setRoot))
 	router.Post("/migrations", middleware.JSON(mw, h.start))
-	router.Post("/migrate/start", middleware.JSON(mw, h.start)) // legacy alias
+	router.Post("/migrations/{migrationID}/phase-change", middleware.JSON(mw, h.changePhase))
 	router.Post("/migrations/log-terminal", middleware.JSON(mw, h.toggleLogTerminal))
 	router.Post("/migrations/db/upload", middleware.MultipartForm(mw, h.uploadDB))
 	router.Get("/migrations/db/list", middleware.NoBody(mw, h.listDBs))
@@ -30,11 +30,14 @@ func Register(router chi.Router, logger zerolog.Logger, core corebridge.Bridge, 
 	router.Post("/migrations/{migrationID}/load", middleware.NoBody(mw, h.load))
 	router.Post("/migrations/{migrationID}/stop", middleware.NoBody(mw, h.stop))
 	router.Get("/migrations/{migrationID}", middleware.NoBody(mw, h.status))
-	router.Get("/migrate/status/{migrationID}", middleware.NoBody(mw, h.status)) // legacy alias
 	router.Get("/migrations/{migrationID}/inspect", middleware.NoBody(mw, h.inspect))
 	router.Get("/migrations/{migrationID}/queue-metrics", middleware.NoBody(mw, h.queueMetrics))
 	router.Post("/migrations/{migrationID}/logs", middleware.JSON(mw, h.getLogs))
 	router.Get("/migrations/{migrationID}/diffs", middleware.NoBody(mw, h.listDiffs))
+	router.Post("/migrations/{migrationID}/node/{nodeID}/exclude", middleware.NoBody(mw, h.excludeNode))
+	router.Post("/migrations/{migrationID}/node/{nodeID}/unexclude", middleware.NoBody(mw, h.unexcludeNode))
+	router.Post("/migrations/{migrationID}/node/{nodeID}/mark-retry", middleware.NoBody(mw, h.markNodeForRetry))
+	router.Post("/migrations/{migrationID}/node/{nodeID}/unmark-retry", middleware.NoBody(mw, h.unmarkNodeForRetry))
+	router.Get("/migrations/{migrationID}/pending-work", middleware.NoBody(mw, h.checkPendingWork))
 	router.Get("/migrations/{migrationID}/stream", h.handleStream)
-	router.Get("/migrate/status/{migrationID}/stream", h.handleStream) // legacy alias
 }

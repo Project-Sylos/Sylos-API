@@ -141,9 +141,10 @@ type Migration struct {
 
 type Status struct {
 	Migration
-	CompletedAt *time.Time  `json:"completedAt,omitempty"`
-	Error       string      `json:"error,omitempty"`
-	Result      *ResultView `json:"result,omitempty"`
+	CompletedAt      *time.Time  `json:"completedAt,omitempty"`
+	Error            string      `json:"error,omitempty"`
+	Result           *ResultView `json:"result,omitempty"`
+	CheckpointStatus string      `json:"checkpointStatus,omitempty"` // Migration checkpoint state (e.g., "Awaiting-Path-Review")
 }
 
 type ResultView struct {
@@ -284,8 +285,9 @@ type ListChildrenDiffsRequest struct {
 	FoldersOnly bool   // If true, only return folders and apply limit to folders only
 }
 
-// DiffItem represents a folder or file with status information from both queues
-type DiffItem struct {
+// PathNodeItem represents a single node (from either SRC or DST) with its metadata
+type PathNodeItem struct {
+	Queue           string `json:"queue"` // "SRC" or "DST"
 	Id              string `json:"id"`
 	ParentId        string `json:"parentId,omitempty"`
 	ParentPath      string `json:"parentPath,omitempty"`
@@ -293,19 +295,62 @@ type DiffItem struct {
 	LocationPath    string `json:"locationPath"`
 	LastUpdated     string `json:"lastUpdated,omitempty"`
 	DepthLevel      int    `json:"depthLevel"`
-	Type            string `json:"type"`                 // "folder" or "file"
-	Size            int64  `json:"size,omitempty"`       // Only for files
-	TraversalStatus string `json:"traversalStatus"`      // "pending", "successful", "failed", "not_on_src"
-	CopyStatus      string `json:"copyStatus,omitempty"` // "pending", "successful", "failed" (for future copy phase)
-	InSrc           bool   `json:"inSrc"`                // Whether item exists in source queue
-	InDst           bool   `json:"inDst"`                // Whether item exists in destination queue
+	Type            string `json:"type"`
+	Size            int64  `json:"size,omitempty"`
+	TraversalStatus string `json:"traversalStatus"`
+	CopyStatus      string `json:"copyStatus,omitempty"`
+}
+
+// PathNodes represents the src and dst nodes for a given path
+type PathNodes struct {
+	Src *PathNodeItem `json:"src,omitempty"`
+	Dst *PathNodeItem `json:"dst,omitempty"`
 }
 
 // ListChildrenDiffsResponse wraps the diff result with pagination metadata
 type ListChildrenDiffsResponse struct {
-	Folders    []DiffItem     `json:"folders"`
-	Files      []DiffItem     `json:"files"`
-	Pagination PaginationInfo `json:"pagination"`
+	Items      map[string]PathNodes `json:"items"` // path -> {src?: {...}, dst?: {...}}
+	Pagination PaginationInfo       `json:"pagination"`
+}
+
+// ExclusionResponse represents the response from exclude/unexclude operations
+type ExclusionResponse struct {
+	Success bool   `json:"success"`
+	Error   string `json:"error,omitempty"`
+}
+
+// SweepConfigRequest represents the configuration for exclusion or retry sweeps
+type SweepConfigRequest struct {
+	WorkerCount        int    `json:"workerCount,omitempty"`
+	MaxRetries         int    `json:"maxRetries,omitempty"`
+	MaxKnownDepth      int    `json:"maxKnownDepth,omitempty"`
+	LogAddress         string `json:"logAddress,omitempty"`
+	LogLevel           string `json:"logLevel,omitempty"`
+	SkipListener       *bool  `json:"skipListener,omitempty"`
+	StartupDelaySec    int    `json:"startupDelaySeconds,omitempty"`
+	ProgressTickMillis int    `json:"progressTickMillis,omitempty"`
+}
+
+// SweepResponse represents the response from triggering a sweep
+type SweepResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message,omitempty"`
+	Error   string `json:"error,omitempty"`
+}
+
+// PendingWorkResponse represents the response for checking pending work
+type PendingWorkResponse struct {
+	HasPendingExclusions   bool `json:"hasPendingExclusions"`   // True if count > 0
+	HasPendingRetries      bool `json:"hasPendingRetries"`      // True if count > 0
+	HasPathReviewChanges   bool `json:"hasPathReviewChanges"`   // True if user made changes (exclusions/retries) since last sweep completion
+	PendingExclusionsCount int  `json:"pendingExclusionsCount"` // Number of items in exclusion-holding buckets
+	PendingRetriesCount    int  `json:"pendingRetriesCount"`    // Number of items marked as "pending" in status-lookup buckets
+}
+
+// MarkRetryResponse represents the response from marking a node for retry
+type MarkRetryResponse struct {
+	Success bool   `json:"success"`
+	Error   string `json:"error,omitempty"`
 }
 
 type Bridge interface {
@@ -327,6 +372,12 @@ type Bridge interface {
 	GetQueueMetrics(ctx context.Context, migrationID string) (*QueueMetricsResponse, error)
 	GetLogs(ctx context.Context, migrationID string, req GetLogsRequest) (*GetLogsResponse, error)
 	ListChildrenDiffs(ctx context.Context, req ListChildrenDiffsRequest) (ListChildrenDiffsResponse, error)
+	ExcludeNode(ctx context.Context, migrationID string, nodeID string) (*ExclusionResponse, error)
+	UnexcludeNode(ctx context.Context, migrationID string, nodeID string) (*ExclusionResponse, error)
+	CheckPendingWork(ctx context.Context, migrationID string) (PendingWorkResponse, error)
+	ChangePhase(ctx context.Context, migrationID string, phase string, req StartMigrationRequest) (Migration, error)
+	MarkNodeForRetry(ctx context.Context, migrationID string, nodeID string) (*MarkRetryResponse, error)
+	UnmarkNodeForRetry(ctx context.Context, migrationID string, nodeID string) (*MarkRetryResponse, error)
 }
 
 const (
