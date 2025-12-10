@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -263,16 +264,21 @@ func (m *Manager) GetMigrationStatus(ctx context.Context, id string) (Status, er
 		return Status{}, err
 	}
 
-	// Get checkpoint status from YAML config
-	var checkpointStatus string
+	// Get checkpoint status from YAML config (this is now the primary status)
+	var status string
 	metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
 	meta, err := metaMgr.GetMigrationMetadata(id)
 	if err == nil && meta.ConfigPath != "" {
 		// Try to load YAML config to get checkpoint state
 		yamlCfg, err := migration.LoadMigrationConfig(meta.ConfigPath)
-		if err == nil {
-			checkpointStatus = yamlCfg.State.Status
+		if err == nil && yamlCfg.State.Status != "" {
+			status = yamlCfg.State.Status
 		}
+	}
+
+	// Fall back to traversal status if checkpoint status is not available
+	if status == "" {
+		status = migStatus.Status
 	}
 
 	return Status{
@@ -281,12 +287,11 @@ func (m *Manager) GetMigrationStatus(ctx context.Context, id string) (Status, er
 			SourceID:      migStatus.SourceID,
 			DestinationID: migStatus.DestinationID,
 			StartedAt:     migStatus.StartedAt,
-			Status:        migStatus.Status,
+			Status:        status,
 		},
-		CompletedAt:      migStatus.CompletedAt,
-		Error:            migStatus.Error,
-		Result:           convertResultView(migStatus.Result),
-		CheckpointStatus: checkpointStatus,
+		CompletedAt: migStatus.CompletedAt,
+		Error:       migStatus.Error,
+		Result:      convertResultView(migStatus.Result),
 	}, nil
 }
 
@@ -338,8 +343,32 @@ func (m *Manager) InspectMigrationStatusFromDB(ctx context.Context, dbPath strin
 	return database.InspectMigrationStatusFromDB(ctx, m.logger, dbPath)
 }
 
-func (m *Manager) UploadMigrationDB(ctx context.Context, filename string, data []byte, overwrite bool) (UploadMigrationDBResponse, error) {
-	resp, err := database.UploadMigrationDB(ctx, m.logger, m.cfg.Runtime.MigrationDBStorageDir, filename, data, overwrite)
+func (m *Manager) UploadMigrationDB(ctx context.Context, migrationID string, data []byte, overwrite bool) (UploadMigrationDBResponse, error) {
+	resp, err := database.UploadMigrationDB(ctx, m.logger, m.cfg.Runtime.DataDir, migrationID, data, overwrite)
+	if err != nil {
+		return UploadMigrationDBResponse{}, err
+	}
+	return UploadMigrationDBResponse{
+		Success: resp.Success,
+		Error:   resp.Error,
+		Path:    resp.Path,
+	}, nil
+}
+
+func (m *Manager) UploadMigrationYAML(ctx context.Context, migrationID string, data []byte, overwrite bool) (UploadMigrationDBResponse, error) {
+	resp, err := database.UploadMigrationYAML(ctx, m.logger, m.cfg.Runtime.DataDir, migrationID, data, overwrite)
+	if err != nil {
+		return UploadMigrationDBResponse{}, err
+	}
+	return UploadMigrationDBResponse{
+		Success: resp.Success,
+		Error:   resp.Error,
+		Path:    resp.Path,
+	}, nil
+}
+
+func (m *Manager) UploadMigrationData(ctx context.Context, migrationID string, zipData []byte, overwrite bool) (UploadMigrationDBResponse, error) {
+	resp, err := database.UploadMigrationData(ctx, m.logger, m.cfg.Runtime.DataDir, migrationID, zipData, overwrite)
 	if err != nil {
 		return UploadMigrationDBResponse{}, err
 	}
@@ -441,18 +470,105 @@ func (m *Manager) UpdateMigrationName(ctx context.Context, migrationID, name str
 	return metaMgr.UpdateMigrationMetadata(meta)
 }
 
-// ListAllMigrations returns all migration metadata
-func (m *Manager) ListAllMigrations(ctx context.Context) ([]MigrationMetadata, error) {
+// ListAllMigrations returns all migrations with full status information, including pagination
+func (m *Manager) ListAllMigrations(ctx context.Context, req ListMigrationsRequest) (ListMigrationsResponse, error) {
+	// Validate and set defaults for pagination
+	offset := req.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	limit := req.Limit
+	if limit <= 0 {
+		limit = 100 // Default limit
+	}
+	if limit > 1000 {
+		limit = 1000 // Max limit
+	}
+
+	// Get all migration metadata (including those without config files)
 	metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
-	metas, err := metaMgr.ListAllMigrations()
+	allMeta, err := metaMgr.LoadAllMetadata()
 	if err != nil {
-		return nil, err
+		return ListMigrationsResponse{}, fmt.Errorf("failed to load migration metadata: %w", err)
 	}
-	result := make([]MigrationMetadata, len(metas))
-	for i, meta := range metas {
-		result[i] = convertMetadata(meta)
+
+	total := len(allMeta.Migrations)
+	statuses := make([]Status, 0, total)
+
+	// Build Status for each migration
+	for id, meta := range allMeta.Migrations {
+		// Try to get full status, but handle gracefully if it fails
+		status, err := m.GetMigrationStatus(ctx, id)
+		if err != nil {
+			// Migration might not have DB/config yet - build minimal status from metadata
+			status = Status{
+				Migration: Migration{
+					ID:            meta.ID,
+					SourceID:      "", // Not available from metadata alone
+					DestinationID: "", // Not available from metadata alone
+					StartedAt:     meta.CreatedAt,
+					Status:        "", // No status yet - migration hasn't started
+				},
+				CompletedAt: nil,
+				Error:       "",
+				Result:      nil,
+			}
+
+			// Try to get source/destination IDs from roots if available
+			plan := m.rootsMgr.GetPlan(id)
+			if plan != nil {
+				if plan.HasSource {
+					status.SourceID = plan.SourceDefinition.ID
+				}
+				if plan.HasDestination {
+					status.DestinationID = plan.DestinationDefinition.ID
+				}
+				// If roots are set but migration hasn't started, status could be "Roots-Set"
+				if plan.HasSource && plan.HasDestination {
+					status.Status = "Roots-Set"
+				} else if plan.HasSource || plan.HasDestination {
+					status.Status = "Roots-Partial" // One root set but not both
+				}
+			}
+		}
+
+		statuses = append(statuses, status)
 	}
-	return result, nil
+
+	// Sort by CreatedAt/StartedAt (newest first)
+	sort.Slice(statuses, func(i, j int) bool {
+		timeI := statuses[i].StartedAt
+		timeJ := statuses[j].StartedAt
+		if timeI.IsZero() {
+			timeI = time.Time{} // Treat zero time as oldest
+		}
+		if timeJ.IsZero() {
+			timeJ = time.Time{}
+		}
+		return timeI.After(timeJ) // Newest first
+	})
+
+	// Apply pagination
+	hasMore := offset+limit < total
+	end := offset + limit
+	if end > total {
+		end = total
+	}
+
+	var paginatedStatuses []Status
+	if offset < total {
+		paginatedStatuses = statuses[offset:end]
+	} else {
+		paginatedStatuses = []Status{} // Empty if offset is beyond total
+	}
+
+	return ListMigrationsResponse{
+		Migrations: paginatedStatuses,
+		Total:      total,
+		Offset:     offset,
+		Limit:      limit,
+		HasMore:    hasMore,
+	}, nil
 }
 
 // LoadMigration loads and resumes a migration from its YAML config file
@@ -1142,8 +1258,8 @@ func (m *Manager) TriggerExclusionSweep(ctx context.Context, migrationID string,
 		sweepCfg.ProgressTick = 1 * time.Second
 	}
 
-	// Use request context for shutdown if needed
-	sweepCfg.ShutdownContext = ctx
+	// Use background context for shutdown (HTTP request context gets canceled when handler returns)
+	sweepCfg.ShutdownContext = context.Background()
 
 	// Start sweep in goroutine (hybrid async pattern)
 	go func() {
@@ -1333,8 +1449,8 @@ func (m *Manager) TriggerRetrySweep(ctx context.Context, migrationID string, con
 		sweepCfg.ProgressTick = 1 * time.Second
 	}
 
-	// Use request context for shutdown if needed
-	sweepCfg.ShutdownContext = ctx
+	// Use background context for shutdown (HTTP request context gets canceled when handler returns)
+	sweepCfg.ShutdownContext = context.Background()
 
 	// Start sweep in goroutine (hybrid async pattern)
 	go func() {

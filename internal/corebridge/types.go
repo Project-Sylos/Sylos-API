@@ -141,10 +141,10 @@ type Migration struct {
 
 type Status struct {
 	Migration
-	CompletedAt      *time.Time  `json:"completedAt,omitempty"`
-	Error            string      `json:"error,omitempty"`
-	Result           *ResultView `json:"result,omitempty"`
-	CheckpointStatus string      `json:"checkpointStatus,omitempty"` // Migration checkpoint state (e.g., "Awaiting-Path-Review")
+	CompletedAt *time.Time  `json:"completedAt,omitempty"`
+	Error       string      `json:"error,omitempty"`
+	Result      *ResultView `json:"result,omitempty"`
+	// Status field in Migration now represents the checkpoint state (e.g., "Awaiting-Path-Review", "Traversal-In-Progress", "Copy-In-Progress")
 }
 
 type ResultView struct {
@@ -353,6 +353,21 @@ type MarkRetryResponse struct {
 	Error   string `json:"error,omitempty"`
 }
 
+// ListMigrationsRequest represents a request to list migrations with pagination
+type ListMigrationsRequest struct {
+	Offset int `json:"offset,omitempty"` // Pagination offset (default: 0)
+	Limit  int `json:"limit,omitempty"`  // Pagination limit (default: 100, max: 1000)
+}
+
+// ListMigrationsResponse represents the response containing paginated migrations
+type ListMigrationsResponse struct {
+	Migrations []Status `json:"migrations"`
+	Total      int      `json:"total"`   // Total number of migrations
+	Offset     int      `json:"offset"`  // Current offset
+	Limit      int      `json:"limit"`   // Current limit
+	HasMore    bool     `json:"hasMore"` // True if there are more migrations
+}
+
 type Bridge interface {
 	ListSources(ctx context.Context) ([]Source, error)
 	ListChildren(ctx context.Context, req ListChildrenRequest) (ListChildrenResponse, error)
@@ -362,11 +377,13 @@ type Bridge interface {
 	GetMigrationStatus(ctx context.Context, id string) (Status, error)
 	InspectMigrationStatus(ctx context.Context, migrationID string) (migration.MigrationStatus, error)
 	InspectMigrationStatusFromDB(ctx context.Context, dbPath string) (migration.MigrationStatus, error)
-	UploadMigrationDB(ctx context.Context, filename string, data []byte, overwrite bool) (UploadMigrationDBResponse, error)
+	UploadMigrationDB(ctx context.Context, migrationID string, data []byte, overwrite bool) (UploadMigrationDBResponse, error)
+	UploadMigrationYAML(ctx context.Context, migrationID string, data []byte, overwrite bool) (UploadMigrationDBResponse, error)
+	UploadMigrationData(ctx context.Context, migrationID string, zipData []byte, overwrite bool) (UploadMigrationDBResponse, error)
 	ListMigrationDBs(ctx context.Context) ([]MigrationDBInfo, error)
 	SubscribeProgress(ctx context.Context, id string) (<-chan ProgressEvent, func(), error)
 	ToggleLogTerminal(ctx context.Context, enable bool, logAddress string) error
-	ListAllMigrations(ctx context.Context) ([]MigrationMetadata, error)
+	ListAllMigrations(ctx context.Context, req ListMigrationsRequest) (ListMigrationsResponse, error)
 	LoadMigration(ctx context.Context, migrationID string) (Migration, error)
 	StopMigration(ctx context.Context, migrationID string) (Status, error)
 	GetQueueMetrics(ctx context.Context, migrationID string) (*QueueMetricsResponse, error)

@@ -1,6 +1,7 @@
 package migrations
 
 import (
+	"context"
 	"net/http"
 
 	"github.com/Project-Sylos/Sylos-API/internal/corebridge"
@@ -21,8 +22,10 @@ func (h handler) start(ctx *middleware.Context, payload corebridge.StartMigratio
 
 	// Launch migration in goroutine and return immediately
 	// This ensures the HTTP handler returns quickly and doesn't block other requests
+	// Use background context since the HTTP request context will be canceled when handler returns
 	go func() {
-		migration, err := h.core.StartMigration(ctx.Request().Context(), payload)
+		bgCtx := context.Background()
+		migration, err := h.core.StartMigration(bgCtx, payload)
 		if err != nil {
 			// Errors are logged by the core bridge
 			// The migration status will reflect the error when queried

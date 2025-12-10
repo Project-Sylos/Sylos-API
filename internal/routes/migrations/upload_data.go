@@ -9,7 +9,7 @@ import (
 	"github.com/go-chi/chi/v5"
 )
 
-func (h handler) uploadDB(ctx *middleware.Context) {
+func (h handler) uploadData(ctx *middleware.Context) {
 	migrationID := chi.URLParam(ctx.Request(), "migrationID")
 	if migrationID == "" {
 		ctx.Error(http.StatusBadRequest, "migration id is required", nil)
@@ -17,7 +17,7 @@ func (h handler) uploadDB(ctx *middleware.Context) {
 	}
 
 	// Parse multipart form
-	if err := ctx.Request().ParseMultipartForm(100 << 20); err != nil { // 100MB max
+	if err := ctx.Request().ParseMultipartForm(500 << 20); err != nil { // 500MB max for zip files
 		ctx.Error(http.StatusBadRequest, "failed to parse multipart form", err)
 		return
 	}
@@ -45,9 +45,9 @@ func (h handler) uploadDB(ctx *middleware.Context) {
 	}
 
 	// Upload to core bridge
-	response, err := h.core.UploadMigrationDB(ctx.Request().Context(), migrationID, data, overwrite)
+	response, err := h.core.UploadMigrationData(ctx.Request().Context(), migrationID, data, overwrite)
 	if err != nil {
-		ctx.Error(http.StatusInternalServerError, "failed to upload migration DB", err)
+		ctx.Error(http.StatusInternalServerError, "failed to upload migration data", err)
 		return
 	}
 

@@ -9,7 +9,7 @@ import (
 	"github.com/go-chi/chi/v5"
 )
 
-func (h handler) uploadDB(ctx *middleware.Context) {
+func (h handler) uploadYAML(ctx *middleware.Context) {
 	migrationID := chi.URLParam(ctx.Request(), "migrationID")
 	if migrationID == "" {
 		ctx.Error(http.StatusBadRequest, "migration id is required", nil)
@@ -45,9 +45,9 @@ func (h handler) uploadDB(ctx *middleware.Context) {
 	}
 
 	// Upload to core bridge
-	response, err := h.core.UploadMigrationDB(ctx.Request().Context(), migrationID, data, overwrite)
+	response, err := h.core.UploadMigrationYAML(ctx.Request().Context(), migrationID, data, overwrite)
 	if err != nil {
-		ctx.Error(http.StatusInternalServerError, "failed to upload migration DB", err)
+		ctx.Error(http.StatusInternalServerError, "failed to upload migration YAML", err)
 		return
 	}
 
@@ -58,3 +58,4 @@ func (h handler) uploadDB(ctx *middleware.Context) {
 
 	ctx.Response(http.StatusOK, response)
 }
+

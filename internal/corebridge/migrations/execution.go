@@ -2,6 +2,8 @@ package migrations
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/Project-Sylos/Migration-Engine/pkg/db"
@@ -74,6 +76,13 @@ func (m *Manager) ExecuteMigration(migrationID string, srcDef, dstDef services.S
 	// Create and save Migration Engine YAML config before starting migration
 	configPath := corebridgeDB.ConfigPathFromDatabasePath(dbPath)
 
+	// CRITICAL: Ensure config directory exists so SDK can save status updates
+	configDir := filepath.Dir(configPath)
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		m.logger.Warn().Err(err).Str("migration_id", migrationID).Str("config_dir", configDir).Msg("failed to create config directory")
+		// Continue anyway - SDK might create it, but this ensures it exists
+	}
+
 	// Get initial migration status to create YAML config
 	status := migration.MigrationStatus{} // Empty status for new migration
 	yamlCfg, err := migration.NewMigrationConfigYAML(cfg, status)
@@ -83,6 +92,8 @@ func (m *Manager) ExecuteMigration(migrationID string, srcDef, dstDef services.S
 		if err := migration.SaveMigrationConfig(configPath, yamlCfg); err != nil {
 			// Log warning but continue - Migration Engine will update it during execution
 			m.logger.Warn().Err(err).Str("migration_id", migrationID).Str("config_path", configPath).Msg("failed to save initial YAML config")
+		} else {
+			m.logger.Info().Str("migration_id", migrationID).Str("config_path", configPath).Msg("saved initial YAML config")
 		}
 	}
 
@@ -193,6 +204,13 @@ func (m *Manager) ExecuteMigrationWithController(migrationID string, srcDef, dst
 	// Create and save Migration Engine YAML config before starting migration
 	configPath := corebridgeDB.ConfigPathFromDatabasePath(dbPath)
 
+	// CRITICAL: Ensure config directory exists so SDK can save status updates
+	configDir := filepath.Dir(configPath)
+	if err := os.MkdirAll(configDir, 0o755); err != nil {
+		m.logger.Warn().Err(err).Str("migration_id", migrationID).Str("config_dir", configDir).Msg("failed to create config directory")
+		// Continue anyway - SDK might create it, but this ensures it exists
+	}
+
 	// Get initial migration status to create YAML config
 	status := migration.MigrationStatus{} // Empty status for new migration
 	yamlCfg, err := migration.NewMigrationConfigYAML(cfg, status)
@@ -202,6 +220,8 @@ func (m *Manager) ExecuteMigrationWithController(migrationID string, srcDef, dst
 		if err := migration.SaveMigrationConfig(configPath, yamlCfg); err != nil {
 			// Log warning but continue - Migration Engine will update it during execution
 			m.logger.Warn().Err(err).Str("migration_id", migrationID).Str("config_path", configPath).Msg("failed to save initial YAML config")
+		} else {
+			m.logger.Info().Str("migration_id", migrationID).Str("config_path", configPath).Msg("saved initial YAML config")
 		}
 	}
 

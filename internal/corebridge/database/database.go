@@ -1,10 +1,12 @@
 package database
 
 import (
+	"archive/zip"
 	"context"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -32,31 +34,19 @@ type MigrationDBInfo struct {
 	ModifiedAt time.Time `json:"modifiedAt"`
 }
 
-func UploadMigrationDB(ctx context.Context, logger zerolog.Logger, storageDir, filename string, data []byte, overwrite bool) (UploadMigrationDBResponse, error) {
-	// Validate filename
-	if filename == "" {
+// UploadMigrationDB uploads a migration database file to the migration-specific folder
+// New structure: saves to dataDir/{migrationID}/{migrationID}.db
+func UploadMigrationDB(ctx context.Context, logger zerolog.Logger, dataDir, migrationID string, data []byte, overwrite bool) (UploadMigrationDBResponse, error) {
+	if migrationID == "" {
 		return UploadMigrationDBResponse{
 			Success: false,
-			Error:   "filename is required",
+			Error:   "migration ID is required",
 		}, nil
 	}
 
-	// Ensure filename ends with .db
-	if !strings.HasSuffix(filename, ".db") {
-		filename = filename + ".db"
-	}
-
-	// Sanitize filename to prevent path traversal
-	filename = filepath.Base(filename)
-	if filename == "." || filename == ".." {
-		return UploadMigrationDBResponse{
-			Success: false,
-			Error:   "invalid filename",
-		}, nil
-	}
-
-	// Construct full path
-	dbPath := filepath.Join(storageDir, filename)
+	// Construct path in migration-specific folder
+	migrationDir := GetMigrationDir(dataDir, migrationID)
+	dbPath := filepath.Join(migrationDir, migrationID+".db")
 
 	// Check if file already exists
 	if _, err := os.Stat(dbPath); err == nil {
@@ -68,9 +58,18 @@ func UploadMigrationDB(ctx context.Context, logger zerolog.Logger, storageDir, f
 		}
 	}
 
+	// Ensure migration directory exists
+	if err := os.MkdirAll(migrationDir, 0o755); err != nil {
+		logger.Error().Err(err).Str("migration_id", migrationID).Msg("failed to create migration directory")
+		return UploadMigrationDBResponse{
+			Success: false,
+			Error:   fmt.Sprintf("failed to create migration directory: %v", err),
+		}, nil
+	}
+
 	// Write file
 	if err := os.WriteFile(dbPath, data, 0o644); err != nil {
-		logger.Error().Err(err).Str("filename", filename).Msg("failed to write migration DB file")
+		logger.Error().Err(err).Str("migration_id", migrationID).Msg("failed to write migration DB file")
 		return UploadMigrationDBResponse{
 			Success: false,
 			Error:   fmt.Sprintf("failed to save file: %v", err),
@@ -78,7 +77,7 @@ func UploadMigrationDB(ctx context.Context, logger zerolog.Logger, storageDir, f
 	}
 
 	logger.Info().
-		Str("filename", filename).
+		Str("migration_id", migrationID).
 		Str("path", dbPath).
 		Int("size", len(data)).
 		Bool("overwrite", overwrite).
@@ -87,6 +86,176 @@ func UploadMigrationDB(ctx context.Context, logger zerolog.Logger, storageDir, f
 	return UploadMigrationDBResponse{
 		Success: true,
 		Path:    dbPath,
+	}, nil
+}
+
+// UploadMigrationYAML uploads a migration YAML config file to the migration-specific folder
+// New structure: saves to dataDir/{migrationID}/{migrationID}.yaml
+func UploadMigrationYAML(ctx context.Context, logger zerolog.Logger, dataDir, migrationID string, data []byte, overwrite bool) (UploadMigrationDBResponse, error) {
+	if migrationID == "" {
+		return UploadMigrationDBResponse{
+			Success: false,
+			Error:   "migration ID is required",
+		}, nil
+	}
+
+	// Construct path in migration-specific folder
+	migrationDir := GetMigrationDir(dataDir, migrationID)
+	yamlPath := filepath.Join(migrationDir, migrationID+".yaml")
+
+	// Check if file already exists
+	if _, err := os.Stat(yamlPath); err == nil {
+		if !overwrite {
+			return UploadMigrationDBResponse{
+				Success: false,
+				Error:   "file already present on API",
+			}, nil
+		}
+	}
+
+	// Ensure migration directory exists
+	if err := os.MkdirAll(migrationDir, 0o755); err != nil {
+		logger.Error().Err(err).Str("migration_id", migrationID).Msg("failed to create migration directory")
+		return UploadMigrationDBResponse{
+			Success: false,
+			Error:   fmt.Sprintf("failed to create migration directory: %v", err),
+		}, nil
+	}
+
+	// Write file
+	if err := os.WriteFile(yamlPath, data, 0o644); err != nil {
+		logger.Error().Err(err).Str("migration_id", migrationID).Msg("failed to write migration YAML file")
+		return UploadMigrationDBResponse{
+			Success: false,
+			Error:   fmt.Sprintf("failed to save file: %v", err),
+		}, nil
+	}
+
+	logger.Info().
+		Str("migration_id", migrationID).
+		Str("path", yamlPath).
+		Int("size", len(data)).
+		Bool("overwrite", overwrite).
+		Msg("uploaded migration YAML file")
+
+	return UploadMigrationDBResponse{
+		Success: true,
+		Path:    yamlPath,
+	}, nil
+}
+
+// UploadMigrationData uploads a zip file containing migration data (YAML, DB, and related files)
+// Extracts the zip to dataDir/{migrationID}/
+func UploadMigrationData(ctx context.Context, logger zerolog.Logger, dataDir, migrationID string, zipData []byte, overwrite bool) (UploadMigrationDBResponse, error) {
+	if migrationID == "" {
+		return UploadMigrationDBResponse{
+			Success: false,
+			Error:   "migration ID is required",
+		}, nil
+	}
+
+	// Construct migration directory path
+	migrationDir := GetMigrationDir(dataDir, migrationID)
+
+	// Check if directory already exists and has files
+	if info, err := os.Stat(migrationDir); err == nil && info.IsDir() {
+		entries, err := os.ReadDir(migrationDir)
+		if err == nil && len(entries) > 0 {
+			if !overwrite {
+				return UploadMigrationDBResponse{
+					Success: false,
+					Error:   "migration directory already contains files",
+				}, nil
+			}
+		}
+	}
+
+	// Create a temporary file for the zip
+	tmpZip, err := os.CreateTemp("", "migration-upload-*.zip")
+	if err != nil {
+		return UploadMigrationDBResponse{
+			Success: false,
+			Error:   fmt.Sprintf("failed to create temporary file: %v", err),
+		}, nil
+	}
+	tmpZipPath := tmpZip.Name()
+	defer os.Remove(tmpZipPath)
+	defer tmpZip.Close()
+
+	// Write zip data to temporary file
+	if _, err := tmpZip.Write(zipData); err != nil {
+		return UploadMigrationDBResponse{
+			Success: false,
+			Error:   fmt.Sprintf("failed to write zip data: %v", err),
+		}, nil
+	}
+	tmpZip.Close()
+
+	// Open the zip file
+	zipReader, err := zip.OpenReader(tmpZipPath)
+	if err != nil {
+		return UploadMigrationDBResponse{
+			Success: false,
+			Error:   fmt.Sprintf("failed to open zip file: %v", err),
+		}, nil
+	}
+	defer zipReader.Close()
+
+	// Ensure migration directory exists
+	if err := os.MkdirAll(migrationDir, 0o755); err != nil {
+		logger.Error().Err(err).Str("migration_id", migrationID).Msg("failed to create migration directory")
+		return UploadMigrationDBResponse{
+			Success: false,
+			Error:   fmt.Sprintf("failed to create migration directory: %v", err),
+		}, nil
+	}
+
+	// Extract all files from the zip
+	for _, file := range zipReader.File {
+		// Sanitize file path to prevent path traversal
+		filePath := filepath.Join(migrationDir, filepath.Base(file.Name))
+
+		// Open file from zip
+		rc, err := file.Open()
+		if err != nil {
+			logger.Warn().Err(err).Str("file", file.Name).Msg("failed to open file from zip, skipping")
+			continue
+		}
+
+		// Create destination file
+		dstFile, err := os.Create(filePath)
+		if err != nil {
+			rc.Close()
+			logger.Warn().Err(err).Str("file", filePath).Msg("failed to create destination file, skipping")
+			continue
+		}
+
+		// Copy file contents
+		_, err = io.Copy(dstFile, rc)
+		rc.Close()
+		dstFile.Close()
+
+		if err != nil {
+			logger.Warn().Err(err).Str("file", filePath).Msg("failed to extract file from zip, skipping")
+			continue
+		}
+
+		// Set file permissions
+		if err := os.Chmod(filePath, 0o644); err != nil {
+			logger.Warn().Err(err).Str("file", filePath).Msg("failed to set file permissions")
+		}
+	}
+
+	logger.Info().
+		Str("migration_id", migrationID).
+		Str("path", migrationDir).
+		Int("size", len(zipData)).
+		Bool("overwrite", overwrite).
+		Msg("uploaded and extracted migration data zip file")
+
+	return UploadMigrationDBResponse{
+		Success: true,
+		Path:    migrationDir,
 	}, nil
 }
 
@@ -128,6 +297,7 @@ func ListMigrationDBs(ctx context.Context, logger zerolog.Logger, storageDir str
 }
 
 // ResolveDatabasePath resolves the database path from migration ID or explicit path
+// New structure: dataDir/{migrationID}/{migrationID}.db
 func ResolveDatabasePath(dataDir, explicitPath, migrationID string) (string, error) {
 	if explicitPath != "" {
 		return explicitPath, nil
@@ -137,21 +307,35 @@ func ResolveDatabasePath(dataDir, explicitPath, migrationID string) (string, err
 		return "", fmt.Errorf("migration ID is required when path is not provided")
 	}
 
-	// Construct database path from migration ID
-	dbPath := filepath.Join(dataDir, migrationID+".db")
+	// Construct database path in migration-specific folder
+	migrationDir := filepath.Join(dataDir, migrationID)
+	dbPath := filepath.Join(migrationDir, migrationID+".db")
 	return dbPath, nil
 }
 
+// GetMigrationDir returns the directory path for a migration
+func GetMigrationDir(dataDir, migrationID string) string {
+	return filepath.Join(dataDir, migrationID)
+}
+
 // DatabasePathFromConfigPath derives the database path from a config path
-// Follows pattern: {config_path sans .yaml}.db
+// New structure: config is in dataDir/{migrationID}/{migrationID}.yaml
+// DB is in dataDir/{migrationID}/{migrationID}.db
 func DatabasePathFromConfigPath(configPath string) string {
-	return strings.TrimSuffix(configPath, ".yaml") + ".db"
+	dir := filepath.Dir(configPath)
+	filename := filepath.Base(configPath)
+	migrationID := strings.TrimSuffix(filename, ".yaml")
+	return filepath.Join(dir, migrationID+".db")
 }
 
 // ConfigPathFromDatabasePath derives the config path from a database path
-// Follows pattern: {database_path sans .db}.yaml
+// New structure: DB is in dataDir/{migrationID}/{migrationID}.db
+// Config is in dataDir/{migrationID}/{migrationID}.yaml
 func ConfigPathFromDatabasePath(dbPath string) string {
-	return strings.TrimSuffix(dbPath, ".db") + ".yaml"
+	dir := filepath.Dir(dbPath)
+	filename := filepath.Base(dbPath)
+	migrationID := strings.TrimSuffix(filename, ".db")
+	return filepath.Join(dir, migrationID+".yaml")
 }
 
 func InspectMigrationStatusFromDB(ctx context.Context, logger zerolog.Logger, dbPath string) (migration.MigrationStatus, error) {
@@ -1231,9 +1415,9 @@ func QueueChildrenInExclusionHolding(tx *bolt.Tx, queueType string, childStates 
 
 // SetNodeExclusion performs the complete exclusion/unexclusion operation atomically:
 // 1. Updates the node's explicit_excluded flag
-// 2. Retrieves direct children
-// 3. Queues children in exclusion-holding bucket
+// 2. Adds the node itself to the appropriate holding bucket (exclusion-holding or unexclusion-holding)
 // nodeID is expected to be a path hash hex string (from db.HashPath)
+// Per SDK docs: The exclusion sweep will propagate the flag to all descendants
 func SetNodeExclusion(ctx context.Context, logger zerolog.Logger, dbInstance *db.DB, nodeID string, excluded bool) error {
 	return dbInstance.Update(func(tx *bolt.Tx) error {
 		// Step 1: Find the node by path hash (same pattern as ListChildrenDiffs)
@@ -1284,69 +1468,48 @@ func SetNodeExclusion(ctx context.Context, logger zerolog.Logger, dbInstance *db
 			return fmt.Errorf("failed to set exclusion flag: %w", err)
 		}
 
-		// Step 3: Get direct children from both queues (merge them)
-		srcChildren, err := GetDirectChildrenHashes(tx, "SRC", nodeInfo.Path)
+		// Step 3: Add the node itself to the appropriate holding bucket
+		// Per SDK docs: Add the node to exclusion-holding or unexclusion-holding bucket
+		// The SDK's exclusion sweep will then propagate the flag to all descendants
+		bucketName := "exclusion-holding"
+		if !excluded {
+			bucketName = "unexclusion-holding"
+		}
+
+		// Get or create the appropriate holding bucket for the node's queue type
+		traversalDataBucket := tx.Bucket([]byte("Traversal-Data"))
+		if traversalDataBucket == nil {
+			return fmt.Errorf("Traversal-Data bucket not found")
+		}
+
+		queueBucket, err := traversalDataBucket.CreateBucketIfNotExists([]byte(nodeInfo.QueueType))
 		if err != nil {
-			return fmt.Errorf("failed to get SRC children: %w", err)
+			return fmt.Errorf("failed to create/get %s queue bucket: %w", nodeInfo.QueueType, err)
 		}
 
-		dstChildren, err := GetDirectChildrenHashes(tx, "DST", nodeInfo.Path)
+		holdingBucket, err := queueBucket.CreateBucketIfNotExists([]byte(bucketName))
 		if err != nil {
-			return fmt.Errorf("failed to get DST children: %w", err)
+			return fmt.Errorf("failed to create/get %s bucket for %s: %w", bucketName, nodeInfo.QueueType, err)
 		}
 
-		// Merge children from both queues
-		allChildrenHashes := make(map[string]bool)
-		for hash := range srcChildren {
-			allChildrenHashes[hash] = true
-		}
-		for hash := range dstChildren {
-			allChildrenHashes[hash] = true
+		// Store path hash -> depth in the holding bucket
+		// pathHash is already []byte (the bucket key)
+		// depth as 8-byte big-endian int64 (same format as SDK uses)
+		depthBytes := make([]byte, 8)
+		binary.BigEndian.PutUint64(depthBytes, uint64(nodeInfo.NodeState.Depth))
+
+		if err := holdingBucket.Put(pathHash, depthBytes); err != nil {
+			return fmt.Errorf("failed to add node to %s bucket: %w", bucketName, err)
 		}
 
-		if len(allChildrenHashes) == 0 {
-			// No children, nothing to queue - operation is complete
-			return nil
-		}
-
-		// Step 4: Get NodeState objects for all children
-		childStates, err := GetChildNodeStates(tx, allChildrenHashes)
-		if err != nil {
-			return fmt.Errorf("failed to get child node states: %w", err)
-		}
-
-		// Step 5: Queue children in exclusion-holding buckets
-		// Queue in SRC holding bucket
-		srcChildStates := []struct {
-			QueueType string
-			NodeState *db.NodeState
-		}{}
-		for _, child := range childStates {
-			if child.QueueType == "SRC" {
-				srcChildStates = append(srcChildStates, child)
-			}
-		}
-		if len(srcChildStates) > 0 {
-			if err := QueueChildrenInExclusionHolding(tx, "SRC", srcChildStates); err != nil {
-				return fmt.Errorf("failed to queue SRC children: %w", err)
-			}
-		}
-
-		// Queue in DST holding bucket
-		dstChildStates := []struct {
-			QueueType string
-			NodeState *db.NodeState
-		}{}
-		for _, child := range childStates {
-			if child.QueueType == "DST" {
-				dstChildStates = append(dstChildStates, child)
-			}
-		}
-		if len(dstChildStates) > 0 {
-			if err := QueueChildrenInExclusionHolding(tx, "DST", dstChildStates); err != nil {
-				return fmt.Errorf("failed to queue DST children: %w", err)
-			}
-		}
+		logger.Info().
+			Str("node_id", nodeID).
+			Str("queue", nodeInfo.QueueType).
+			Str("path", nodeInfo.NodeState.Path).
+			Int("depth", nodeInfo.NodeState.Depth).
+			Bool("excluded", excluded).
+			Str("bucket", bucketName).
+			Msg("marked node for exclusion sweep")
 
 		return nil
 	})

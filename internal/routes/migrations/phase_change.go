@@ -1,6 +1,7 @@
 package migrations
 
 import (
+	"context"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
@@ -42,8 +43,10 @@ func (h handler) changePhase(ctx *middleware.Context, payload PhaseChangeRequest
 	}
 
 	// Launch phase change in goroutine and return immediately
+	// Use background context since the HTTP request context will be canceled when handler returns
 	go func() {
-		migration, err := h.core.ChangePhase(ctx.Request().Context(), migrationID, payload.Phase, payload.StartMigrationRequest)
+		bgCtx := context.Background()
+		migration, err := h.core.ChangePhase(bgCtx, migrationID, payload.Phase, payload.StartMigrationRequest)
 		if err != nil {
 			// Errors are logged by the core bridge
 			h.logger.Error().
