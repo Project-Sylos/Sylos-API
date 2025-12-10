@@ -199,7 +199,6 @@ func (m *Manager) StartMigration(ctx context.Context, req StartMigrationRequest)
 			ProgressTickMillis:      req.Options.ProgressTickMillis,
 			Verification: migrations.VerificationOptions{
 				AllowPending:  req.Options.Verification.AllowPending,
-				AllowFailed:   req.Options.Verification.AllowFailed,
 				AllowNotOnSrc: req.Options.Verification.AllowNotOnSrc,
 			},
 		},

@@ -44,7 +44,6 @@ type MigrationOptions struct {
 // VerificationOptions represents verification options
 type VerificationOptions struct {
 	AllowPending  bool
-	AllowFailed   bool
 	AllowNotOnSrc bool
 }
 

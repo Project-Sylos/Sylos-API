@@ -86,7 +86,6 @@ type ServiceSelection struct {
 
 type VerificationOptions struct {
 	AllowPending  bool `json:"allowPending"`
-	AllowFailed   bool `json:"allowFailed"`
 	AllowNotOnSrc bool `json:"allowNotOnSrc"`
 }
 

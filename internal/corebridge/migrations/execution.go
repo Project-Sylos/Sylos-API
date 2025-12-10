@@ -292,37 +292,33 @@ func (m *Manager) selectSkipListener(opts MigrationOptions) bool {
 }
 
 // selectVerificationOptions sets default verification options
-// Defaults: AllowPending=false (not allowed), AllowFailed=true (allowed), AllowNotOnSrc=true (allowed)
+// Defaults: AllowPending=false (not allowed), AllowNotOnSrc=true (allowed)
 // These defaults apply to all migrations unless explicitly overridden
 func (m *Manager) selectVerificationOptions(opts VerificationOptions) migration.VerifyOptions {
 	// Start with defaults
 	verifyOpts := migration.VerifyOptions{
 		// Default: AllowPending is false (pending nodes should not be allowed)
 		AllowPending: false,
-		// Default: AllowFailed is true (failed nodes are allowed)
-		AllowFailed: true,
 		// Default: AllowNotOnSrc is true (nodes on dst but not on src are allowed)
 		AllowNotOnSrc: true,
 	}
 
 	// Apply user-provided options if they were explicitly set
 	// Note: Since Go booleans can't distinguish "not set" from "false", we use a heuristic:
-	// Defaults are: AllowPending=false, AllowFailed=true, AllowNotOnSrc=true
-	// Zero values (not provided) are: AllowPending=false, AllowFailed=false, AllowNotOnSrc=false
+	// Defaults are: AllowPending=false, AllowNotOnSrc=true
+	// Zero values (not provided) are: AllowPending=false, AllowNotOnSrc=false
 	//
 	// We can detect user-provided options by checking if any value differs from zero values:
 	// - If AllowPending is true, user provided it (zero is false)
-	// - If AllowFailed is true, user provided it (zero is false, default is true)
 	// - If AllowNotOnSrc is true, user provided it (zero is false, default is true)
 	//
 	// If user provided any option, we use all their values (even if some match defaults)
 	// Otherwise, we use our defaults
-	userProvidedOptions := opts.AllowPending || opts.AllowFailed || opts.AllowNotOnSrc
+	userProvidedOptions := opts.AllowPending || opts.AllowNotOnSrc
 
 	if userProvidedOptions {
 		// User has provided explicit options, use their values
 		verifyOpts.AllowPending = opts.AllowPending
-		verifyOpts.AllowFailed = opts.AllowFailed
 		verifyOpts.AllowNotOnSrc = opts.AllowNotOnSrc
 	}
 	// Otherwise, use defaults (already set above)

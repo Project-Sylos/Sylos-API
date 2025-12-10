@@ -119,7 +119,6 @@ Start a new migration or resume an existing one.
     "progressTickMillis": 1000,
     "verification": {
       "allowPending": false,
-      "allowFailed": false,
       "allowNotOnSrc": false
     }
   }
@@ -687,7 +686,6 @@ All endpoints may return the following error responses:
   progressTickMillis?: number;
   verification?: {
     allowPending?: boolean;
-    allowFailed?: boolean;
     allowNotOnSrc?: boolean;
   };
 }
