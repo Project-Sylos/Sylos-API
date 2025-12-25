@@ -7,7 +7,6 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/Project-Sylos/Sylos-API/internal/routes/middleware"
-	"github.com/Project-Sylos/Sylos-API/pkg/common_utils"
 )
 
 func (h handler) excludeNode(ctx *middleware.Context) {
@@ -32,10 +31,8 @@ func (h handler) excludeNode(ctx *middleware.Context) {
 
 	h.logger.Info().Str("migration_id", migrationID).Str("node_id", unescapedNodeID).Msg("excluding node")
 
-	// hash path before sending it to the core
-	hashedPath := string(common_utils.HashPath(unescapedNodeID))
-
-	result, err := h.core.ExcludeNode(ctx.Request().Context(), migrationID, string(hashedPath))
+	// nodeID is a ULID - pass directly without hashing
+	result, err := h.core.ExcludeNode(ctx.Request().Context(), migrationID, unescapedNodeID)
 	if err != nil {
 		ctx.Error(http.StatusInternalServerError, "failed to exclude node", err)
 		return
@@ -69,9 +66,8 @@ func (h handler) unexcludeNode(ctx *middleware.Context) {
 		return
 	}
 
-	// hash path before sending it to the core
-	hashedPath := common_utils.HashPath(unescapedNodeID)
-	result, err := h.core.UnexcludeNode(ctx.Request().Context(), migrationID, hashedPath)
+	// nodeID is a ULID - pass directly without hashing
+	result, err := h.core.UnexcludeNode(ctx.Request().Context(), migrationID, unescapedNodeID)
 	if err != nil {
 		ctx.Error(http.StatusInternalServerError, "failed to unexclude node", err)
 		return

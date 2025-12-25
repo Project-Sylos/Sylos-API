@@ -29,6 +29,7 @@ type Manager struct {
 	rootsMgr      *roots.Manager
 	migrationsMgr *migrations.Manager
 	terminalMgr   *terminal.Manager
+	bgTaskMgr     *BackgroundTaskManager
 }
 
 func NewManager(logger zerolog.Logger, cfg config.Config) (*Manager, error) {
@@ -44,6 +45,18 @@ func NewManager(logger zerolog.Logger, cfg config.Config) (*Manager, error) {
 	rootsMgr := roots.NewManager(logger, cfg.Runtime.DataDir, serviceMgr, resolveDBPath)
 	migrationsMgr := migrations.NewManager(logger, cfg, serviceMgr, rootsMgr, resolveDBPath)
 	terminalMgr := terminal.NewManager(logger, cfg)
+	bgTaskMgr := NewBackgroundTaskManager(logger)
+
+	// Set up callbacks for migrations manager to manage background tasks
+	migrationsMgr.SetBackgroundTaskCallback(func(migrationID string, taskType string, path string) string {
+		return bgTaskMgr.StartTaskWithPath(migrationID, BackgroundTaskType(taskType), path)
+	})
+	migrationsMgr.SetBackgroundTaskCompleteCallback(func(migrationID, taskID string) {
+		bgTaskMgr.CompleteTask(migrationID, taskID)
+	})
+	migrationsMgr.SetBackgroundTaskFailCallback(func(migrationID, taskID string, err error) {
+		bgTaskMgr.FailTask(migrationID, taskID, err)
+	})
 
 	manager := &Manager{
 		logger:        logger,
@@ -52,7 +65,11 @@ func NewManager(logger zerolog.Logger, cfg config.Config) (*Manager, error) {
 		rootsMgr:      rootsMgr,
 		migrationsMgr: migrationsMgr,
 		terminalMgr:   terminalMgr,
+		bgTaskMgr:     bgTaskMgr,
 	}
+
+	// Recover any interrupted ETL processes on startup
+	go migrationsMgr.RecoverInterruptedETL()
 
 	return manager, nil
 }
@@ -878,58 +895,68 @@ func (m *Manager) GetLogs(ctx context.Context, migrationID string, req GetLogsRe
 
 // ListChildrenDiffs retrieves merged children from both SRC and DST queues with status information
 func (m *Manager) ListChildrenDiffs(ctx context.Context, req ListChildrenDiffsRequest) (ListChildrenDiffsResponse, error) {
-	// Get DB instance - tries record.DB first, then pool
-	boltDB := m.migrationsMgr.GetDB(req.MigrationID)
+	// Get migration metadata to check status and get paths
+	metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
+	meta, err := metaMgr.GetMigrationMetadata(req.MigrationID)
+	if err != nil {
+		return ListChildrenDiffsResponse{}, ErrMigrationNotFound
+	}
+
+	// Derive database path from config path
+	dbPath := strings.TrimSuffix(meta.ConfigPath, ".yaml") + ".db"
+	if dbPath == ".db" {
+		dbPath, err = database.ResolveDatabasePath(m.cfg.Runtime.DataDir, "", req.MigrationID)
+		if err != nil {
+			return ListChildrenDiffsResponse{}, fmt.Errorf("failed to resolve database path: %w", err)
+		}
+	}
+
+	// Check if DuckDB is available (status is Awaiting-Path-Review)
+	useDuckDB := false
+	if meta.ConfigPath != "" {
+		yamlCfg, err := migration.LoadMigrationConfig(meta.ConfigPath)
+		if err == nil {
+			status := strings.TrimSpace(yamlCfg.State.Status)
+			if status == "Awaiting-Path-Review" {
+				useDuckDB = true
+			} else if status == "Preparing-Path-Review" {
+				// Ensure ETL is running or completed
+				err := m.migrationsMgr.EnsureETLCompleted(req.MigrationID, meta.ConfigPath, dbPath)
+				if err != nil {
+					return ListChildrenDiffsResponse{}, fmt.Errorf("ETL not ready: %w", err)
+				}
+				// Re-check status after ETL
+				yamlCfg, err = migration.LoadMigrationConfig(meta.ConfigPath)
+				if err == nil && strings.TrimSpace(yamlCfg.State.Status) == "Awaiting-Path-Review" {
+					useDuckDB = true
+				}
+			}
+		}
+	}
 
 	var dbItems map[string]database.PathNodes
 	var dbPagination database.PaginationInfo
-	var err error
 
-	if boltDB != nil {
-		// Use the shared DB instance from the pool
-		dbItems, dbPagination, err = database.GetChildrenDiffsFromDBInstance(ctx, m.logger, boltDB, req.Path, req.Offset, req.Limit, req.FoldersOnly)
-		if err != nil {
-			// Check if this is a database not available error - indicates DB was closed unexpectedly
-			if isDatabaseNotAvailableError(err) {
-				// CRITICAL: DB was closed unexpectedly - this indicates a lifecycle violation
-				m.logger.Error().
-					Err(err).
-					Str("migration_id", req.MigrationID).
-					Msg("CRITICAL: DB for migration was closed unexpectedly — this indicates an ME lifecycle violation")
-
-				return ListChildrenDiffsResponse{}, ErrDatabaseNotAvailable
-			}
-			return ListChildrenDiffsResponse{}, fmt.Errorf("failed to get children diffs from DB instance: %w", err)
-		}
-	} else {
-		// Fallback: migration not running or DB not available, open a new connection
-		// Get migration metadata to find the config path
-		metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
-		meta, err := metaMgr.GetMigrationMetadata(req.MigrationID)
-		if err != nil {
-			return ListChildrenDiffsResponse{}, ErrMigrationNotFound
-		}
-
-		// Derive database path from config path
-		// Config path is {db_path}.yaml, so DB path is {config_path sans .yaml}.db
-		dbPath := strings.TrimSuffix(meta.ConfigPath, ".yaml") + ".db"
-		if dbPath == ".db" {
-			// Fallback: try to resolve from migration ID
-			dbPath, err = database.ResolveDatabasePath(m.cfg.Runtime.DataDir, "", req.MigrationID)
-			if err != nil {
-				return ListChildrenDiffsResponse{}, fmt.Errorf("failed to resolve database path: %w", err)
+	if useDuckDB {
+		// Use DuckDB for path review operations
+		duckdbPath := database.GetDuckDBPath(dbPath)
+		duckdbConn := m.migrationsMgr.GetDuckDB(req.MigrationID)
+		if duckdbConn == nil {
+			// Try to open DuckDB
+			duckdbPool := m.migrationsMgr.GetDuckDBPool()
+			if duckdbPool != nil {
+				duckdbConn, err = duckdbPool.OpenDuckDB(req.MigrationID, duckdbPath)
+				if err != nil {
+					return ListChildrenDiffsResponse{}, fmt.Errorf("failed to open DuckDB: %w", err)
+				}
+			} else {
+				return ListChildrenDiffsResponse{}, fmt.Errorf("DuckDB pool not available")
 			}
 		}
 
-		// Check if database file exists
-		if _, err := os.Stat(dbPath); os.IsNotExist(err) {
-			return ListChildrenDiffsResponse{}, ErrMigrationNotFound
-		}
-
-		// Get children diffs from database
-		dbItems, dbPagination, err = database.GetChildrenDiffsFromDB(ctx, m.logger, dbPath, req.Path, req.Offset, req.Limit, req.FoldersOnly)
+		dbItems, dbPagination, err = database.GetChildrenDiffsFromDuckDB(ctx, m.logger, duckdbConn, req.Path, req.Offset, req.Limit, req.FoldersOnly)
 		if err != nil {
-			return ListChildrenDiffsResponse{}, fmt.Errorf("failed to get children diffs: %w", err)
+			return ListChildrenDiffsResponse{}, fmt.Errorf("failed to get children diffs from DuckDB: %w", err)
 		}
 	}
 
@@ -944,7 +971,7 @@ func (m *Manager) ListChildrenDiffs(ctx context.Context, req ListChildrenDiffsRe
 				Id:              dbPathNodes.Src.Id,
 				ParentId:        dbPathNodes.Src.ParentId,
 				ParentPath:      dbPathNodes.Src.ParentPath,
-				DisplayName:     dbPathNodes.Src.DisplayName,
+				Name:            dbPathNodes.Src.Name,
 				LocationPath:    dbPathNodes.Src.LocationPath,
 				LastUpdated:     dbPathNodes.Src.LastUpdated,
 				DepthLevel:      dbPathNodes.Src.DepthLevel,
@@ -961,7 +988,7 @@ func (m *Manager) ListChildrenDiffs(ctx context.Context, req ListChildrenDiffsRe
 				Id:              dbPathNodes.Dst.Id,
 				ParentId:        dbPathNodes.Dst.ParentId,
 				ParentPath:      dbPathNodes.Dst.ParentPath,
-				DisplayName:     dbPathNodes.Dst.DisplayName,
+				Name:            dbPathNodes.Dst.Name,
 				LocationPath:    dbPathNodes.Dst.LocationPath,
 				LastUpdated:     dbPathNodes.Dst.LastUpdated,
 				DepthLevel:      dbPathNodes.Dst.DepthLevel,
@@ -990,72 +1017,56 @@ func (m *Manager) ListChildrenDiffs(ctx context.Context, req ListChildrenDiffsRe
 
 // ExcludeNode excludes a node and queues its children for exclusion propagation
 func (m *Manager) ExcludeNode(ctx context.Context, migrationID string, nodeID string) (*ExclusionResponse, error) {
-	// Get DB instance
-	boltDB := m.migrationsMgr.GetDB(migrationID)
-	if boltDB == nil {
-		// Try to get DB path and open it
-		metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
-		meta, err := metaMgr.GetMigrationMetadata(migrationID)
-		if err != nil {
+	// Prepare path review context
+	prc, err := m.preparePathReviewContext(ctx, migrationID)
+	if err != nil {
+		if err == ErrMigrationNotFound {
 			return &ExclusionResponse{
 				Success: false,
 				Error:   "migration not found",
-			}, ErrMigrationNotFound
+			}, err
 		}
-
-		// Derive database path from config path
-		dbPath := strings.TrimSuffix(meta.ConfigPath, ".yaml") + ".db"
-		if dbPath == ".db" {
-			dbPath, err = database.ResolveDatabasePath(m.cfg.Runtime.DataDir, "", migrationID)
-			if err != nil {
-				return &ExclusionResponse{
-					Success: false,
-					Error:   "failed to resolve database path",
-				}, fmt.Errorf("failed to resolve database path: %w", err)
-			}
-		}
-
-		// Check if database file exists
-		if _, err := os.Stat(dbPath); os.IsNotExist(err) {
-			return &ExclusionResponse{
-				Success: false,
-				Error:   "migration database not found",
-			}, ErrMigrationNotFound
-		}
-
-		// Open database for update
-		var errOpen error
-		boltDB, _, errOpen = migration.SetupDatabase(migration.DatabaseConfig{
-			Path:           dbPath,
-			RemoveExisting: false,
-		})
-		if errOpen != nil {
-			return &ExclusionResponse{
-				Success: false,
-				Error:   "failed to open database",
-			}, fmt.Errorf("failed to open database: %w", errOpen)
-		}
-		defer func() {
-			if err := boltDB.Close(); err != nil {
-				m.logger.Warn().Err(err).Str("migration_id", migrationID).Msg("failed to close database after exclusion")
-			}
-		}()
-	}
-
-	// Perform exclusion
-	err := database.SetNodeExclusion(ctx, m.logger, boltDB, nodeID, true)
-	if err != nil {
-		m.logger.Error().Err(err).Str("migration_id", migrationID).Str("node_id", nodeID).Msg("failed to exclude node")
 		return &ExclusionResponse{
 			Success: false,
 			Error:   err.Error(),
 		}, err
 	}
 
+	// Find node path from ULID
+	nodePath, err := m.findNodePathFromID(ctx, prc, nodeID)
+	if err != nil {
+		return &ExclusionResponse{
+			Success: false,
+			Error:   fmt.Sprintf("node not found: %v", err),
+		}, err
+	}
+
+	// Mark immediate parent as excluded
+	err = database.SetNodeExclusionDuckDB(ctx, m.logger, prc.DuckDBConn, nodePath, true)
+	if err != nil {
+		return &ExclusionResponse{
+			Success: false,
+			Error:   err.Error(),
+		}, err
+	}
+
+	// Trigger background propagation task
+	taskID := m.bgTaskMgr.StartTaskWithPath(prc.MigrationID, BackgroundTaskTypeExclusionPropagate, nodePath)
+	go func() {
+		defer m.bgTaskMgr.CompleteTask(prc.MigrationID, taskID)
+		if err := database.PropagateExclusionDuckDB(context.Background(), m.logger, prc.DuckDBConn, nodePath, true); err != nil {
+			m.logger.Error().
+				Err(err).
+				Str("migration_id", prc.MigrationID).
+				Str("node_path", nodePath).
+				Msg("failed to propagate exclusion")
+			m.bgTaskMgr.FailTask(prc.MigrationID, taskID, err)
+		}
+	}()
+
 	// Mark that user made changes during path review
 	if err := m.markPathReviewChanges(migrationID, true); err != nil {
 		m.logger.Warn().Err(err).Str("migration_id", migrationID).Msg("failed to mark path review changes")
-		// Don't fail the exclusion, just log the warning
 	}
 
 	return &ExclusionResponse{
@@ -1065,72 +1076,56 @@ func (m *Manager) ExcludeNode(ctx context.Context, migrationID string, nodeID st
 
 // UnexcludeNode unexcludes a node and queues its children for unexclusion propagation
 func (m *Manager) UnexcludeNode(ctx context.Context, migrationID string, nodeID string) (*ExclusionResponse, error) {
-	// Get DB instance
-	boltDB := m.migrationsMgr.GetDB(migrationID)
-	if boltDB == nil {
-		// Try to get DB path and open it
-		metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
-		meta, err := metaMgr.GetMigrationMetadata(migrationID)
-		if err != nil {
+	// Prepare path review context
+	prc, err := m.preparePathReviewContext(ctx, migrationID)
+	if err != nil {
+		if err == ErrMigrationNotFound {
 			return &ExclusionResponse{
 				Success: false,
 				Error:   "migration not found",
-			}, ErrMigrationNotFound
+			}, err
 		}
-
-		// Derive database path from config path
-		dbPath := strings.TrimSuffix(meta.ConfigPath, ".yaml") + ".db"
-		if dbPath == ".db" {
-			dbPath, err = database.ResolveDatabasePath(m.cfg.Runtime.DataDir, "", migrationID)
-			if err != nil {
-				return &ExclusionResponse{
-					Success: false,
-					Error:   "failed to resolve database path",
-				}, fmt.Errorf("failed to resolve database path: %w", err)
-			}
-		}
-
-		// Check if database file exists
-		if _, err := os.Stat(dbPath); os.IsNotExist(err) {
-			return &ExclusionResponse{
-				Success: false,
-				Error:   "migration database not found",
-			}, ErrMigrationNotFound
-		}
-
-		// Open database for update
-		var errOpen error
-		boltDB, _, errOpen = migration.SetupDatabase(migration.DatabaseConfig{
-			Path:           dbPath,
-			RemoveExisting: false,
-		})
-		if errOpen != nil {
-			return &ExclusionResponse{
-				Success: false,
-				Error:   "failed to open database",
-			}, fmt.Errorf("failed to open database: %w", errOpen)
-		}
-		defer func() {
-			if err := boltDB.Close(); err != nil {
-				m.logger.Warn().Err(err).Str("migration_id", migrationID).Msg("failed to close database after unexclusion")
-			}
-		}()
-	}
-
-	// Perform unexclusion
-	err := database.SetNodeExclusion(ctx, m.logger, boltDB, nodeID, false)
-	if err != nil {
-		m.logger.Error().Err(err).Str("migration_id", migrationID).Str("node_id", nodeID).Msg("failed to unexclude node")
 		return &ExclusionResponse{
 			Success: false,
 			Error:   err.Error(),
 		}, err
 	}
 
+	// Find node path from ULID
+	nodePath, err := m.findNodePathFromID(ctx, prc, nodeID)
+	if err != nil {
+		return &ExclusionResponse{
+			Success: false,
+			Error:   fmt.Sprintf("node not found: %v", err),
+		}, err
+	}
+
+	// Mark immediate parent as unexcluded (set to pending)
+	err = database.SetNodeExclusionDuckDB(ctx, m.logger, prc.DuckDBConn, nodePath, false)
+	if err != nil {
+		return &ExclusionResponse{
+			Success: false,
+			Error:   err.Error(),
+		}, err
+	}
+
+	// Trigger background propagation task
+	taskID := m.bgTaskMgr.StartTaskWithPath(prc.MigrationID, BackgroundTaskTypeUnexclusionPropagate, nodePath)
+	go func() {
+		defer m.bgTaskMgr.CompleteTask(prc.MigrationID, taskID)
+		if err := database.PropagateExclusionDuckDB(context.Background(), m.logger, prc.DuckDBConn, nodePath, false); err != nil {
+			m.logger.Error().
+				Err(err).
+				Str("migration_id", prc.MigrationID).
+				Str("node_path", nodePath).
+				Msg("failed to propagate unexclusion")
+			m.bgTaskMgr.FailTask(prc.MigrationID, taskID, err)
+		}
+	}()
+
 	// Mark that user made changes during path review
-	if err := m.markPathReviewChanges(migrationID, true); err != nil {
-		m.logger.Warn().Err(err).Str("migration_id", migrationID).Msg("failed to mark path review changes")
-		// Don't fail the unexclusion, just log the warning
+	if err := m.markPathReviewChanges(prc.MigrationID, true); err != nil {
+		m.logger.Warn().Err(err).Str("migration_id", prc.MigrationID).Msg("failed to mark path review changes")
 	}
 
 	return &ExclusionResponse{
@@ -1257,34 +1252,70 @@ func (m *Manager) TriggerExclusionSweep(ctx context.Context, migrationID string,
 		sweepCfg.ProgressTick = 1 * time.Second
 	}
 
+	// Check if DuckDB is available (status is Awaiting-Path-Review)
+	useDuckDB := false
+	yamlCfg, err := migration.LoadMigrationConfig(configPath)
+	if err == nil {
+		status := strings.TrimSpace(yamlCfg.State.Status)
+		if status == "Awaiting-Path-Review" {
+			useDuckDB = true
+		}
+	}
+
 	// Use background context for shutdown (HTTP request context gets canceled when handler returns)
-	sweepCfg.ShutdownContext = context.Background()
+	bgCtx := context.Background()
 
-	// Start sweep in goroutine (hybrid async pattern)
-	go func() {
-		stats, err := migration.RunExclusionSweep(sweepCfg)
-		if err != nil {
-			m.logger.Error().
-				Err(err).
+	if useDuckDB {
+		// Use DuckDB-based exclusion sweep
+		dbPath := migrationCfg.Database.Path
+		duckdbPath := database.GetDuckDBPath(dbPath)
+		duckdbPool := m.migrationsMgr.GetDuckDBPool()
+
+		// Start sweep in goroutine with background task tracking
+		taskID := m.bgTaskMgr.StartTask(migrationID, BackgroundTaskTypeExclusionSweep)
+		go func() {
+			defer m.bgTaskMgr.CompleteTask(migrationID, taskID)
+
+			// Open DuckDB connection
+			duckdbConn, err := duckdbPool.OpenDuckDB(migrationID, duckdbPath)
+			if err != nil {
+				m.logger.Error().
+					Err(err).
+					Str("migration_id", migrationID).
+					Msg("failed to open DuckDB for exclusion sweep")
+				m.bgTaskMgr.FailTask(migrationID, taskID, err)
+				return
+			}
+			defer duckdbPool.Close(migrationID)
+
+			// Run DuckDB-based exclusion sweep
+			err = database.RunExclusionSweepDuckDB(bgCtx, m.logger, duckdbConn)
+			if err != nil {
+				m.logger.Error().
+					Err(err).
+					Str("migration_id", migrationID).
+					Msg("exclusion sweep failed in DuckDB")
+				m.bgTaskMgr.FailTask(migrationID, taskID, err)
+				return
+			}
+
+			m.logger.Info().
 				Str("migration_id", migrationID).
-				Msg("exclusion sweep failed")
-			return
-		}
+				Msg("exclusion sweep completed in DuckDB")
 
-		m.logger.Info().
-			Str("migration_id", migrationID).
-			Dur("duration", stats.Duration).
-			Int("src_round", stats.Src.Round).
-			Int("src_pending", stats.Src.Pending).
-			Int("dst_round", stats.Dst.Round).
-			Int("dst_pending", stats.Dst.Pending).
-			Msg("exclusion sweep completed")
-
-		// Clear path review changes flag on successful sweep completion
-		if err := m.markPathReviewChanges(migrationID, false); err != nil {
-			m.logger.Warn().Err(err).Str("migration_id", migrationID).Msg("failed to clear path review changes flag")
-		}
-	}()
+			// Clear path review changes flag on successful sweep completion
+			if err := m.markPathReviewChanges(migrationID, false); err != nil {
+				m.logger.Warn().Err(err).Str("migration_id", migrationID).Msg("failed to clear path review changes flag")
+			}
+		}()
+	} else {
+		// Exclusion sweep is only available during path review phase (Awaiting-Path-Review)
+		// For other phases, exclusion sweeps are handled by the migration engine during traversal
+		return SweepResponse{
+			Success: false,
+			Error:   "exclusion sweep is only available during path review phase (Awaiting-Path-Review status)",
+		}, fmt.Errorf("exclusion sweep not available: migration status is not Awaiting-Path-Review")
+	}
 
 	return SweepResponse{
 		Success: true,
@@ -1684,62 +1715,33 @@ func (m *Manager) CheckPendingWork(ctx context.Context, migrationID string) (Pen
 
 // MarkNodeForRetry marks a failed node for retry
 func (m *Manager) MarkNodeForRetry(ctx context.Context, migrationID string, nodeID string) (*MarkRetryResponse, error) {
-	// Get DB instance
-	dbInstance := m.migrationsMgr.GetDB(migrationID)
-	if dbInstance == nil {
-		// Try to get DB path and open it
-		metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
-		meta, err := metaMgr.GetMigrationMetadata(migrationID)
-		if err != nil {
+	// Prepare path review context
+	prc, err := m.preparePathReviewContext(ctx, migrationID)
+	if err != nil {
+		if err == ErrMigrationNotFound {
 			return &MarkRetryResponse{
 				Success: false,
 				Error:   "migration not found",
-			}, ErrMigrationNotFound
+			}, err
 		}
-
-		// Derive database path from config path
-		dbPath := strings.TrimSuffix(meta.ConfigPath, ".yaml") + ".db"
-		if dbPath == ".db" {
-			dbPath, err = database.ResolveDatabasePath(m.cfg.Runtime.DataDir, "", migrationID)
-			if err != nil {
-				return &MarkRetryResponse{
-					Success: false,
-					Error:   "failed to resolve database path",
-				}, fmt.Errorf("failed to resolve database path: %w", err)
-			}
-		}
-
-		// Check if database file exists
-		if _, err := os.Stat(dbPath); os.IsNotExist(err) {
-			return &MarkRetryResponse{
-				Success: false,
-				Error:   "migration database not found",
-			}, ErrMigrationNotFound
-		}
-
-		// Open database for update
-		var errOpen error
-		dbInstance, _, errOpen = migration.SetupDatabase(migration.DatabaseConfig{
-			Path:           dbPath,
-			RemoveExisting: false,
-		})
-		if errOpen != nil {
-			return &MarkRetryResponse{
-				Success: false,
-				Error:   "failed to open database",
-			}, fmt.Errorf("failed to open database: %w", errOpen)
-		}
-		defer func() {
-			if err := dbInstance.Close(); err != nil {
-				m.logger.Warn().Err(err).Str("migration_id", migrationID).Msg("failed to close database after marking node for retry")
-			}
-		}()
+		return &MarkRetryResponse{
+			Success: false,
+			Error:   err.Error(),
+		}, err
 	}
 
-	// Mark node for retry
-	err := database.MarkNodeForRetry(ctx, m.logger, dbInstance, nodeID)
+	// Find node path from ULID
+	nodePath, err := m.findNodePathFromID(ctx, prc, nodeID)
 	if err != nil {
-		m.logger.Error().Err(err).Str("migration_id", migrationID).Str("node_id", nodeID).Msg("failed to mark node for retry")
+		return &MarkRetryResponse{
+			Success: false,
+			Error:   fmt.Sprintf("node not found: %v", err),
+		}, err
+	}
+
+	// Mark node for retry in DuckDB
+	err = database.MarkNodeForRetryDuckDB(ctx, m.logger, prc.DuckDBConn, nodePath)
+	if err != nil {
 		return &MarkRetryResponse{
 			Success: false,
 			Error:   err.Error(),
@@ -1749,7 +1751,6 @@ func (m *Manager) MarkNodeForRetry(ctx context.Context, migrationID string, node
 	// Mark that user made changes during path review
 	if err := m.markPathReviewChanges(migrationID, true); err != nil {
 		m.logger.Warn().Err(err).Str("migration_id", migrationID).Msg("failed to mark path review changes")
-		// Don't fail the retry marking, just log the warning
 	}
 
 	return &MarkRetryResponse{
@@ -1759,62 +1760,33 @@ func (m *Manager) MarkNodeForRetry(ctx context.Context, migrationID string, node
 
 // UnmarkNodeForRetry unmarks a pending node for retry (changes status back to failed)
 func (m *Manager) UnmarkNodeForRetry(ctx context.Context, migrationID string, nodeID string) (*MarkRetryResponse, error) {
-	// Get DB instance
-	dbInstance := m.migrationsMgr.GetDB(migrationID)
-	if dbInstance == nil {
-		// Try to get DB path and open it
-		metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
-		meta, err := metaMgr.GetMigrationMetadata(migrationID)
-		if err != nil {
+	// Prepare path review context
+	prc, err := m.preparePathReviewContext(ctx, migrationID)
+	if err != nil {
+		if err == ErrMigrationNotFound {
 			return &MarkRetryResponse{
 				Success: false,
 				Error:   "migration not found",
-			}, ErrMigrationNotFound
+			}, err
 		}
-
-		// Derive database path from config path
-		dbPath := strings.TrimSuffix(meta.ConfigPath, ".yaml") + ".db"
-		if dbPath == ".db" {
-			dbPath, err = database.ResolveDatabasePath(m.cfg.Runtime.DataDir, "", migrationID)
-			if err != nil {
-				return &MarkRetryResponse{
-					Success: false,
-					Error:   "failed to resolve database path",
-				}, fmt.Errorf("failed to resolve database path: %w", err)
-			}
-		}
-
-		// Check if database file exists
-		if _, err := os.Stat(dbPath); os.IsNotExist(err) {
-			return &MarkRetryResponse{
-				Success: false,
-				Error:   "migration database not found",
-			}, ErrMigrationNotFound
-		}
-
-		// Open database for update
-		var errOpen error
-		dbInstance, _, errOpen = migration.SetupDatabase(migration.DatabaseConfig{
-			Path:           dbPath,
-			RemoveExisting: false,
-		})
-		if errOpen != nil {
-			return &MarkRetryResponse{
-				Success: false,
-				Error:   "failed to open database",
-			}, fmt.Errorf("failed to open database: %w", errOpen)
-		}
-		defer func() {
-			if err := dbInstance.Close(); err != nil {
-				m.logger.Warn().Err(err).Str("migration_id", migrationID).Msg("failed to close database after unmarking node for retry")
-			}
-		}()
+		return &MarkRetryResponse{
+			Success: false,
+			Error:   err.Error(),
+		}, err
 	}
 
-	// Unmark node for retry
-	err := database.UnmarkNodeForRetry(ctx, m.logger, dbInstance, nodeID)
+	// Find node path from ULID
+	nodePath, err := m.findNodePathFromID(ctx, prc, nodeID)
 	if err != nil {
-		m.logger.Error().Err(err).Str("migration_id", migrationID).Str("node_id", nodeID).Msg("failed to unmark node for retry")
+		return &MarkRetryResponse{
+			Success: false,
+			Error:   fmt.Sprintf("node not found: %v", err),
+		}, err
+	}
+
+	// Unmark node for retry in DuckDB
+	err = database.UnmarkNodeForRetryDuckDB(ctx, m.logger, prc.DuckDBConn, nodePath)
+	if err != nil {
 		return &MarkRetryResponse{
 			Success: false,
 			Error:   err.Error(),
@@ -1824,12 +1796,16 @@ func (m *Manager) UnmarkNodeForRetry(ctx context.Context, migrationID string, no
 	// Mark that user made changes during path review
 	if err := m.markPathReviewChanges(migrationID, true); err != nil {
 		m.logger.Warn().Err(err).Str("migration_id", migrationID).Msg("failed to mark path review changes")
-		// Don't fail the unretry marking, just log the warning
 	}
 
 	return &MarkRetryResponse{
 		Success: true,
 	}, nil
+}
+
+// GetBackgroundTasks returns all background tasks for a migration
+func (m *Manager) GetBackgroundTasks(ctx context.Context, migrationID string) ([]BackgroundTask, error) {
+	return m.bgTaskMgr.GetTasks(migrationID), nil
 }
 
 // convertMetadata converts internal metadata to public API metadata

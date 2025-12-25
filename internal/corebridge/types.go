@@ -290,7 +290,7 @@ type PathNodeItem struct {
 	Id              string `json:"id"`
 	ParentId        string `json:"parentId,omitempty"`
 	ParentPath      string `json:"parentPath,omitempty"`
-	DisplayName     string `json:"displayName"`
+	Name            string `json:"name"`
 	LocationPath    string `json:"locationPath"`
 	LastUpdated     string `json:"lastUpdated,omitempty"`
 	DepthLevel      int    `json:"depthLevel"`
@@ -394,6 +394,7 @@ type Bridge interface {
 	ChangePhase(ctx context.Context, migrationID string, phase string, req StartMigrationRequest) (Migration, error)
 	MarkNodeForRetry(ctx context.Context, migrationID string, nodeID string) (*MarkRetryResponse, error)
 	UnmarkNodeForRetry(ctx context.Context, migrationID string, nodeID string) (*MarkRetryResponse, error)
+	GetBackgroundTasks(ctx context.Context, migrationID string) ([]BackgroundTask, error)
 }
 
 const (

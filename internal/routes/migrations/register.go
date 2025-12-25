@@ -41,5 +41,6 @@ func Register(router chi.Router, logger zerolog.Logger, core corebridge.Bridge, 
 	router.Post("/migrations/{migrationID}/node/{nodeID}/mark-retry", middleware.NoBody(mw, h.markNodeForRetry))
 	router.Post("/migrations/{migrationID}/node/{nodeID}/unmark-retry", middleware.NoBody(mw, h.unmarkNodeForRetry))
 	router.Get("/migrations/{migrationID}/pending-work", middleware.NoBody(mw, h.checkPendingWork))
+	router.Get("/migrations/{migrationID}/bgTasks", middleware.NoBody(mw, h.bgTasks))
 	router.Get("/migrations/{migrationID}/stream", h.handleStream)
 }

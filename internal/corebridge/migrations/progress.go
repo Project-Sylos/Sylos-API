@@ -3,12 +3,16 @@ package migrations
 import (
 	"context"
 	"fmt"
+	"math/rand"
+	"strings"
 	"time"
 
+	"github.com/Project-Sylos/Migration-Engine/pkg/migration"
 	"github.com/Project-Sylos/Migration-Engine/pkg/queue"
+	corebridgeDB "github.com/Project-Sylos/Sylos-API/internal/corebridge/database"
 	"github.com/Project-Sylos/Sylos-API/internal/corebridge/services"
 	fstypes "github.com/Project-Sylos/Sylos-FS/pkg/types"
-	"github.com/rs/xid"
+	"github.com/oklog/ulid/v2"
 )
 
 func (m *Manager) SubscribeProgress(ctx context.Context, id string) (<-chan ProgressEvent, func(), error) {
@@ -20,7 +24,9 @@ func (m *Manager) SubscribeProgress(ctx context.Context, id string) (<-chan Prog
 	}
 
 	ch := make(chan ProgressEvent, 16)
-	subID := xid.New().String()
+	// Generate ULID for subscriber ID (lexicographically sortable, time-ordered)
+	entropy := rand.New(rand.NewSource(time.Now().UnixNano()))
+	subID := ulid.MustNew(ulid.Timestamp(time.Now()), entropy).String()
 	if _, exists := m.subscribers[id]; !exists {
 		m.subscribers[id] = make(map[string]chan ProgressEvent)
 	}
@@ -240,6 +246,43 @@ func (m *Manager) RunMigration(record *MigrationRecord, srcDef, dstDef services.
 	m.logger.Info().
 		Str("migration_id", record.ID).
 		Msg("migration completed successfully")
+
+	// Trigger ETL after traversal completes
+	// Get config path to check/update status
+	configPath := corebridgeDB.ConfigPathFromDatabasePath(dbPath)
+	if configPath != "" {
+		// Load YAML config to check current status
+		yamlCfg, err := migration.LoadMigrationConfig(configPath)
+		if err == nil {
+			currentStatus := strings.TrimSpace(yamlCfg.State.Status)
+
+			// Only trigger ETL if not already in Awaiting-Path-Review
+			if currentStatus != "Awaiting-Path-Review" {
+				// Update status to Preparing-Path-Review
+				yamlCfg.State.Status = "Preparing-Path-Review"
+				if err := migration.SaveMigrationConfig(configPath, yamlCfg); err != nil {
+					m.logger.Error().
+						Err(err).
+						Str("migration_id", record.ID).
+						Msg("failed to update status to Preparing-Path-Review")
+				} else {
+					m.logger.Info().
+						Str("migration_id", record.ID).
+						Str("old_status", currentStatus).
+						Str("new_status", "Preparing-Path-Review").
+						Msg("traversal completed, triggering ETL")
+
+					// Run ETL directly using the existing BoltDB instance
+					// The DB instance is still in the pool and available via record.DB
+					m.runETL(record, dbPath, configPath, dbInstance)
+				}
+			} else {
+				m.logger.Debug().
+					Str("migration_id", record.ID).
+					Msg("already in Awaiting-Path-Review, skipping ETL")
+			}
+		}
+	}
 
 	srcStats := result.Runtime.Src
 	dstStats := result.Runtime.Dst

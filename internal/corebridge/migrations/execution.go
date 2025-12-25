@@ -86,7 +86,10 @@ func (m *Manager) ExecuteMigration(migrationID string, srcDef, dstDef services.S
 	// Get initial migration status to create YAML config
 	status := migration.MigrationStatus{} // Empty status for new migration
 	yamlCfg, err := migration.NewMigrationConfigYAML(cfg, status)
-	if err == nil {
+	if err != nil {
+		// Log error but continue - Migration Engine might create it during execution
+		m.logger.Warn().Err(err).Str("migration_id", migrationID).Str("config_path", configPath).Msg("failed to create initial YAML config structure")
+	} else {
 		// Update migration ID in YAML config
 		yamlCfg.Metadata.MigrationID = migrationID
 		if err := migration.SaveMigrationConfig(configPath, yamlCfg); err != nil {
@@ -139,8 +142,10 @@ func (m *Manager) ExecuteMigration(migrationID string, srcDef, dstDef services.S
 // The migration engine takes ownership of the adapters and handles cleanup
 // dbInstance must be pre-opened by the API - the migration engine does not open databases
 func (m *Manager) ExecuteMigrationWithController(migrationID string, srcDef, dstDef services.ServiceDefinition, srcFolder, dstFolder fstypes.Folder, opts MigrationOptions, dbInstance *db.DB, resolveDBPath func(path, migrationID string) (string, error), acquireAdapter func(services.ServiceDefinition, string, string) (fstypes.FSAdapter, func(), error)) (*migration.MigrationController, error) {
+
 	dbPath, err := resolveDBPath(opts.DatabasePath, migrationID)
 	if err != nil {
+		m.logger.Error().Err(err).Str("migration_id", migrationID).Msg("failed to resolve DB path")
 		return nil, err
 	}
 
@@ -148,17 +153,25 @@ func (m *Manager) ExecuteMigrationWithController(migrationID string, srcDef, dst
 		return nil, fmt.Errorf("database instance is required - migration engine does not open databases")
 	}
 
+	m.logger.Info().Str("migration_id", migrationID).Str("source", srcDef.ID).Str("root_id", srcFolder.ID()).Msg("acquiring source adapter")
+	// log the input args to this function call just below this for debugging
+	m.logger.Info().Str("migration_id", migrationID).Str("source_def", fmt.Sprintf("%+v", srcDef)).Str("src_folder", fmt.Sprintf("%+v", srcFolder)).Str("opts", fmt.Sprintf("%+v", opts)).Msg("input args to acquireAdapter")
 	srcAdapter, _, err := acquireAdapter(srcDef, srcFolder.ID(), opts.SourceConnectionID)
 	if err != nil {
+		m.logger.Error().Err(err).Str("migration_id", migrationID).Str("source", srcDef.ID).Msg("failed to acquire source adapter")
 		return nil, fmt.Errorf("source adapter: %w", err)
 	}
+	m.logger.Info().Str("migration_id", migrationID).Msg("source adapter acquired")
 	// Note: Cleanup functions are not used. Once migration.StartMigration() is called,
 	// the migration engine takes ownership of the adapters and handles cleanup itself.
 
+	m.logger.Info().Str("migration_id", migrationID).Str("destination", dstDef.ID).Str("root_id", dstFolder.ID()).Msg("acquiring destination adapter")
 	dstAdapter, _, err := acquireAdapter(dstDef, dstFolder.ID(), opts.DestinationConnectionID)
 	if err != nil {
+		m.logger.Error().Err(err).Str("migration_id", migrationID).Str("destination", dstDef.ID).Msg("failed to acquire destination adapter")
 		return nil, fmt.Errorf("destination adapter: %w", err)
 	}
+	m.logger.Info().Str("migration_id", migrationID).Msg("destination adapter acquired - adapters ready, proceeding with config setup")
 
 	cfg := migration.Config{
 		// REQUIRED: Pass the pre-opened DB instance (API owns lifecycle)
@@ -194,32 +207,33 @@ func (m *Manager) ExecuteMigrationWithController(migrationID string, srcDef, dst
 		cfg.ProgressTick = 500 * time.Millisecond
 	}
 
+	m.logger.Info().Str("migration_id", migrationID).Msg("setting root folders")
 	if err := cfg.SetRootFolders(srcFolder, dstFolder); err != nil {
+		m.logger.Error().Err(err).Str("migration_id", migrationID).Msg("failed to set root folders")
 		return nil, err
 	}
+	m.logger.Info().Str("migration_id", migrationID).Msg("root folders set successfully")
 
 	// Set SeedRoots to true - StartMigration will only use it if DB is empty
 	cfg.SeedRoots = true
+	m.logger.Info().Str("migration_id", migrationID).Msg("about to create YAML config")
 
 	// Create and save Migration Engine YAML config before starting migration
 	configPath := corebridgeDB.ConfigPathFromDatabasePath(dbPath)
-
-	// CRITICAL: Ensure config directory exists so SDK can save status updates
-	configDir := filepath.Dir(configPath)
-	if err := os.MkdirAll(configDir, 0o755); err != nil {
-		m.logger.Warn().Err(err).Str("migration_id", migrationID).Str("config_dir", configDir).Msg("failed to create config directory")
-		// Continue anyway - SDK might create it, but this ensures it exists
-	}
+	m.logger.Info().Str("migration_id", migrationID).Str("config_path", configPath).Str("db_path", dbPath).Str("source_type", string(srcDef.Type)).Str("dest_type", string(dstDef.Type)).Msg("creating YAML config")
 
 	// Get initial migration status to create YAML config
 	status := migration.MigrationStatus{} // Empty status for new migration
+	m.logger.Info().Str("migration_id", migrationID).Msg("calling NewMigrationConfigYAML")
 	yamlCfg, err := migration.NewMigrationConfigYAML(cfg, status)
-	if err == nil {
+	if err != nil {
+		m.logger.Error().Err(err).Str("migration_id", migrationID).Str("config_path", configPath).Msg("failed to create initial YAML config structure")
+	} else {
+		m.logger.Info().Str("migration_id", migrationID).Msg("NewMigrationConfigYAML succeeded, saving config")
 		// Update migration ID in YAML config
 		yamlCfg.Metadata.MigrationID = migrationID
 		if err := migration.SaveMigrationConfig(configPath, yamlCfg); err != nil {
-			// Log warning but continue - Migration Engine will update it during execution
-			m.logger.Warn().Err(err).Str("migration_id", migrationID).Str("config_path", configPath).Msg("failed to save initial YAML config")
+			m.logger.Error().Err(err).Str("migration_id", migrationID).Str("config_path", configPath).Msg("failed to save initial YAML config")
 		} else {
 			m.logger.Info().Str("migration_id", migrationID).Str("config_path", configPath).Msg("saved initial YAML config")
 		}

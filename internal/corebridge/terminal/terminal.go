@@ -66,6 +66,7 @@ func (m *Manager) SpawnLogTerminal(logAddress string) error {
 	// Find the Migration Engine directory
 	// Try relative path from current working directory first (for development)
 	migrationEnginePath := "../Migration-Engine"
+	// TODO: Use the actual imported path, not this hacky nonsense. PLEASE FIX.
 	if _, err := os.Stat(migrationEnginePath); os.IsNotExist(err) {
 		// Fallback: try relative to executable
 		execPath, err := os.Executable()

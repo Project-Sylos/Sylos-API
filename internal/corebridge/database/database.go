@@ -332,10 +332,8 @@ func DatabasePathFromConfigPath(configPath string) string {
 // New structure: DB is in dataDir/{migrationID}/{migrationID}.db
 // Config is in dataDir/{migrationID}/{migrationID}.yaml
 func ConfigPathFromDatabasePath(dbPath string) string {
-	dir := filepath.Dir(dbPath)
-	filename := filepath.Base(dbPath)
-	migrationID := strings.TrimSuffix(filename, ".db")
-	return filepath.Join(dir, migrationID+".yaml")
+	dbPathMinusDB := strings.TrimSuffix(dbPath, ".db")
+	return dbPathMinusDB + ".yaml"
 }
 
 func InspectMigrationStatusFromDB(ctx context.Context, logger zerolog.Logger, dbPath string) (migration.MigrationStatus, error) {
@@ -647,7 +645,7 @@ type PathNodeItem struct {
 	Id              string `json:"id"`
 	ParentId        string `json:"parentId,omitempty"`
 	ParentPath      string `json:"parentPath,omitempty"`
-	DisplayName     string `json:"displayName"`
+	Name            string `json:"name"`
 	LocationPath    string `json:"locationPath"`
 	LastUpdated     string `json:"lastUpdated,omitempty"`
 	DepthLevel      int    `json:"depthLevel"`
@@ -697,11 +695,6 @@ func GetChildrenDiffsFromDB(ctx context.Context, logger zerolog.Logger, dbPath s
 	var pagination PaginationInfo
 
 	err = boltDB.View(func(tx *bolt.Tx) error {
-		// DIAGNOSTIC: Inspect root paths when querying root
-		if path == "/" {
-			DebugInspectRootPathsInTx(ctx, logger, tx)
-		}
-
 		items, pagination, err = getChildrenDiffsFromTx(ctx, logger, tx, path, offset, limit, foldersOnly)
 		return err
 	})
@@ -721,11 +714,6 @@ func GetChildrenDiffsFromDBInstance(ctx context.Context, logger zerolog.Logger, 
 	var err error
 
 	err = dbInstance.View(func(tx *bolt.Tx) error {
-		// DIAGNOSTIC: Inspect root paths when querying root
-		if path == "/" {
-			DebugInspectRootPathsInTx(ctx, logger, tx)
-		}
-
 		items, pagination, err = getChildrenDiffsFromTx(ctx, logger, tx, path, offset, limit, foldersOnly)
 		return err
 	})
@@ -745,61 +733,158 @@ func getChildrenDiffsFromTx(ctx context.Context, logger zerolog.Logger, tx *bolt
 		return map[string]PathNodes{}, PaginationInfo{}, ctx.Err()
 	}
 
-	// Hash the parent path to get the key for children bucket
-	// Use Migration Engine SDK's HashPath to ensure consistency with bucket keys
-	parentHashHex := db.HashPath(path)
-	parentHash := []byte(parentHashHex)
+	// Step 1: Hash the parent path and use path-to-ulid lookup to get the parent's ULID
+	parentPathHash := db.HashPath(path)
+	parentPathHashBytes := []byte(parentPathHash)
 
-	// Collect all unique child path hashes from both SRC and DST
-	// Use byte slices as keys for pathHash comparison
-	childHashesMap := make(map[string]bool) // pathHash hex string -> exists
+	logger.Debug().
+		Str("path", path).
+		Str("pathHash", parentPathHash).
+		Msg("DEBUG: Looking up path in path-to-ulid bucket")
 
-	// Get children from SRC queue
-	// Children bucket stores JSON array of string hashes (32-char hex strings from HashPath)
-	// Key: parentHash (as []byte - ASCII bytes of 32-char hex string)
-	// Value: JSON([]string) where each string is a 32-char hex hash of child paths
-	srcChildrenBucket := db.GetChildrenBucket(tx, "SRC")
-	if srcChildrenBucket != nil {
-		childrenJSON := srcChildrenBucket.Get(parentHash)
-		if childrenJSON != nil {
-			var childHashes []string // Children are stored as []string (hex strings)
-			if err := json.Unmarshal(childrenJSON, &childHashes); err != nil {
-				previewLen := len(childrenJSON)
-				if previewLen > 100 {
-					previewLen = 100
-				}
-				logger.Warn().Err(err).Str("path", path).Str("queue", "SRC").Str("json_preview", string(childrenJSON[:previewLen])).Msg("failed to unmarshal children JSON")
-			} else {
-				for _, hashHex := range childHashes {
-					// hashHex is already a hex string (32 characters from HashPath)
-					childHashesMap[hashHex] = true
-				}
-			}
+	// Get SRC parent ULID using path-to-ulid lookup table
+	var srcParentULID string
+	srcPathToULIDBucket := db.GetPathToULIDBucket(tx, "SRC")
+	if srcPathToULIDBucket != nil {
+		logger.Debug().Msg("DEBUG: SRC path-to-ulid bucket exists")
+		ulidBytes := srcPathToULIDBucket.Get(parentPathHashBytes)
+		if ulidBytes != nil {
+			srcParentULID = string(ulidBytes)
+			logger.Debug().
+				Str("srcParentULID", srcParentULID).
+				Msg("DEBUG: Found SRC parent ULID from path-to-ulid lookup")
+		} else {
+			logger.Debug().
+				Str("pathHash", parentPathHash).
+				Msg("DEBUG: Path hash not found in SRC path-to-ulid bucket")
 		}
+	} else {
+		logger.Debug().Msg("DEBUG: SRC path-to-ulid bucket does not exist!")
 	}
 
-	// Get children from DST queue
-	dstChildrenBucket := db.GetChildrenBucket(tx, "DST")
-	if dstChildrenBucket != nil {
-		childrenJSON := dstChildrenBucket.Get(parentHash)
-		if childrenJSON != nil {
-			var childHashes []string // Children are stored as []string (hex strings)
-			if err := json.Unmarshal(childrenJSON, &childHashes); err != nil {
-				previewLen := len(childrenJSON)
-				if previewLen > 100 {
-					previewLen = 100
+	// Step 2: Use src-to-dst join table to get DST parent ULID (O(1) lookup)
+	var dstParentULID string
+	if srcParentULID != "" {
+		logger.Debug().
+			Str("srcParentULID", srcParentULID).
+			Msg("DEBUG: Looking up DST parent ULID from src-to-dst join table")
+		traversalDataBucket := tx.Bucket([]byte("Traversal-Data"))
+		if traversalDataBucket != nil {
+			srcBucket := traversalDataBucket.Bucket([]byte("SRC"))
+			if srcBucket != nil {
+				srcToDstBucket := srcBucket.Bucket([]byte("src-to-dst"))
+				if srcToDstBucket != nil {
+					dstULIDBytes := srcToDstBucket.Get([]byte(srcParentULID))
+					if dstULIDBytes != nil {
+						dstParentULID = string(dstULIDBytes)
+						logger.Debug().
+							Str("dstParentULID", dstParentULID).
+							Msg("DEBUG: Found DST parent ULID from src-to-dst join table")
+					} else {
+						logger.Debug().Msg("DEBUG: No DST parent ULID found in src-to-dst join table (node may be SRC-only)")
+					}
+				} else {
+					logger.Debug().Msg("DEBUG: src-to-dst bucket does not exist")
 				}
-				logger.Warn().Err(err).Str("path", path).Str("queue", "DST").Str("json_preview", string(childrenJSON[:previewLen])).Msg("failed to unmarshal children JSON")
 			} else {
-				for _, hashHex := range childHashes {
-					// hashHex is already a hex string (32 characters from HashPath)
-					childHashesMap[hashHex] = true
-				}
+				logger.Debug().Msg("DEBUG: SRC bucket does not exist")
 			}
+		} else {
+			logger.Debug().Msg("DEBUG: Traversal-Data bucket does not exist")
 		}
+	} else {
+		logger.Debug().Msg("DEBUG: No SRC parent ULID found, skipping DST lookup")
 	}
 
-	if len(childHashesMap) == 0 {
+	// Collect all unique child ULIDs from both SRC and DST
+	childULIDsMap := make(map[string]bool) // child ULID -> exists
+
+	// Step 3: Get children from SRC using parent ULID
+	// Children bucket: parentULID → []childULID JSON
+	if srcParentULID != "" {
+		logger.Debug().
+			Str("srcParentULID", srcParentULID).
+			Msg("DEBUG: Getting SRC children")
+		srcChildrenBucket := db.GetChildrenBucket(tx, "SRC")
+		if srcChildrenBucket != nil {
+			childrenJSON := srcChildrenBucket.Get([]byte(srcParentULID))
+			if childrenJSON != nil {
+				var childULIDs []string
+				if err := json.Unmarshal(childrenJSON, &childULIDs); err != nil {
+					previewLen := len(childrenJSON)
+					if previewLen > 100 {
+						previewLen = 100
+					}
+					logger.Warn().Err(err).Str("path", path).Str("srcParentULID", srcParentULID).Str("queue", "SRC").Str("json_preview", string(childrenJSON[:previewLen])).Msg("failed to unmarshal children JSON")
+				} else {
+					logger.Debug().
+						Str("srcParentULID", srcParentULID).
+						Int("childCount", len(childULIDs)).
+						Msg("DEBUG: Found SRC children")
+					for _, childULID := range childULIDs {
+						childULIDsMap[childULID] = true
+					}
+				}
+			} else {
+				logger.Debug().
+					Str("srcParentULID", srcParentULID).
+					Msg("DEBUG: No children found in SRC children bucket for this parent")
+			}
+		} else {
+			logger.Debug().Msg("DEBUG: SRC children bucket does not exist")
+		}
+	} else {
+		logger.Debug().Msg("DEBUG: No SRC parent ULID, skipping SRC children lookup")
+	}
+
+	// Step 4: Get children from DST using parent ULID
+	if dstParentULID != "" {
+		logger.Debug().
+			Str("dstParentULID", dstParentULID).
+			Msg("DEBUG: Getting DST children")
+		dstChildrenBucket := db.GetChildrenBucket(tx, "DST")
+		if dstChildrenBucket != nil {
+			childrenJSON := dstChildrenBucket.Get([]byte(dstParentULID))
+			if childrenJSON != nil {
+				var childULIDs []string
+				if err := json.Unmarshal(childrenJSON, &childULIDs); err != nil {
+					previewLen := len(childrenJSON)
+					if previewLen > 100 {
+						previewLen = 100
+					}
+					logger.Warn().Err(err).Str("path", path).Str("dstParentULID", dstParentULID).Str("queue", "DST").Str("json_preview", string(childrenJSON[:previewLen])).Msg("failed to unmarshal children JSON")
+				} else {
+					logger.Debug().
+						Str("dstParentULID", dstParentULID).
+						Int("childCount", len(childULIDs)).
+						Msg("DEBUG: Found DST children")
+					for _, childULID := range childULIDs {
+						childULIDsMap[childULID] = true
+					}
+				}
+			} else {
+				logger.Debug().
+					Str("dstParentULID", dstParentULID).
+					Msg("DEBUG: No children found in DST children bucket for this parent")
+			}
+		} else {
+			logger.Debug().Msg("DEBUG: DST children bucket does not exist")
+		}
+	} else {
+		logger.Debug().Msg("DEBUG: No DST parent ULID, skipping DST children lookup")
+	}
+
+	logger.Debug().
+		Str("path", path).
+		Int("totalChildULIDs", len(childULIDsMap)).
+		Str("srcParentULID", srcParentULID).
+		Str("dstParentULID", dstParentULID).
+		Msg("DEBUG: Child ULID collection complete")
+
+	if len(childULIDsMap) == 0 {
+		logger.Debug().
+			Str("path", path).
+			Msg("DEBUG: No children found, returning empty result")
 		return map[string]PathNodes{}, PaginationInfo{
 			Offset:       offset,
 			Limit:        limit,
@@ -810,72 +895,146 @@ func getChildrenDiffsFromTx(ctx context.Context, logger zerolog.Logger, tx *bolt
 		}, nil
 	}
 
-	// Group nodes by path - each path can have SRC node, DST node, or both
-	pathItemsMap := make(map[string]PathNodes) // path -> {src?: {...}, dst?: {...}}
+	// Step 5: Query nodes bucket using child ULIDs and use join table to correlate SRC/DST
+	// Group nodes by displayName - each displayName can have SRC node, DST node, or both
+	pathItemsMap := make(map[string]PathNodes) // displayName -> {src?: {...}, dst?: {...}}
 
-	// Get nodes buckets for both queues
+	// Track which ULIDs we've already processed to avoid duplicates
+	processedULIDs := make(map[string]bool)
+
+	// Get nodes buckets and join table buckets
 	srcNodesBucket := db.GetNodesBucket(tx, "SRC")
 	dstNodesBucket := db.GetNodesBucket(tx, "DST")
 
-	for pathHashHex := range childHashesMap {
-		// pathHashHex is a 32-character hex string (from HashPath)
-		// The nodes bucket stores keys as ASCII bytes of the hex string, not decoded bytes
-		// So we need to convert the hex string directly to []byte (ASCII representation)
-		pathHash := []byte(pathHashHex)
+	traversalDataBucket := tx.Bucket([]byte("Traversal-Data"))
+	var srcToDstBucket *bolt.Bucket
+	var dstToSrcBucket *bolt.Bucket
+	if traversalDataBucket != nil {
+		if srcBucket := traversalDataBucket.Bucket([]byte("SRC")); srcBucket != nil {
+			srcToDstBucket = srcBucket.Bucket([]byte("src-to-dst"))
+		}
+		if dstBucket := traversalDataBucket.Bucket([]byte("DST")); dstBucket != nil {
+			dstToSrcBucket = dstBucket.Bucket([]byte("dst-to-src"))
+		}
+	}
+
+	for childULID := range childULIDsMap {
+		if processedULIDs[childULID] {
+			continue // Already processed
+		}
+
+		// childULID is a ULID string (26 characters)
+		// The nodes bucket stores keys as ASCII bytes of the ULID string
+		childULIDBytes := []byte(childULID)
 
 		var srcNodeState *db.NodeState
 		var dstNodeState *db.NodeState
+		var name string
 
-		// Query SRC nodes bucket with child hash key
+		// Check if this ULID exists in SRC
 		if srcNodesBucket != nil {
-			nodeData := srcNodesBucket.Get(pathHash)
+			nodeData := srcNodesBucket.Get(childULIDBytes)
 			if nodeData != nil {
 				var nodeState db.NodeState
 				if err := json.Unmarshal(nodeData, &nodeState); err != nil {
-					logger.Warn().Err(err).Str("pathHash", pathHashHex).Str("queue", "SRC").Msg("failed to unmarshal NodeState")
+					logger.Warn().Err(err).Str("childULID", childULID).Str("queue", "SRC").Msg("failed to unmarshal NodeState")
 				} else {
 					srcNodeState = &nodeState
+					name = filepath.Base(nodeState.Path)
+					if name == "" || name == "." || name == "/" {
+						name = nodeState.Path
+					}
+					processedULIDs[childULID] = true
+
+					// Use join table to find corresponding DST node
+					if srcToDstBucket != nil {
+						dstULIDBytes := srcToDstBucket.Get(childULIDBytes)
+						if dstULIDBytes != nil && dstNodesBucket != nil {
+							dstNodeData := dstNodesBucket.Get(dstULIDBytes)
+							if dstNodeData != nil {
+								var dstState db.NodeState
+								if err := json.Unmarshal(dstNodeData, &dstState); err == nil {
+									dstNodeState = &dstState
+									processedULIDs[string(dstULIDBytes)] = true
+								}
+							}
+						}
+					}
 				}
 			}
 		}
 
-		// Query DST nodes bucket with child hash key (same key in both buckets)
-		if dstNodesBucket != nil {
-			nodeData := dstNodesBucket.Get(pathHash)
+		// If not found in SRC, check DST
+		if srcNodeState == nil && dstNodesBucket != nil {
+			nodeData := dstNodesBucket.Get(childULIDBytes)
 			if nodeData != nil {
 				var nodeState db.NodeState
 				if err := json.Unmarshal(nodeData, &nodeState); err != nil {
-					logger.Warn().Err(err).Str("pathHash", pathHashHex).Str("queue", "DST").Msg("failed to unmarshal NodeState")
+					logger.Warn().Err(err).Str("childULID", childULID).Str("queue", "DST").Msg("failed to unmarshal NodeState")
 				} else {
 					dstNodeState = &nodeState
+					name = filepath.Base(nodeState.Path)
+					if name == "" || name == "." || name == "/" {
+						name = nodeState.Path
+					}
+					processedULIDs[childULID] = true
+
+					// Use join table to find corresponding SRC node
+					if dstToSrcBucket != nil {
+						srcULIDBytes := dstToSrcBucket.Get(childULIDBytes)
+						if srcULIDBytes != nil && srcNodesBucket != nil {
+							srcNodeData := srcNodesBucket.Get(srcULIDBytes)
+							if srcNodeData != nil {
+								var srcState db.NodeState
+								if err := json.Unmarshal(srcNodeData, &srcState); err == nil {
+									srcNodeState = &srcState
+									// Update displayName from SRC if available
+									if srcDisplayName := filepath.Base(srcState.Path); srcDisplayName != "" && srcDisplayName != "." && srcDisplayName != "/" {
+										name = srcDisplayName
+									}
+									processedULIDs[string(srcULIDBytes)] = true
+								}
+							}
+						}
+					}
 				}
 			}
 		}
 
-		// Skip if no node state found for this hash
+		// Skip if no node state found for this ULID
 		if srcNodeState == nil && dstNodeState == nil {
 			continue
 		}
 
+		// Ensure we have a displayName
+		if name == "" {
+			if srcNodeState != nil {
+				name = filepath.Base(srcNodeState.Path)
+			} else if dstNodeState != nil {
+				name = filepath.Base(dstNodeState.Path)
+			}
+			if name == "" || name == "." || name == "/" {
+				if srcNodeState != nil {
+					name = srcNodeState.Path
+				} else if dstNodeState != nil {
+					name = dstNodeState.Path
+				}
+			}
+		}
+
 		// Build PathNodes with src and/or dst nodes
-		// Determine display name from whichever node exists (they should be the same for the same logical item)
-		var displayName string
 		var srcItem *PathNodeItem
 		var dstItem *PathNodeItem
 
 		if srcNodeState != nil {
-			srcStatus := getStatusFromLookup(tx, "SRC", srcNodeState.Depth, srcNodeState.Path)
-			displayName = filepath.Base(srcNodeState.Path)
-			if displayName == "" || displayName == "." || displayName == "/" {
-				displayName = srcNodeState.Path
-			}
-
+			// Get status using ULID from status-lookup
+			srcStatus := getStatusFromLookupByULID(tx, "SRC", srcNodeState.Depth, []byte(srcNodeState.ID))
 			srcItem = &PathNodeItem{
 				Queue:           "SRC",
 				Id:              srcNodeState.ID,
 				ParentId:        srcNodeState.ParentID,
 				ParentPath:      srcNodeState.ParentPath,
-				DisplayName:     displayName,
+				Name:            name,
 				LocationPath:    srcNodeState.Path,
 				LastUpdated:     time.Now().Format(time.RFC3339), // NodeState doesn't store LastUpdated
 				DepthLevel:      srcNodeState.Depth,
@@ -889,22 +1048,15 @@ func getChildrenDiffsFromTx(ctx context.Context, logger zerolog.Logger, tx *bolt
 		}
 
 		if dstNodeState != nil {
-			// If displayName not set from src, get it from dst
-			if displayName == "" {
-				displayName = filepath.Base(dstNodeState.Path)
-				if displayName == "" || displayName == "." || displayName == "/" {
-					displayName = dstNodeState.Path
-				}
-			}
-
-			dstStatus := getStatusFromLookup(tx, "DST", dstNodeState.Depth, dstNodeState.Path)
+			// Get status using ULID from status-lookup
+			dstStatus := getStatusFromLookupByULID(tx, "DST", dstNodeState.Depth, []byte(dstNodeState.ID))
 
 			dstItem = &PathNodeItem{
 				Queue:           "DST",
 				Id:              dstNodeState.ID,
 				ParentId:        dstNodeState.ParentID,
 				ParentPath:      dstNodeState.ParentPath,
-				DisplayName:     displayName, // Use the same display name
+				Name:            name, // Use the same display name
 				LocationPath:    dstNodeState.Path,
 				LastUpdated:     time.Now().Format(time.RFC3339), // NodeState doesn't store LastUpdated
 				DepthLevel:      dstNodeState.Depth,
@@ -918,8 +1070,8 @@ func getChildrenDiffsFromTx(ctx context.Context, logger zerolog.Logger, tx *bolt
 		}
 
 		// Add to map using display name as key (at least one node should exist since we check above)
-		if displayName != "" {
-			pathItemsMap[displayName] = PathNodes{
+		if name != "" {
+			pathItemsMap[name] = PathNodes{
 				Src: srcItem,
 				Dst: dstItem,
 			}
@@ -1020,9 +1172,10 @@ func getChildrenDiffsFromTx(ctx context.Context, logger zerolog.Logger, tx *bolt
 	return resultMap, pagination, nil
 }
 
-// getStatusFromLookupByHash retrieves the traversal status from the status-lookup index using a path hash directly
+// getStatusFromLookupByULID retrieves the traversal status from the status-lookup index using a ULID directly
 // Manually navigates to /Traversal-Data/{queueType}/levels/{formattedLevel}/status-lookup
-func getStatusFromLookupByHash(tx *bolt.Tx, queueType string, level int, pathHash []byte) string {
+// Per DB structure: status-lookup bucket uses ULID as key (not path hash)
+func getStatusFromLookupByULID(tx *bolt.Tx, queueType string, level int, nodeULID []byte) string {
 	formattedLevel := formatLevel(level)
 
 	// Navigate to /Traversal-Data/{queueType}/levels/{formattedLevel}/status-lookup
@@ -1051,20 +1204,12 @@ func getStatusFromLookupByHash(tx *bolt.Tx, queueType string, level int, pathHas
 		return ""
 	}
 
-	statusBytes := statusLookupBucket.Get(pathHash)
+	statusBytes := statusLookupBucket.Get(nodeULID)
 	if statusBytes == nil {
 		return ""
 	}
 
 	return string(statusBytes)
-}
-
-// getStatusFromLookup retrieves the traversal status from the status-lookup index
-// Manually navigates to /Traversal-Data/{queueType}/levels/{formattedLevel}/status-lookup
-func getStatusFromLookup(tx *bolt.Tx, queueType string, level int, path string) string {
-	// Use Migration Engine SDK's HashPath to ensure consistency with bucket keys
-	pathHash := []byte(db.HashPath(path))
-	return getStatusFromLookupByHash(tx, queueType, level, pathHash)
 }
 
 // DebugInspectRootPathsInTx is a diagnostic function to inspect what root paths are actually stored in the database
@@ -1252,11 +1397,11 @@ func GetChildNodeStates(tx *bolt.Tx, childHashes map[string]bool) ([]struct {
 	dstNodesBucket := db.GetNodesBucket(tx, "DST")
 
 	for pathHashHex := range childHashes {
-		pathHash := []byte(pathHashHex) // Convert hex string to ASCII bytes
+		pathHashBytes := []byte(pathHashHex) // Convert hex string to ASCII bytes
 
 		// Check SRC first
 		if srcNodesBucket != nil {
-			nodeData := srcNodesBucket.Get(pathHash)
+			nodeData := srcNodesBucket.Get(pathHashBytes)
 			if nodeData != nil {
 				var nodeState db.NodeState
 				if err := json.Unmarshal(nodeData, &nodeState); err == nil {
@@ -1274,7 +1419,7 @@ func GetChildNodeStates(tx *bolt.Tx, childHashes map[string]bool) ([]struct {
 
 		// Check DST if not found in SRC
 		if dstNodesBucket != nil {
-			nodeData := dstNodesBucket.Get(pathHash)
+			nodeData := dstNodesBucket.Get(pathHashBytes)
 			if nodeData != nil {
 				var nodeState db.NodeState
 				if err := json.Unmarshal(nodeData, &nodeState); err == nil {
@@ -1416,14 +1561,14 @@ func QueueChildrenInExclusionHolding(tx *bolt.Tx, queueType string, childStates 
 // SetNodeExclusion performs the complete exclusion/unexclusion operation atomically:
 // 1. Updates the node's explicit_excluded flag
 // 2. Adds the node itself to the appropriate holding bucket (exclusion-holding or unexclusion-holding)
-// nodeID is expected to be a path hash hex string (from db.HashPath)
+// nodeID is expected to be a ULID (26 characters from Migration Engine)
 // Per SDK docs: The exclusion sweep will propagate the flag to all descendants
 func SetNodeExclusion(ctx context.Context, logger zerolog.Logger, dbInstance *db.DB, nodeID string, excluded bool) error {
 	return dbInstance.Update(func(tx *bolt.Tx) error {
-		// Step 1: Find the node by path hash (same pattern as ListChildrenDiffs)
-		// nodeID is a path hash hex string (32 characters from db.HashPath)
-		// Convert to []byte to get the bucket key (ASCII bytes of hex string)
-		pathHash := []byte(nodeID)
+		// Step 1: Find the node by ULID
+		// nodeID is a ULID string (26 characters from Migration Engine)
+		// Convert to []byte to get the bucket key (ASCII bytes of ULID string)
+		nodeULID := []byte(nodeID)
 
 		var nodeInfo *NodeInfo
 		srcNodesBucket := db.GetNodesBucket(tx, "SRC")
@@ -1431,7 +1576,7 @@ func SetNodeExclusion(ctx context.Context, logger zerolog.Logger, dbInstance *db
 
 		// Query SRC nodes bucket directly (prefer SRC if both exist)
 		if srcNodesBucket != nil {
-			nodeData := srcNodesBucket.Get(pathHash)
+			nodeData := srcNodesBucket.Get(nodeULID)
 			if nodeData != nil {
 				var nodeState db.NodeState
 				if err := json.Unmarshal(nodeData, &nodeState); err == nil {
@@ -1446,7 +1591,7 @@ func SetNodeExclusion(ctx context.Context, logger zerolog.Logger, dbInstance *db
 
 		// Query DST nodes bucket if not found in SRC
 		if nodeInfo == nil && dstNodesBucket != nil {
-			nodeData := dstNodesBucket.Get(pathHash)
+			nodeData := dstNodesBucket.Get(nodeULID)
 			if nodeData != nil {
 				var nodeState db.NodeState
 				if err := json.Unmarshal(nodeData, &nodeState); err == nil {
@@ -1460,7 +1605,7 @@ func SetNodeExclusion(ctx context.Context, logger zerolog.Logger, dbInstance *db
 		}
 
 		if nodeInfo == nil {
-			return fmt.Errorf("node with path hash %s not found", nodeID)
+			return fmt.Errorf("node with ULID %s not found", nodeID)
 		}
 
 		// Step 2: Set the exclusion flag
@@ -1492,13 +1637,13 @@ func SetNodeExclusion(ctx context.Context, logger zerolog.Logger, dbInstance *db
 			return fmt.Errorf("failed to create/get %s bucket for %s: %w", bucketName, nodeInfo.QueueType, err)
 		}
 
-		// Store path hash -> depth in the holding bucket
-		// pathHash is already []byte (the bucket key)
+		// Store ULID -> depth in the holding bucket
+		// nodeULID is already []byte (the bucket key)
 		// depth as 8-byte big-endian int64 (same format as SDK uses)
 		depthBytes := make([]byte, 8)
 		binary.BigEndian.PutUint64(depthBytes, uint64(nodeInfo.NodeState.Depth))
 
-		if err := holdingBucket.Put(pathHash, depthBytes); err != nil {
+		if err := holdingBucket.Put(nodeULID, depthBytes); err != nil {
 			return fmt.Errorf("failed to add node to %s bucket: %w", bucketName, err)
 		}
 
@@ -1658,13 +1803,13 @@ func CountPendingRetries(ctx context.Context, logger zerolog.Logger, dbInstance 
 // 2. Status-lookup bucket entry
 // 3. Status buckets (moves from failed to pending)
 // 4. Stats counters (decrements failed, increments pending)
-// nodeID is expected to be a path hash hex string (from db.HashPath)
+// nodeID is expected to be a ULID (26 characters from Migration Engine)
 func MarkNodeForRetry(ctx context.Context, logger zerolog.Logger, dbInstance *db.DB, nodeID string) error {
 	return dbInstance.Update(func(tx *bolt.Tx) error {
-		// Step 1: Find the node by path hash (same pattern as ListChildrenDiffs)
-		// nodeID is a path hash hex string (32 characters from db.HashPath)
-		// Convert to []byte to get the bucket key (ASCII bytes of hex string)
-		pathHash := []byte(nodeID)
+		// Step 1: Find the node by ULID
+		// nodeID is a ULID string (26 characters from Migration Engine)
+		// Convert to []byte to get the bucket key (ASCII bytes of ULID string)
+		nodeULID := []byte(nodeID)
 
 		var nodeInfo *NodeInfo
 		srcNodesBucket := db.GetNodesBucket(tx, "SRC")
@@ -1672,7 +1817,7 @@ func MarkNodeForRetry(ctx context.Context, logger zerolog.Logger, dbInstance *db
 
 		// Query SRC nodes bucket directly (prefer SRC if both exist)
 		if srcNodesBucket != nil {
-			nodeData := srcNodesBucket.Get(pathHash)
+			nodeData := srcNodesBucket.Get(nodeULID)
 			if nodeData != nil {
 				var nodeState db.NodeState
 				if err := json.Unmarshal(nodeData, &nodeState); err == nil {
@@ -1687,7 +1832,7 @@ func MarkNodeForRetry(ctx context.Context, logger zerolog.Logger, dbInstance *db
 
 		// Query DST nodes bucket if not found in SRC
 		if nodeInfo == nil && dstNodesBucket != nil {
-			nodeData := dstNodesBucket.Get(pathHash)
+			nodeData := dstNodesBucket.Get(nodeULID)
 			if nodeData != nil {
 				var nodeState db.NodeState
 				if err := json.Unmarshal(nodeData, &nodeState); err == nil {
@@ -1701,12 +1846,12 @@ func MarkNodeForRetry(ctx context.Context, logger zerolog.Logger, dbInstance *db
 		}
 
 		if nodeInfo == nil {
-			return fmt.Errorf("node with path hash %s not found", nodeID)
+			return fmt.Errorf("node with ULID %s not found", nodeID)
 		}
 
 		// Step 2: Verify node is currently "failed"
-		// pathHash is already set from Step 1, use it for status lookup
-		currentStatus := getStatusFromLookupByHash(tx, nodeInfo.QueueType, nodeInfo.NodeState.Depth, pathHash)
+		// Get status from status-lookup using ULID (status-lookup uses ULID as key)
+		currentStatus := getStatusFromLookupByULID(tx, nodeInfo.QueueType, nodeInfo.NodeState.Depth, nodeULID)
 		if currentStatus != "failed" {
 			return fmt.Errorf("node is not in failed status (current: %s), cannot mark for retry", currentStatus)
 		}
@@ -1738,19 +1883,20 @@ func MarkNodeForRetry(ctx context.Context, logger zerolog.Logger, dbInstance *db
 			return fmt.Errorf("status-lookup bucket not found")
 		}
 
-		// Update status-lookup from "failed" to "pending"
-		if err := statusLookupBucket.Put(pathHash, []byte("pending")); err != nil {
+		// Update status-lookup from "failed" to "pending" (uses ULID as key)
+		if err := statusLookupBucket.Put(nodeULID, []byte("pending")); err != nil {
 			return fmt.Errorf("failed to update status-lookup: %w", err)
 		}
 
 		// Step 4: Update status buckets (move from failed to pending)
 		// Status buckets are at: Traversal-Data/{queueType}/levels/{level}/status/{status}
+		// Per DB structure: status buckets use ULID as key
 		statusBucket := levelBucket.Bucket([]byte("status"))
 		if statusBucket != nil {
 			// Remove from failed bucket
 			failedBucket := statusBucket.Bucket([]byte("failed"))
 			if failedBucket != nil {
-				if err := failedBucket.Delete(pathHash); err != nil {
+				if err := failedBucket.Delete(nodeULID); err != nil {
 					logger.Warn().Err(err).Str("node_id", nodeID).Msg("failed to remove from failed status bucket")
 					// Continue - not critical
 				}
@@ -1761,8 +1907,8 @@ func MarkNodeForRetry(ctx context.Context, logger zerolog.Logger, dbInstance *db
 			if err != nil {
 				return fmt.Errorf("failed to create pending status bucket: %w", err)
 			}
-			// Add empty value (key is the path hash, value can be empty)
-			if err := pendingBucket.Put(pathHash, []byte{}); err != nil {
+			// Add empty value (key is the ULID, value can be empty)
+			if err := pendingBucket.Put(nodeULID, []byte{}); err != nil {
 				return fmt.Errorf("failed to add to pending status bucket: %w", err)
 			}
 		}
@@ -1770,7 +1916,7 @@ func MarkNodeForRetry(ctx context.Context, logger zerolog.Logger, dbInstance *db
 		// Step 5: Update node in nodes bucket (if NodeState has Status field)
 		nodesBucket := db.GetNodesBucket(tx, nodeInfo.QueueType)
 		if nodesBucket != nil {
-			nodeData := nodesBucket.Get(pathHash)
+			nodeData := nodesBucket.Get(nodeULID)
 			if nodeData != nil {
 				var nodeState db.NodeState
 				if err := json.Unmarshal(nodeData, &nodeState); err == nil {
@@ -1783,7 +1929,7 @@ func MarkNodeForRetry(ctx context.Context, logger zerolog.Logger, dbInstance *db
 						// So we just update the node data back (in case there are other changes needed)
 						updatedNodeData, err := json.Marshal(nodeState)
 						if err == nil {
-							if err := nodesBucket.Put(pathHash, updatedNodeData); err != nil {
+							if err := nodesBucket.Put(nodeULID, updatedNodeData); err != nil {
 								logger.Warn().Err(err).Str("node_id", nodeID).Msg("failed to update node in nodes bucket")
 								// Continue - status-lookup is the source of truth
 							}
@@ -1842,13 +1988,13 @@ func MarkNodeForRetry(ctx context.Context, logger zerolog.Logger, dbInstance *db
 // 2. Status-lookup bucket entry
 // 3. Status buckets (moves from pending to failed)
 // 4. Stats counters (decrements pending, increments failed)
-// nodeID is expected to be a path hash hex string (from db.HashPath)
+// nodeID is expected to be a ULID (26 characters from Migration Engine)
 func UnmarkNodeForRetry(ctx context.Context, logger zerolog.Logger, dbInstance *db.DB, nodeID string) error {
 	return dbInstance.Update(func(tx *bolt.Tx) error {
-		// Step 1: Find the node by path hash (same pattern as MarkNodeForRetry)
-		// nodeID is a path hash hex string (32 characters from db.HashPath)
-		// Convert to []byte to get the bucket key (ASCII bytes of hex string)
-		pathHash := []byte(nodeID)
+		// Step 1: Find the node by ULID
+		// nodeID is a ULID string (26 characters from Migration Engine)
+		// Convert to []byte to get the bucket key (ASCII bytes of ULID string)
+		nodeULID := []byte(nodeID)
 
 		var nodeInfo *NodeInfo
 		srcNodesBucket := db.GetNodesBucket(tx, "SRC")
@@ -1856,7 +2002,7 @@ func UnmarkNodeForRetry(ctx context.Context, logger zerolog.Logger, dbInstance *
 
 		// Query SRC nodes bucket directly (prefer SRC if both exist)
 		if srcNodesBucket != nil {
-			nodeData := srcNodesBucket.Get(pathHash)
+			nodeData := srcNodesBucket.Get(nodeULID)
 			if nodeData != nil {
 				var nodeState db.NodeState
 				if err := json.Unmarshal(nodeData, &nodeState); err == nil {
@@ -1871,7 +2017,7 @@ func UnmarkNodeForRetry(ctx context.Context, logger zerolog.Logger, dbInstance *
 
 		// Query DST nodes bucket if not found in SRC
 		if nodeInfo == nil && dstNodesBucket != nil {
-			nodeData := dstNodesBucket.Get(pathHash)
+			nodeData := dstNodesBucket.Get(nodeULID)
 			if nodeData != nil {
 				var nodeState db.NodeState
 				if err := json.Unmarshal(nodeData, &nodeState); err == nil {
@@ -1885,12 +2031,12 @@ func UnmarkNodeForRetry(ctx context.Context, logger zerolog.Logger, dbInstance *
 		}
 
 		if nodeInfo == nil {
-			return fmt.Errorf("node with path hash %s not found", nodeID)
+			return fmt.Errorf("node with ULID %s not found", nodeID)
 		}
 
 		// Step 2: Verify node is currently "pending"
-		// pathHash is already set from Step 1, use it for status lookup
-		currentStatus := getStatusFromLookupByHash(tx, nodeInfo.QueueType, nodeInfo.NodeState.Depth, pathHash)
+		// Get status from status-lookup using ULID (status-lookup uses ULID as key)
+		currentStatus := getStatusFromLookupByULID(tx, nodeInfo.QueueType, nodeInfo.NodeState.Depth, nodeULID)
 		if currentStatus != "pending" {
 			return fmt.Errorf("node is not in pending status (current: %s), cannot unmark for retry", currentStatus)
 		}
@@ -1922,19 +2068,20 @@ func UnmarkNodeForRetry(ctx context.Context, logger zerolog.Logger, dbInstance *
 			return fmt.Errorf("status-lookup bucket not found")
 		}
 
-		// Update status-lookup from "pending" to "failed"
-		if err := statusLookupBucket.Put(pathHash, []byte("failed")); err != nil {
+		// Update status-lookup from "pending" to "failed" (uses ULID as key)
+		if err := statusLookupBucket.Put(nodeULID, []byte("failed")); err != nil {
 			return fmt.Errorf("failed to update status-lookup: %w", err)
 		}
 
 		// Step 4: Update status buckets (move from pending to failed)
 		// Status buckets are at: Traversal-Data/{queueType}/levels/{level}/status/{status}
+		// Per DB structure: status buckets use ULID as key
 		statusBucket := levelBucket.Bucket([]byte("status"))
 		if statusBucket != nil {
 			// Remove from pending bucket
 			pendingBucket := statusBucket.Bucket([]byte("pending"))
 			if pendingBucket != nil {
-				if err := pendingBucket.Delete(pathHash); err != nil {
+				if err := pendingBucket.Delete(nodeULID); err != nil {
 					logger.Warn().Err(err).Str("node_id", nodeID).Msg("failed to remove from pending status bucket")
 					// Continue - not critical
 				}
@@ -1945,8 +2092,8 @@ func UnmarkNodeForRetry(ctx context.Context, logger zerolog.Logger, dbInstance *
 			if err != nil {
 				return fmt.Errorf("failed to create failed status bucket: %w", err)
 			}
-			// Add empty value (key is the path hash, value can be empty)
-			if err := failedBucket.Put(pathHash, []byte{}); err != nil {
+			// Add empty value (key is the ULID, value can be empty)
+			if err := failedBucket.Put(nodeULID, []byte{}); err != nil {
 				return fmt.Errorf("failed to add to failed status bucket: %w", err)
 			}
 		}
@@ -1954,7 +2101,7 @@ func UnmarkNodeForRetry(ctx context.Context, logger zerolog.Logger, dbInstance *
 		// Step 5: Update node in nodes bucket (if NodeState has Status field)
 		nodesBucket := db.GetNodesBucket(tx, nodeInfo.QueueType)
 		if nodesBucket != nil {
-			nodeData := nodesBucket.Get(pathHash)
+			nodeData := nodesBucket.Get(nodeULID)
 			if nodeData != nil {
 				var nodeState db.NodeState
 				if err := json.Unmarshal(nodeData, &nodeState); err == nil {
@@ -1963,7 +2110,7 @@ func UnmarkNodeForRetry(ctx context.Context, logger zerolog.Logger, dbInstance *
 					// So we just update the node data back (in case there are other changes needed)
 					updatedNodeData, err := json.Marshal(nodeState)
 					if err == nil {
-						if err := nodesBucket.Put(pathHash, updatedNodeData); err != nil {
+						if err := nodesBucket.Put(nodeULID, updatedNodeData); err != nil {
 							logger.Warn().Err(err).Str("node_id", nodeID).Msg("failed to update node in nodes bucket")
 							// Continue - status-lookup is the source of truth
 						}

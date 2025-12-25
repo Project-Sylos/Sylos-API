@@ -10,7 +10,6 @@ import (
 
 	"github.com/Project-Sylos/Sylos-API/internal/corebridge"
 	"github.com/Project-Sylos/Sylos-API/internal/routes/middleware"
-	"github.com/Project-Sylos/Sylos-API/pkg/common_utils"
 )
 
 // contains is a helper function to check if a string contains a substring (case-insensitive)
@@ -65,10 +64,8 @@ func (h handler) markNodeForRetry(ctx *middleware.Context) {
 		return
 	}
 
-	// hash path before sending it to the core
-	hashedPath := common_utils.HashPath(unescapedNodeID)
-
-	result, err := h.core.MarkNodeForRetry(ctx.Request().Context(), migrationID, hashedPath)
+	// nodeID is a ULID - pass directly without hashing
+	result, err := h.core.MarkNodeForRetry(ctx.Request().Context(), migrationID, unescapedNodeID)
 	if err != nil {
 		if errors.Is(err, corebridge.ErrMigrationNotFound) {
 			ctx.Error(http.StatusNotFound, "migration not found", err)
@@ -119,10 +116,8 @@ func (h handler) unmarkNodeForRetry(ctx *middleware.Context) {
 		return
 	}
 
-	// hash path before sending it to the core
-	hashedPath := common_utils.HashPath(unescapedNodeID)
-
-	result, err := h.core.UnmarkNodeForRetry(ctx.Request().Context(), migrationID, hashedPath)
+	// nodeID is a ULID - pass directly without hashing
+	result, err := h.core.UnmarkNodeForRetry(ctx.Request().Context(), migrationID, unescapedNodeID)
 	if err != nil {
 		if errors.Is(err, corebridge.ErrMigrationNotFound) {
 			ctx.Error(http.StatusNotFound, "migration not found", err)

@@ -38,7 +38,7 @@ func SaveSpectraConfigOverride(dataDir, migrationID, originalConfigPath string) 
 		return "", fmt.Errorf("failed to parse original Spectra config: %w", err)
 	}
 
-	// Override db_path
+	// Override db_path - put Spectra DB in migration-specific folder
 	spectraDBPath := ResolveSpectraDBPath(dataDir, migrationID)
 	absSpectraDBPath, err := filepath.Abs(spectraDBPath)
 	if err != nil {
@@ -46,8 +46,9 @@ func SaveSpectraConfigOverride(dataDir, migrationID, originalConfigPath string) 
 	}
 	config.Seed.DBPath = absSpectraDBPath
 
-	// Create override config file
-	overrideConfigPath := filepath.Join(dataDir, fmt.Sprintf("%s-spectra-config.json", migrationID))
+	// Create override config file in migration-specific folder (same as migration DB/YAML)
+	migrationDir := filepath.Join(dataDir, migrationID)
+	overrideConfigPath := filepath.Join(migrationDir, "spectra-config.json")
 
 	// Ensure directory exists
 	if err := os.MkdirAll(filepath.Dir(overrideConfigPath), 0o755); err != nil {
@@ -68,14 +69,17 @@ func SaveSpectraConfigOverride(dataDir, migrationID, originalConfigPath string) 
 }
 
 // ResolveSpectraDBPath returns the path to the Spectra DB for a migration
+// Puts the DB in the migration-specific folder (same as migration DB/YAML)
 func ResolveSpectraDBPath(dataDir, migrationID string) string {
-	filename := fmt.Sprintf("%s-spectra.db", migrationID)
-	return filepath.Join(dataDir, filename)
+	migrationDir := filepath.Join(dataDir, migrationID)
+	return filepath.Join(migrationDir, "spectra.db")
 }
 
 // LoadSpectraConfigOverride checks if an override config exists and returns its path
+// Looks in the migration-specific folder (same as migration DB/YAML)
 func LoadSpectraConfigOverride(dataDir, migrationID string) (string, bool, error) {
-	overrideConfigPath := filepath.Join(dataDir, fmt.Sprintf("%s-spectra-config.json", migrationID))
+	migrationDir := filepath.Join(dataDir, migrationID)
+	overrideConfigPath := filepath.Join(migrationDir, "spectra-config.json")
 
 	_, err := os.Stat(overrideConfigPath)
 	if os.IsNotExist(err) {

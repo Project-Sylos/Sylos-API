@@ -237,7 +237,7 @@ func (m *ServiceManager) GetServiceDefinitionByWorld(world string) (ServiceDefin
 	return ServiceDefinition{}, ErrServiceNotFound
 }
 
-func (m *ServiceManager) AcquireAdapter(def ServiceDefinition, rootID, connectionID string) (fstypes.FSAdapter, func(), error) {
+func (m *ServiceManager) AcquireAdapter(def ServiceDefinition, rootID, connectionID string, ) (fstypes.FSAdapter, func(), error) {
 	return m.AcquireAdapterWithOverride(def, rootID, connectionID, "")
 }
 

@@ -7,11 +7,14 @@ import (
 	"strings"
 	"sync"
 
+	"math/rand"
+	"time"
+
 	"github.com/Project-Sylos/Migration-Engine/pkg/db"
 	"github.com/Project-Sylos/Migration-Engine/pkg/migration"
 	"github.com/Project-Sylos/Sylos-API/internal/corebridge/services"
 	fstypes "github.com/Project-Sylos/Sylos-FS/pkg/types"
-	"github.com/rs/xid"
+	"github.com/oklog/ulid/v2"
 	"github.com/rs/zerolog"
 )
 
@@ -88,7 +91,7 @@ func FolderFromDescriptor(desc FolderDescriptor) (fstypes.Folder, error) {
 	}
 
 	folder := fstypes.Folder{
-		Id:           desc.ID,
+		ServiceID:    desc.ID,
 		ParentId:     desc.ParentID,
 		ParentPath:   desc.ParentPath,
 		DisplayName:  desc.DisplayName,
@@ -156,7 +159,9 @@ func (m *Manager) SetRoot(ctx context.Context, req SetRootRequest) (SetRootRespo
 
 	migrationID := req.MigrationID
 	if migrationID == "" {
-		migrationID = xid.New().String()
+		// Generate ULID for migration ID (lexicographically sortable, time-ordered)
+		entropy := rand.New(rand.NewSource(time.Now().UnixNano()))
+		migrationID = ulid.MustNew(ulid.Timestamp(time.Now()), entropy).String()
 	}
 
 	m.mu.Lock()
