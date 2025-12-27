@@ -36,11 +36,15 @@ func Register(router chi.Router, logger zerolog.Logger, core corebridge.Bridge, 
 	router.Get("/migrations/{migrationID}/queue-metrics", middleware.NoBody(mw, h.queueMetrics))
 	router.Post("/migrations/{migrationID}/logs", middleware.JSON(mw, h.getLogs))
 	router.Get("/migrations/{migrationID}/diffs", middleware.NoBody(mw, h.listDiffs))
-	router.Post("/migrations/{migrationID}/node/{nodeID}/exclude", middleware.NoBody(mw, h.excludeNode))
-	router.Post("/migrations/{migrationID}/node/{nodeID}/unexclude", middleware.NoBody(mw, h.unexcludeNode))
+	router.Post("/migrations/{migrationID}/exclude", middleware.JSON(mw, h.excludeNodes))
+	router.Post("/migrations/{migrationID}/node/{nodeID}/exclude", middleware.NoBody(mw, h.excludeNode)) // Backward compatibility
+	router.Post("/migrations/{migrationID}/unexclude", middleware.JSON(mw, h.unexcludeNodes))
+	router.Post("/migrations/{migrationID}/node/{nodeID}/unexclude", middleware.NoBody(mw, h.unexcludeNode)) // Backward compatibility
 	router.Post("/migrations/{migrationID}/node/{nodeID}/mark-retry", middleware.NoBody(mw, h.markNodeForRetry))
 	router.Post("/migrations/{migrationID}/node/{nodeID}/unmark-retry", middleware.NoBody(mw, h.unmarkNodeForRetry))
 	router.Get("/migrations/{migrationID}/pending-work", middleware.NoBody(mw, h.checkPendingWork))
 	router.Get("/migrations/{migrationID}/bgTasks", middleware.NoBody(mw, h.bgTasks))
+	router.Get("/migrations/{migrationID}/stats", middleware.NoBody(mw, h.stats))
+	router.Post("/migrations/{migrationID}/search", middleware.JSON(mw, h.search))
 	router.Get("/migrations/{migrationID}/stream", h.handleStream)
 }

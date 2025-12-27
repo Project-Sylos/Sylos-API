@@ -17,6 +17,7 @@ const (
 	BackgroundTaskTypeUnexclusionPropagate BackgroundTaskType = "unexclusion_propagate"
 	BackgroundTaskTypeExclusionSweep       BackgroundTaskType = "exclusion_sweep"
 	BackgroundTaskTypeRetrySweep           BackgroundTaskType = "retry_sweep"
+	BackgroundTaskTypeRetryAll             BackgroundTaskType = "retry_all"
 )
 
 // BackgroundTaskStatus represents the status of a background task
@@ -30,14 +31,14 @@ const (
 
 // BackgroundTask represents a running background task
 type BackgroundTask struct {
-	ID          string                 `json:"id"`
-	Type        BackgroundTaskType     `json:"type"`
-	Status      BackgroundTaskStatus   `json:"status"`
-	StartedAt   time.Time              `json:"startedAt"`
-	CompletedAt *time.Time             `json:"completedAt,omitempty"`
-	Error       string                 `json:"error,omitempty"`
-	Progress    map[string]interface{} `json:"progress,omitempty"` // Task-specific progress info
-	Path        string                 `json:"path,omitempty"`     // Path for exclusion/unexclusion propagation tasks
+	ID          string               `json:"id"`
+	Type        BackgroundTaskType   `json:"type"`
+	Status      BackgroundTaskStatus `json:"status"`
+	StartedAt   time.Time            `json:"startedAt"`
+	CompletedAt *time.Time           `json:"completedAt,omitempty"`
+	Error       string               `json:"error,omitempty"`
+	Progress    map[string]any       `json:"progress,omitempty"` // Task-specific progress info
+	Path        string               `json:"path,omitempty"`     // Path for exclusion/unexclusion propagation tasks
 }
 
 // BackgroundTaskManager manages background tasks for migrations
@@ -77,7 +78,7 @@ func (m *BackgroundTaskManager) StartTaskWithPath(migrationID string, taskType B
 		Type:      taskType,
 		Status:    BackgroundTaskStatusRunning,
 		StartedAt: time.Now().UTC(),
-		Progress:  make(map[string]interface{}),
+		Progress:  make(map[string]any),
 		Path:      path,
 	}
 
@@ -151,7 +152,7 @@ func (m *BackgroundTaskManager) FailTask(migrationID, taskID string, err error) 
 }
 
 // UpdateTaskProgress updates the progress of a running task
-func (m *BackgroundTaskManager) UpdateTaskProgress(migrationID, taskID string, progress map[string]interface{}) {
+func (m *BackgroundTaskManager) UpdateTaskProgress(migrationID, taskID string, progress map[string]any) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 

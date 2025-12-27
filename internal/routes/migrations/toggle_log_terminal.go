@@ -24,7 +24,7 @@ func (h handler) toggleLogTerminal(ctx *middleware.Context, req toggleLogTermina
 		return
 	}
 
-	ctx.Response(http.StatusOK, map[string]interface{}{
+	ctx.Response(http.StatusOK, map[string]any{
 		"enabled": req.Enable,
 		"message": "log terminal toggled successfully",
 	})

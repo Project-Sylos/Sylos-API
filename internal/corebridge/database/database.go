@@ -497,9 +497,9 @@ func GetQueueMetricsFromDBInstance(ctx context.Context, logger zerolog.Logger, d
 
 // LogEntry represents a single log entry from the database
 type LogEntry struct {
-	ID    string                 `json:"id"`
-	Level string                 `json:"level"`
-	Data  map[string]interface{} `json:"data"`
+	ID    string         `json:"id"`
+	Level string         `json:"level"`
+	Data  map[string]any `json:"data"`
 }
 
 // GetLogsFromDB retrieves logs from a migration database
@@ -548,7 +548,7 @@ func GetLogsFromDB(ctx context.Context, logger zerolog.Logger, dbPath string) (m
 				logID := string(k)
 
 				// Parse the log entry
-				var logData map[string]interface{}
+				var logData map[string]any
 				if err := json.Unmarshal(v, &logData); err != nil {
 					logger.Warn().Err(err).Str("level", level).Str("log_id", logID).Msg("failed to unmarshal log entry")
 					continue
@@ -611,7 +611,7 @@ func GetLogsFromDBInstance(ctx context.Context, logger zerolog.Logger, dbInstanc
 				logID := string(k)
 
 				// Parse the log entry
-				var logData map[string]interface{}
+				var logData map[string]any
 				if err := json.Unmarshal(v, &logData); err != nil {
 					logger.Warn().Err(err).Str("level", level).Str("log_id", logID).Msg("failed to unmarshal log entry")
 					continue

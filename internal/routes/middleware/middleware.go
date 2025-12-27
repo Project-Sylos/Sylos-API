@@ -109,7 +109,7 @@ func (c *Context) Request() *http.Request {
 }
 
 // Response writes a JSON response with the provided status code and payload.
-func (c *Context) Response(status int, payload interface{}) {
+func (c *Context) Response(status int, payload any) {
 	if c.wrote {
 		return
 	}
@@ -177,7 +177,7 @@ func newContext(mw *Middleware, w http.ResponseWriter, r *http.Request) *Context
 	}
 }
 
-func decodeJSON(r *http.Request, dst interface{}) error {
+func decodeJSON(r *http.Request, dst any) error {
 	if r.Body == nil {
 		return errors.New("request body required")
 	}
@@ -201,7 +201,7 @@ func decodeJSON(r *http.Request, dst interface{}) error {
 	return nil
 }
 
-func writeJSON(w http.ResponseWriter, status int, payload interface{}) error {
+func writeJSON(w http.ResponseWriter, status int, payload any) error {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	return json.NewEncoder(w).Encode(payload)

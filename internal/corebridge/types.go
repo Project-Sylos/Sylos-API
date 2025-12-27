@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/Project-Sylos/Migration-Engine/pkg/migration"
+	"github.com/Project-Sylos/Sylos-API/internal/corebridge/database"
 	fstypes "github.com/Project-Sylos/Sylos-FS/pkg/types"
 )
 
@@ -221,9 +222,9 @@ type QueueMetricsResponse struct {
 
 // LogEntry represents a single log entry from the database
 type LogEntry struct {
-	ID    string                 `json:"id"`
-	Level string                 `json:"level"`
-	Data  map[string]interface{} `json:"data"`
+	ID    string         `json:"id"`
+	Level string         `json:"level"`
+	Data  map[string]any `json:"data"`
 }
 
 // GetLogsRequest represents a request to get logs for a migration
@@ -278,10 +279,11 @@ type MigrationMetadata struct {
 // ListChildrenDiffsRequest represents a request to list children diffs from migration database
 type ListChildrenDiffsRequest struct {
 	MigrationID string
-	Path        string // Optional, defaults to "/"
-	Offset      int    // Pagination offset (default: 0)
-	Limit       int    // Pagination limit (default: 100, max: 1000)
-	FoldersOnly bool   // If true, only return folders and apply limit to folders only
+	Path        string      // Optional, defaults to "/"
+	Offset      int         // Pagination offset (default: 0)
+	Limit       int         // Pagination limit (default: 100, max: 1000)
+	FoldersOnly bool        // If true, only return folders and apply limit to folders only
+	Sort        *SortOption `json:"sort,omitempty"` // Sort options (field and direction)
 }
 
 // PathNodeItem represents a single node (from either SRC or DST) with its metadata
@@ -310,12 +312,23 @@ type PathNodes struct {
 type ListChildrenDiffsResponse struct {
 	Items      map[string]PathNodes `json:"items"` // path -> {src?: {...}, dst?: {...}}
 	Pagination PaginationInfo       `json:"pagination"`
+	Stats      *PathReviewStats     `json:"stats,omitempty"` // Statistics for the search results (optional)
+}
+
+// ExclusionRequest represents a request to exclude/unexclude nodes
+type ExclusionRequest struct {
+	NodeIDs []string `json:"nodeIDs,omitempty"` // Array of node IDs to exclude/unexclude
+	All     bool     `json:"all,omitempty"`     // If true, mark all matching items
+	Filter  *struct {
+		Status string `json:"status,omitempty"` // Optional status filter (e.g., "failed")
+	} `json:"filter,omitempty"`
 }
 
 // ExclusionResponse represents the response from exclude/unexclude operations
 type ExclusionResponse struct {
 	Success bool   `json:"success"`
 	Error   string `json:"error,omitempty"`
+	TaskID  string `json:"taskID,omitempty"` // Background task ID for 'all' operations
 }
 
 // SweepConfigRequest represents the configuration for exclusion or retry sweeps
@@ -346,10 +359,40 @@ type PendingWorkResponse struct {
 	PendingRetriesCount    int  `json:"pendingRetriesCount"`    // Number of items marked as "pending" in status-lookup buckets
 }
 
+// MarkRetryRequest represents a request to mark nodes for retry
+type MarkRetryRequest struct {
+	NodeIDs []string `json:"nodeIDs,omitempty"` // Array of node IDs to mark for retry
+	All     bool     `json:"all,omitempty"`     // If true, mark all failed items
+}
+
 // MarkRetryResponse represents the response from marking a node for retry
 type MarkRetryResponse struct {
 	Success bool   `json:"success"`
 	Error   string `json:"error,omitempty"`
+	TaskID  string `json:"taskID,omitempty"` // Background task ID for 'all' operations
+}
+
+// PathReviewStats represents statistics for path review (aliased from database package)
+type PathReviewStats = database.PathReviewStats
+
+// SearchCondition represents a single search condition
+type SearchCondition struct {
+	Field    string `json:"field"`              // Field to search: "name", "path", "type", "depth", "size", "traversalStatus", "copyStatus"
+	Operator string `json:"operator,omitempty"` // Operator: "equals", "contains", "gt", "gte", "lt", "lte" (ignored for "name" and "path" - always uses contains)
+	Value    any    `json:"value"`              // Value to compare against
+}
+
+// SearchRequest represents a request to search path review items
+// If Conditions is empty or nil, lists all items (same as diff endpoint with path="/")
+type SearchRequest struct {
+	Conditions []SearchCondition `json:"conditions,omitempty"` // Search conditions
+	Sort       *SortOption       `json:"sort,omitempty"`       // Sort options (field and direction)
+}
+
+// SortOption represents sorting options for search results
+type SortOption struct {
+	Field     string `json:"field"`               // Field to sort by: "name", "path", "depth", "size", "type", "traversalStatus", etc.
+	Direction string `json:"direction,omitempty"` // Sort direction: "asc" or "desc" (default: "asc")
 }
 
 // ListMigrationsRequest represents a request to list migrations with pagination
@@ -389,12 +432,16 @@ type Bridge interface {
 	GetLogs(ctx context.Context, migrationID string, req GetLogsRequest) (*GetLogsResponse, error)
 	ListChildrenDiffs(ctx context.Context, req ListChildrenDiffsRequest) (ListChildrenDiffsResponse, error)
 	ExcludeNode(ctx context.Context, migrationID string, nodeID string) (*ExclusionResponse, error)
+	ExcludeNodes(ctx context.Context, migrationID string, req ExclusionRequest) (*ExclusionResponse, error)
 	UnexcludeNode(ctx context.Context, migrationID string, nodeID string) (*ExclusionResponse, error)
+	UnexcludeNodes(ctx context.Context, migrationID string, req ExclusionRequest) (*ExclusionResponse, error)
 	CheckPendingWork(ctx context.Context, migrationID string) (PendingWorkResponse, error)
 	ChangePhase(ctx context.Context, migrationID string, phase string, req StartMigrationRequest) (Migration, error)
 	MarkNodeForRetry(ctx context.Context, migrationID string, nodeID string) (*MarkRetryResponse, error)
 	UnmarkNodeForRetry(ctx context.Context, migrationID string, nodeID string) (*MarkRetryResponse, error)
 	GetBackgroundTasks(ctx context.Context, migrationID string) ([]BackgroundTask, error)
+	GetPathReviewStats(ctx context.Context, migrationID string) (*PathReviewStats, error)
+	SearchPathReviewItems(ctx context.Context, migrationID string, req SearchRequest, offset, limit int) (ListChildrenDiffsResponse, error)
 }
 
 const (

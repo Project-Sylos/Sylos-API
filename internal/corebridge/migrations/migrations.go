@@ -928,7 +928,7 @@ func (m *Manager) updateMetadataForMigration(migrationID, name, configPath strin
 
 // createAdapterFactory creates an adapter factory for reconstructing adapters from YAML config
 func (m *Manager) createAdapterFactory(spectraConfigOverridePath string) migration.AdapterFactory {
-	return func(serviceType string, serviceCfg migration.ServiceConfigYAML, serviceConfigs map[string]interface{}) (fstypes.FSAdapter, error) {
+	return func(serviceType string, serviceCfg migration.ServiceConfigYAML, serviceConfigs map[string]any) (fstypes.FSAdapter, error) {
 		switch strings.ToLower(serviceType) {
 		case "spectra":
 			// Use override config if provided, otherwise try to extract from serviceConfigs

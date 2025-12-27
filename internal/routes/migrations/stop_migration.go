@@ -28,7 +28,7 @@ func (h handler) stop(ctx *middleware.Context) {
 	}
 
 	// Return status with a message indicating the migration was suspended
-	response := map[string]interface{}{
+	response := map[string]any{
 		"id":      migrationID,
 		"status":  status.Status,
 		"result":  status.Result,

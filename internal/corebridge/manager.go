@@ -936,6 +936,7 @@ func (m *Manager) ListChildrenDiffs(ctx context.Context, req ListChildrenDiffsRe
 
 	var dbItems map[string]database.PathNodes
 	var dbPagination database.PaginationInfo
+	var dbStats *database.PathReviewStats
 
 	if useDuckDB {
 		// Use DuckDB for path review operations
@@ -954,10 +955,26 @@ func (m *Manager) ListChildrenDiffs(ctx context.Context, req ListChildrenDiffsRe
 			}
 		}
 
-		dbItems, dbPagination, err = database.GetChildrenDiffsFromDuckDB(ctx, m.logger, duckdbConn, req.Path, req.Offset, req.Limit, req.FoldersOnly)
+		// Extract sort parameters
+		sortField := ""
+		sortDir := "asc"
+		if req.Sort != nil {
+			sortField = req.Sort.Field
+			if req.Sort.Direction != "" {
+				sortDir = req.Sort.Direction
+			}
+		}
+
+		dbItems, dbPagination, dbStats, err = database.GetChildrenDiffsFromDuckDB(ctx, m.logger, duckdbConn, req.Path, req.Offset, req.Limit, req.FoldersOnly, sortField, sortDir)
 		if err != nil {
 			return ListChildrenDiffsResponse{}, fmt.Errorf("failed to get children diffs from DuckDB: %w", err)
 		}
+	}
+
+	// Convert database stats to corebridge stats (aliased type, so just assign pointer)
+	var stats *PathReviewStats
+	if dbStats != nil {
+		stats = dbStats
 	}
 
 	// Convert database types to corebridge types
@@ -1012,11 +1029,159 @@ func (m *Manager) ListChildrenDiffs(ctx context.Context, req ListChildrenDiffsRe
 			TotalFiles:   dbPagination.TotalFiles,
 			HasMore:      dbPagination.HasMore,
 		},
+		Stats: stats,
 	}, nil
 }
 
-// ExcludeNode excludes a node and queues its children for exclusion propagation
+// SearchPathReviewItems searches for path review items matching the given conditions
+func (m *Manager) SearchPathReviewItems(ctx context.Context, migrationID string, req SearchRequest, offset, limit int) (ListChildrenDiffsResponse, error) {
+	// Get migration metadata to check status and get paths
+	metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
+	meta, err := metaMgr.GetMigrationMetadata(migrationID)
+	if err != nil {
+		return ListChildrenDiffsResponse{}, ErrMigrationNotFound
+	}
+
+	// Derive database path from config path
+	dbPath := strings.TrimSuffix(meta.ConfigPath, ".yaml") + ".db"
+	if dbPath == ".db" {
+		dbPath, err = database.ResolveDatabasePath(m.cfg.Runtime.DataDir, "", migrationID)
+		if err != nil {
+			return ListChildrenDiffsResponse{}, fmt.Errorf("failed to resolve database path: %w", err)
+		}
+	}
+
+	// Check if DuckDB is available (status is Awaiting-Path-Review)
+	useDuckDB := false
+	if meta.ConfigPath != "" {
+		yamlCfg, err := migration.LoadMigrationConfig(meta.ConfigPath)
+		if err == nil {
+			status := strings.TrimSpace(yamlCfg.State.Status)
+			if status == "Awaiting-Path-Review" {
+				useDuckDB = true
+			}
+		}
+	}
+
+	if !useDuckDB {
+		return ListChildrenDiffsResponse{}, ErrDatabaseNotAvailable
+	}
+
+	// Open DuckDB connection
+	duckdbPath := database.GetDuckDBPath(dbPath)
+	duckdbConn := m.migrationsMgr.GetDuckDB(migrationID)
+	if duckdbConn == nil {
+		duckdbPool := m.migrationsMgr.GetDuckDBPool()
+		if duckdbPool != nil {
+			duckdbConn, err = duckdbPool.OpenDuckDB(migrationID, duckdbPath)
+			if err != nil {
+				return ListChildrenDiffsResponse{}, fmt.Errorf("failed to open DuckDB: %w", err)
+			}
+		} else {
+			return ListChildrenDiffsResponse{}, fmt.Errorf("DuckDB pool not available")
+		}
+	}
+
+	// Convert corebridge.SearchCondition to database.SearchCondition
+	dbConditions := make([]database.SearchCondition, len(req.Conditions))
+	for i, cond := range req.Conditions {
+		dbConditions[i] = database.SearchCondition{
+			Field:    cond.Field,
+			Operator: cond.Operator,
+			Value:    cond.Value,
+		}
+	}
+
+	// Extract sort parameters
+	sortField := ""
+	sortDir := "asc"
+	if req.Sort != nil {
+		sortField = req.Sort.Field
+		if req.Sort.Direction != "" {
+			sortDir = req.Sort.Direction
+		}
+	}
+
+	// Call database search function
+	dbItems, dbPagination, dbStats, err := database.SearchPathReviewItemsDuckDB(ctx, m.logger, duckdbConn, dbConditions, offset, limit, sortField, sortDir)
+	if err != nil {
+		return ListChildrenDiffsResponse{}, fmt.Errorf("failed to search path review items: %w", err)
+	}
+
+	// Convert database stats to corebridge stats (aliased type, so just assign pointer)
+	var stats *PathReviewStats
+	if dbStats != nil {
+		stats = dbStats
+	}
+
+	// Convert database types to corebridge types (same as ListChildrenDiffs)
+	items := make(map[string]PathNodes, len(dbItems))
+	for path, dbPathNodes := range dbItems {
+		pathNodes := PathNodes{}
+
+		if dbPathNodes.Src != nil {
+			pathNodes.Src = &PathNodeItem{
+				Queue:           dbPathNodes.Src.Queue,
+				Id:              dbPathNodes.Src.Id,
+				ParentId:        dbPathNodes.Src.ParentId,
+				ParentPath:      dbPathNodes.Src.ParentPath,
+				Name:            dbPathNodes.Src.Name,
+				LocationPath:    dbPathNodes.Src.LocationPath,
+				LastUpdated:     dbPathNodes.Src.LastUpdated,
+				DepthLevel:      dbPathNodes.Src.DepthLevel,
+				Type:            dbPathNodes.Src.Type,
+				Size:            dbPathNodes.Src.Size,
+				TraversalStatus: dbPathNodes.Src.TraversalStatus,
+				CopyStatus:      dbPathNodes.Src.CopyStatus,
+			}
+		}
+
+		if dbPathNodes.Dst != nil {
+			pathNodes.Dst = &PathNodeItem{
+				Queue:           dbPathNodes.Dst.Queue,
+				Id:              dbPathNodes.Dst.Id,
+				ParentId:        dbPathNodes.Dst.ParentId,
+				ParentPath:      dbPathNodes.Dst.ParentPath,
+				Name:            dbPathNodes.Dst.Name,
+				LocationPath:    dbPathNodes.Dst.LocationPath,
+				LastUpdated:     dbPathNodes.Dst.LastUpdated,
+				DepthLevel:      dbPathNodes.Dst.DepthLevel,
+				Type:            dbPathNodes.Dst.Type,
+				Size:            dbPathNodes.Dst.Size,
+				TraversalStatus: dbPathNodes.Dst.TraversalStatus,
+				CopyStatus:      dbPathNodes.Dst.CopyStatus,
+			}
+		}
+
+		items[path] = pathNodes
+	}
+
+	return ListChildrenDiffsResponse{
+		Items: items,
+		Pagination: PaginationInfo{
+			Offset:       dbPagination.Offset,
+			Limit:        dbPagination.Limit,
+			Total:        dbPagination.Total,
+			TotalFolders: dbPagination.TotalFolders,
+			TotalFiles:   dbPagination.TotalFiles,
+			HasMore:      dbPagination.HasMore,
+		},
+		Stats: stats,
+	}, nil
+}
+
+// ExcludeNode excludes nodes and queues their children for exclusion propagation
+// Accepts either a single nodeID (for backward compatibility) or an ExclusionRequest
 func (m *Manager) ExcludeNode(ctx context.Context, migrationID string, nodeID string) (*ExclusionResponse, error) {
+	// For backward compatibility, treat single nodeID as a request with one node
+	req := ExclusionRequest{
+		NodeIDs: []string{nodeID},
+	}
+	return m.ExcludeNodes(ctx, migrationID, req)
+}
+
+// ExcludeNodes excludes nodes based on ExclusionRequest
+func (m *Manager) ExcludeNodes(ctx context.Context, migrationID string, req ExclusionRequest) (*ExclusionResponse, error) {
 	// Prepare path review context
 	prc, err := m.preparePathReviewContext(ctx, migrationID)
 	if err != nil {
@@ -1032,37 +1197,96 @@ func (m *Manager) ExcludeNode(ctx context.Context, migrationID string, nodeID st
 		}, err
 	}
 
-	// Find node path from ULID
-	nodePath, err := m.findNodePathFromID(ctx, prc, nodeID)
-	if err != nil {
-		return &ExclusionResponse{
-			Success: false,
-			Error:   fmt.Sprintf("node not found: %v", err),
-		}, err
-	}
-
-	// Mark immediate parent as excluded
-	err = database.SetNodeExclusionDuckDB(ctx, m.logger, prc.DuckDBConn, nodePath, true)
-	if err != nil {
-		return &ExclusionResponse{
-			Success: false,
-			Error:   err.Error(),
-		}, err
-	}
-
-	// Trigger background propagation task
-	taskID := m.bgTaskMgr.StartTaskWithPath(prc.MigrationID, BackgroundTaskTypeExclusionPropagate, nodePath)
-	go func() {
-		defer m.bgTaskMgr.CompleteTask(prc.MigrationID, taskID)
-		if err := database.PropagateExclusionDuckDB(context.Background(), m.logger, prc.DuckDBConn, nodePath, true); err != nil {
-			m.logger.Error().
-				Err(err).
-				Str("migration_id", prc.MigrationID).
-				Str("node_path", nodePath).
-				Msg("failed to propagate exclusion")
-			m.bgTaskMgr.FailTask(prc.MigrationID, taskID, err)
+	// Handle 'all' option
+	if req.All {
+		// Check if filter is specified
+		if req.Filter != nil && req.Filter.Status == "failed" {
+			// Mark all failed as excluded
+			taskID := m.bgTaskMgr.StartTask(prc.MigrationID, BackgroundTaskTypeExclusionSweep)
+			go func() {
+				defer m.bgTaskMgr.CompleteTask(prc.MigrationID, taskID)
+				if err := database.MarkAllFailedAsExcludedDuckDB(context.Background(), m.logger, prc.DuckDBConn); err != nil {
+					m.logger.Error().
+						Err(err).
+						Str("migration_id", prc.MigrationID).
+						Msg("failed to mark all failed items as excluded")
+					m.bgTaskMgr.FailTask(prc.MigrationID, taskID, err)
+					return
+				}
+				if err := m.markPathReviewChanges(migrationID, true); err != nil {
+					m.logger.Warn().Err(err).Str("migration_id", migrationID).Msg("failed to mark path review changes")
+				}
+			}()
+			return &ExclusionResponse{
+				Success: true,
+				TaskID:  taskID,
+			}, nil
 		}
-	}()
+		// For 'all' without filter, get all pending and failed items
+		pendingPaths, err := database.GetAllNodesByStatusDuckDB(ctx, m.logger, prc.DuckDBConn, "pending")
+		if err != nil {
+			return &ExclusionResponse{
+				Success: false,
+				Error:   fmt.Sprintf("failed to get pending nodes: %v", err),
+			}, err
+		}
+		failedPaths, err := database.GetAllNodesByStatusDuckDB(ctx, m.logger, prc.DuckDBConn, "failed")
+		if err != nil {
+			return &ExclusionResponse{
+				Success: false,
+				Error:   fmt.Sprintf("failed to get failed nodes: %v", err),
+			}, err
+		}
+		// Combine and deduplicate
+		allPaths := make(map[string]bool)
+		for _, p := range pendingPaths {
+			allPaths[p] = true
+		}
+		for _, p := range failedPaths {
+			allPaths[p] = true
+		}
+		req.NodeIDs = make([]string, 0, len(allPaths))
+		for p := range allPaths {
+			req.NodeIDs = append(req.NodeIDs, p)
+		}
+	}
+
+	// Process each node ID
+	for _, nodeID := range req.NodeIDs {
+		// Find node path from ULID
+		nodePath, err := m.findNodePathFromID(ctx, prc, nodeID)
+		if err != nil {
+			m.logger.Warn().
+				Err(err).
+				Str("node_id", nodeID).
+				Msg("failed to find node path, skipping")
+			continue
+		}
+
+		// Mark immediate parent as excluded
+		err = database.SetNodeExclusionDuckDB(ctx, m.logger, prc.DuckDBConn, nodePath, true)
+		if err != nil {
+			m.logger.Warn().
+				Err(err).
+				Str("node_path", nodePath).
+				Msg("failed to set node exclusion, skipping")
+			continue
+		}
+
+		// Trigger background propagation task
+		taskID := m.bgTaskMgr.StartTaskWithPath(prc.MigrationID, BackgroundTaskTypeExclusionPropagate, nodePath)
+		go func(path string) {
+			defer m.bgTaskMgr.CompleteTask(prc.MigrationID, taskID)
+			if err := database.PropagateExclusionDuckDB(context.Background(), m.logger, prc.DuckDBConn, path, true); err != nil {
+				m.logger.Error().
+					Err(err).
+					Str("migration_id", prc.MigrationID).
+					Str("node_path", path).
+					Msg("failed to propagate exclusion")
+				m.bgTaskMgr.FailTask(prc.MigrationID, taskID, err)
+			}
+		}(nodePath)
+	}
 
 	// Mark that user made changes during path review
 	if err := m.markPathReviewChanges(migrationID, true); err != nil {
@@ -1075,7 +1299,17 @@ func (m *Manager) ExcludeNode(ctx context.Context, migrationID string, nodeID st
 }
 
 // UnexcludeNode unexcludes a node and queues its children for unexclusion propagation
+// Accepts either a single nodeID (for backward compatibility) or an ExclusionRequest
 func (m *Manager) UnexcludeNode(ctx context.Context, migrationID string, nodeID string) (*ExclusionResponse, error) {
+	// For backward compatibility, treat single nodeID as a request with one node
+	req := ExclusionRequest{
+		NodeIDs: []string{nodeID},
+	}
+	return m.UnexcludeNodes(ctx, migrationID, req)
+}
+
+// UnexcludeNodes unexcludes nodes based on ExclusionRequest
+func (m *Manager) UnexcludeNodes(ctx context.Context, migrationID string, req ExclusionRequest) (*ExclusionResponse, error) {
 	// Prepare path review context
 	prc, err := m.preparePathReviewContext(ctx, migrationID)
 	if err != nil {
@@ -1091,41 +1325,77 @@ func (m *Manager) UnexcludeNode(ctx context.Context, migrationID string, nodeID 
 		}, err
 	}
 
-	// Find node path from ULID
-	nodePath, err := m.findNodePathFromID(ctx, prc, nodeID)
-	if err != nil {
-		return &ExclusionResponse{
-			Success: false,
-			Error:   fmt.Sprintf("node not found: %v", err),
-		}, err
-	}
-
-	// Mark immediate parent as unexcluded (set to pending)
-	err = database.SetNodeExclusionDuckDB(ctx, m.logger, prc.DuckDBConn, nodePath, false)
-	if err != nil {
-		return &ExclusionResponse{
-			Success: false,
-			Error:   err.Error(),
-		}, err
-	}
-
-	// Trigger background propagation task
-	taskID := m.bgTaskMgr.StartTaskWithPath(prc.MigrationID, BackgroundTaskTypeUnexclusionPropagate, nodePath)
-	go func() {
-		defer m.bgTaskMgr.CompleteTask(prc.MigrationID, taskID)
-		if err := database.PropagateExclusionDuckDB(context.Background(), m.logger, prc.DuckDBConn, nodePath, false); err != nil {
-			m.logger.Error().
-				Err(err).
-				Str("migration_id", prc.MigrationID).
-				Str("node_path", nodePath).
-				Msg("failed to propagate unexclusion")
-			m.bgTaskMgr.FailTask(prc.MigrationID, taskID, err)
+	// Handle 'all' option
+	if req.All {
+		// Get all excluded items (exclusion_explicit or exclusion_inherited)
+		explicitPaths, err := database.GetAllNodesByStatusDuckDB(ctx, m.logger, prc.DuckDBConn, "exclusion_explicit")
+		if err != nil {
+			return &ExclusionResponse{
+				Success: false,
+				Error:   fmt.Sprintf("failed to get exclusion_explicit nodes: %v", err),
+			}, err
 		}
-	}()
+		inheritedPaths, err := database.GetAllNodesByStatusDuckDB(ctx, m.logger, prc.DuckDBConn, "exclusion_inherited")
+		if err != nil {
+			return &ExclusionResponse{
+				Success: false,
+				Error:   fmt.Sprintf("failed to get exclusion_inherited nodes: %v", err),
+			}, err
+		}
+		// Combine and deduplicate
+		allPaths := make(map[string]bool)
+		for _, p := range explicitPaths {
+			allPaths[p] = true
+		}
+		for _, p := range inheritedPaths {
+			allPaths[p] = true
+		}
+		req.NodeIDs = make([]string, 0, len(allPaths))
+		for p := range allPaths {
+			req.NodeIDs = append(req.NodeIDs, p)
+		}
+	}
+
+	// Process each node ID
+	for _, nodeID := range req.NodeIDs {
+		// Find node path from ULID
+		nodePath, err := m.findNodePathFromID(ctx, prc, nodeID)
+		if err != nil {
+			m.logger.Warn().
+				Err(err).
+				Str("node_id", nodeID).
+				Msg("failed to find node path, skipping")
+			continue
+		}
+
+		// Mark immediate parent as unexcluded (set to pending)
+		err = database.SetNodeExclusionDuckDB(ctx, m.logger, prc.DuckDBConn, nodePath, false)
+		if err != nil {
+			m.logger.Warn().
+				Err(err).
+				Str("node_path", nodePath).
+				Msg("failed to set node unexclusion, skipping")
+			continue
+		}
+
+		// Trigger background propagation task
+		taskID := m.bgTaskMgr.StartTaskWithPath(prc.MigrationID, BackgroundTaskTypeUnexclusionPropagate, nodePath)
+		go func(path string) {
+			defer m.bgTaskMgr.CompleteTask(prc.MigrationID, taskID)
+			if err := database.PropagateExclusionDuckDB(context.Background(), m.logger, prc.DuckDBConn, path, false); err != nil {
+				m.logger.Error().
+					Err(err).
+					Str("migration_id", prc.MigrationID).
+					Str("node_path", path).
+					Msg("failed to propagate unexclusion")
+				m.bgTaskMgr.FailTask(prc.MigrationID, taskID, err)
+			}
+		}(nodePath)
+	}
 
 	// Mark that user made changes during path review
-	if err := m.markPathReviewChanges(prc.MigrationID, true); err != nil {
-		m.logger.Warn().Err(err).Str("migration_id", prc.MigrationID).Msg("failed to mark path review changes")
+	if err := m.markPathReviewChanges(migrationID, true); err != nil {
+		m.logger.Warn().Err(err).Str("migration_id", migrationID).Msg("failed to mark path review changes")
 	}
 
 	return &ExclusionResponse{
@@ -1540,7 +1810,7 @@ func (m *Manager) selectMaxRetriesForSweep(value int) int {
 // createAdapterFactoryForSweep creates an adapter factory for reconstructing adapters from YAML config
 // This mirrors the logic in migrations.Manager.createAdapterFactory
 func (m *Manager) createAdapterFactoryForSweep(spectraConfigOverridePath string) migration.AdapterFactory {
-	return func(serviceType string, serviceCfg migration.ServiceConfigYAML, serviceConfigs map[string]interface{}) (fstypes.FSAdapter, error) {
+	return func(serviceType string, serviceCfg migration.ServiceConfigYAML, serviceConfigs map[string]any) (fstypes.FSAdapter, error) {
 		switch strings.ToLower(serviceType) {
 		case "spectra":
 			// Use override config if provided, otherwise try to extract from serviceConfigs
@@ -1714,7 +1984,17 @@ func (m *Manager) CheckPendingWork(ctx context.Context, migrationID string) (Pen
 }
 
 // MarkNodeForRetry marks a failed node for retry
+// Accepts either a single nodeID (for backward compatibility) or a MarkRetryRequest
 func (m *Manager) MarkNodeForRetry(ctx context.Context, migrationID string, nodeID string) (*MarkRetryResponse, error) {
+	// For backward compatibility, treat single nodeID as a request with one node
+	req := MarkRetryRequest{
+		NodeIDs: []string{nodeID},
+	}
+	return m.MarkNodesForRetry(ctx, migrationID, req)
+}
+
+// MarkNodesForRetry marks nodes for retry based on MarkRetryRequest
+func (m *Manager) MarkNodesForRetry(ctx context.Context, migrationID string, req MarkRetryRequest) (*MarkRetryResponse, error) {
 	// Prepare path review context
 	prc, err := m.preparePathReviewContext(ctx, migrationID)
 	if err != nil {
@@ -1730,22 +2010,51 @@ func (m *Manager) MarkNodeForRetry(ctx context.Context, migrationID string, node
 		}, err
 	}
 
-	// Find node path from ULID
-	nodePath, err := m.findNodePathFromID(ctx, prc, nodeID)
-	if err != nil {
+	// Handle 'all' option
+	if req.All {
+		// Retry all failed items
+		taskID := m.bgTaskMgr.StartTask(prc.MigrationID, BackgroundTaskTypeRetryAll)
+		go func() {
+			defer m.bgTaskMgr.CompleteTask(prc.MigrationID, taskID)
+			if err := database.RetryAllFailedDuckDB(context.Background(), m.logger, prc.DuckDBConn); err != nil {
+				m.logger.Error().
+					Err(err).
+					Str("migration_id", prc.MigrationID).
+					Msg("failed to retry all failed items")
+				m.bgTaskMgr.FailTask(prc.MigrationID, taskID, err)
+				return
+			}
+			if err := m.markPathReviewChanges(migrationID, true); err != nil {
+				m.logger.Warn().Err(err).Str("migration_id", migrationID).Msg("failed to mark path review changes")
+			}
+		}()
 		return &MarkRetryResponse{
-			Success: false,
-			Error:   fmt.Sprintf("node not found: %v", err),
-		}, err
+			Success: true,
+			TaskID:  taskID,
+		}, nil
 	}
 
-	// Mark node for retry in DuckDB
-	err = database.MarkNodeForRetryDuckDB(ctx, m.logger, prc.DuckDBConn, nodePath)
-	if err != nil {
-		return &MarkRetryResponse{
-			Success: false,
-			Error:   err.Error(),
-		}, err
+	// Process each node ID
+	for _, nodeID := range req.NodeIDs {
+		// Find node path from ULID
+		nodePath, err := m.findNodePathFromID(ctx, prc, nodeID)
+		if err != nil {
+			m.logger.Warn().
+				Err(err).
+				Str("node_id", nodeID).
+				Msg("failed to find node path, skipping")
+			continue
+		}
+
+		// Mark node for retry in DuckDB
+		err = database.MarkNodeForRetryDuckDB(ctx, m.logger, prc.DuckDBConn, nodePath)
+		if err != nil {
+			m.logger.Warn().
+				Err(err).
+				Str("node_path", nodePath).
+				Msg("failed to mark node for retry, skipping")
+			continue
+		}
 	}
 
 	// Mark that user made changes during path review
@@ -1754,6 +2063,88 @@ func (m *Manager) MarkNodeForRetry(ctx context.Context, migrationID string, node
 	}
 
 	return &MarkRetryResponse{
+		Success: true,
+	}, nil
+}
+
+// RetryAllFailed marks all failed items for retry in a background task
+func (m *Manager) RetryAllFailed(ctx context.Context, migrationID string) (*MarkRetryResponse, error) {
+	// Prepare path review context
+	prc, err := m.preparePathReviewContext(ctx, migrationID)
+	if err != nil {
+		if err == ErrMigrationNotFound {
+			return &MarkRetryResponse{
+				Success: false,
+				Error:   "migration not found",
+			}, err
+		}
+		return &MarkRetryResponse{
+			Success: false,
+			Error:   err.Error(),
+		}, err
+	}
+
+	// Start background task
+	taskID := m.bgTaskMgr.StartTask(prc.MigrationID, BackgroundTaskTypeRetryAll)
+	go func() {
+		defer m.bgTaskMgr.CompleteTask(prc.MigrationID, taskID)
+		if err := database.RetryAllFailedDuckDB(context.Background(), m.logger, prc.DuckDBConn); err != nil {
+			m.logger.Error().
+				Err(err).
+				Str("migration_id", prc.MigrationID).
+				Msg("failed to retry all failed items")
+			m.bgTaskMgr.FailTask(prc.MigrationID, taskID, err)
+			return
+		}
+
+		// Mark that user made changes during path review
+		if err := m.markPathReviewChanges(migrationID, true); err != nil {
+			m.logger.Warn().Err(err).Str("migration_id", migrationID).Msg("failed to mark path review changes")
+		}
+	}()
+
+	return &MarkRetryResponse{
+		Success: true,
+	}, nil
+}
+
+// MarkAllFailedAsExcluded marks all failed items as excluded in a background task
+func (m *Manager) MarkAllFailedAsExcluded(ctx context.Context, migrationID string) (*ExclusionResponse, error) {
+	// Prepare path review context
+	prc, err := m.preparePathReviewContext(ctx, migrationID)
+	if err != nil {
+		if err == ErrMigrationNotFound {
+			return &ExclusionResponse{
+				Success: false,
+				Error:   "migration not found",
+			}, err
+		}
+		return &ExclusionResponse{
+			Success: false,
+			Error:   err.Error(),
+		}, err
+	}
+
+	// Start background task
+	taskID := m.bgTaskMgr.StartTask(prc.MigrationID, BackgroundTaskTypeExclusionSweep)
+	go func() {
+		defer m.bgTaskMgr.CompleteTask(prc.MigrationID, taskID)
+		if err := database.MarkAllFailedAsExcludedDuckDB(context.Background(), m.logger, prc.DuckDBConn); err != nil {
+			m.logger.Error().
+				Err(err).
+				Str("migration_id", prc.MigrationID).
+				Msg("failed to mark all failed items as excluded")
+			m.bgTaskMgr.FailTask(prc.MigrationID, taskID, err)
+			return
+		}
+
+		// Mark that user made changes during path review
+		if err := m.markPathReviewChanges(migrationID, true); err != nil {
+			m.logger.Warn().Err(err).Str("migration_id", migrationID).Msg("failed to mark path review changes")
+		}
+	}()
+
+	return &ExclusionResponse{
 		Success: true,
 	}, nil
 }
@@ -1801,6 +2192,26 @@ func (m *Manager) UnmarkNodeForRetry(ctx context.Context, migrationID string, no
 	return &MarkRetryResponse{
 		Success: true,
 	}, nil
+}
+
+// GetPathReviewStats returns statistics for path review
+func (m *Manager) GetPathReviewStats(ctx context.Context, migrationID string) (*database.PathReviewStats, error) {
+	// Prepare path review context
+	prc, err := m.preparePathReviewContext(ctx, migrationID)
+	if err != nil {
+		if err == ErrMigrationNotFound {
+			return nil, err
+		}
+		return nil, err
+	}
+
+	// Get stats from DuckDB
+	stats, err := database.GetPathReviewStatsDuckDB(ctx, m.logger, prc.DuckDBConn)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get path review stats: %w", err)
+	}
+
+	return stats, nil
 }
 
 // GetBackgroundTasks returns all background tasks for a migration
