@@ -134,11 +134,46 @@ func (m *Manager) RunMigration(record *MigrationRecord, srcDef, dstDef services.
 		return
 	}
 
+	// Get adapters from RootPlan (acquired during root selection)
+	// Re-fetch plan to ensure we have the latest state including adapters
+	plan = m.rootsMgr.GetPlan(record.ID)
+	if plan == nil {
+		m.mu.Lock()
+		record.Status = MigrationStatusFailed
+		record.Error = "root plan not found"
+		finished := time.Now().UTC()
+		record.CompletedAt = &finished
+		m.mu.Unlock()
+
+		m.logger.Error().
+			Str("migration_id", record.ID).
+			Msg("root plan not found")
+
+		m.publishProgress(record.ID, "failed", nil, nil)
+		m.closeSubscribers(record.ID)
+		return
+	}
+
+	if plan.SourceAdapter == nil || plan.DestinationAdapter == nil {
+		m.mu.Lock()
+		record.Status = MigrationStatusFailed
+		record.Error = "adapters not available in root plan"
+		finished := time.Now().UTC()
+		record.CompletedAt = &finished
+		m.mu.Unlock()
+
+		m.logger.Error().
+			Str("migration_id", record.ID).
+			Msg("adapters not available in root plan")
+
+		m.publishProgress(record.ID, "failed", nil, nil)
+		m.closeSubscribers(record.ID)
+		return
+	}
+
 	// Start migration with controller for programmatic shutdown
-	// Pass the pre-opened DB instance (API owns lifecycle)
-	controller, err := m.ExecuteMigrationWithController(record.ID, srcDef, dstDef, srcFolder, dstFolder, opts, dbInstance, m.resolveDBPath, func(def services.ServiceDefinition, rootID, connID string) (fstypes.FSAdapter, func(), error) {
-		return m.serviceMgr.AcquireAdapterWithOverride(def, rootID, connID, spectraConfigOverridePath)
-	})
+	// Pass the pre-opened DB instance and pre-acquired adapters (API owns lifecycle)
+	controller, err := m.ExecuteMigrationWithController(record.ID, srcDef, dstDef, srcFolder, dstFolder, opts, dbInstance, m.resolveDBPath, plan.SourceAdapter, plan.DestinationAdapter)
 	if err != nil {
 		m.mu.Lock()
 		record.Status = MigrationStatusFailed
@@ -189,6 +224,14 @@ func (m *Manager) RunMigration(record *MigrationRecord, srcDef, dstDef services.
 	result, err := controller.Wait()
 	close(done)
 
+	// Extract adapters from plan for cleanup
+	plan = m.rootsMgr.GetPlan(record.ID)
+	var srcAdapter, dstAdapter fstypes.FSAdapter
+	if plan != nil {
+		srcAdapter = plan.SourceAdapter
+		dstAdapter = plan.DestinationAdapter
+	}
+
 	// Check if migration was suspended (clean shutdown via killswitch)
 	if err != nil && err.Error() == "migration suspended by force shutdown" {
 		// Migration was cleanly suspended - result contains stats up to shutdown point
@@ -200,6 +243,9 @@ func (m *Manager) RunMigration(record *MigrationRecord, srcDef, dstDef services.
 		record.Result = &result
 		record.Controller = nil // Clear controller reference
 		m.mu.Unlock()
+
+		// Clear adapter references from RootPlan (calls release functions)
+		m.rootsMgr.ClearAdapters(record.ID)
 
 		m.logger.Info().
 			Str("migration_id", record.ID).
@@ -221,6 +267,9 @@ func (m *Manager) RunMigration(record *MigrationRecord, srcDef, dstDef services.
 		record.Controller = nil // Clear controller reference
 		m.mu.Unlock()
 
+		// Clear adapter references from RootPlan (calls release functions)
+		m.rootsMgr.ClearAdapters(record.ID)
+
 		m.logger.Error().
 			Err(err).
 			Str("migration_id", record.ID).
@@ -239,6 +288,12 @@ func (m *Manager) RunMigration(record *MigrationRecord, srcDef, dstDef services.
 	record.Result = &result
 	record.Controller = nil // Clear controller reference
 	m.mu.Unlock()
+
+	// Close adapters (API owns lifecycle)
+	m.closeAdapters(srcAdapter, dstAdapter, record.ID)
+
+	// Clear adapter references from RootPlan
+	m.rootsMgr.ClearAdapters(record.ID)
 
 	// Migration Engine will update its YAML config with completion status and rounds
 	// No need to update our minimal metadata here

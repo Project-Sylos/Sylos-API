@@ -161,9 +161,24 @@ type MigrationRecord struct {
 	Error         string
 	Controller    *migration.MigrationController // Controller for programmatic shutdown
 	DB            *db.DB                         // DB instance for querying logs/metrics (shared with migration engine)
-	ETLRunning    bool                           // Track if ETL goroutine is running
+	etlRunning    bool                           // Track if ETL goroutine is running (use getter/setter)
 	ETLMutex      sync.Mutex                     // Mutex to protect ETL state
 	DuckDBPath    string                         // Path to DuckDB file (if ETL completed)
+}
+
+// GetETLRunning returns the current ETL running state (thread-safe)
+func (r *MigrationRecord) GetETLRunning() bool {
+	r.ETLMutex.Lock()
+	defer r.ETLMutex.Unlock()
+	return r.etlRunning
+}
+
+// SetETLRunning sets the ETL running state (thread-safe)
+func (r *MigrationRecord) SetETLRunning(value bool) bool {
+	r.ETLMutex.Lock()
+	defer r.ETLMutex.Unlock()
+	r.etlRunning = value
+	return r.etlRunning
 }
 
 const (
@@ -265,9 +280,25 @@ func (m *Manager) LoadMigrationFromConfigPath(ctx context.Context, migrationID, 
 		spectraConfigPath = overridePath
 	}
 
-	// Load YAML config and reconstruct migration config
-	adapterFactory := m.createAdapterFactory(spectraConfigPath)
-	cfg, err := migration.LoadMigrationConfigFromYAML(configPath, adapterFactory)
+	// Load YAML config first to get service configuration
+	yamlCfg, err := migration.LoadMigrationConfig(configPath)
+	if err != nil {
+		return Migration{}, fmt.Errorf("failed to load YAML config: %w", err)
+	}
+
+	// Acquire adapters based on YAML service configuration
+	srcAdapter, err := m.acquireAdapterFromYAMLConfig(yamlCfg.Services.Source, spectraConfigPath)
+	if err != nil {
+		return Migration{}, fmt.Errorf("failed to acquire source adapter: %w", err)
+	}
+
+	dstAdapter, err := m.acquireAdapterFromYAMLConfig(yamlCfg.Services.Destination, spectraConfigPath)
+	if err != nil {
+		return Migration{}, fmt.Errorf("failed to acquire destination adapter: %w", err)
+	}
+
+	// Load migration config with provided adapters
+	cfg, err := migration.LoadMigrationConfigFromYAML(configPath, srcAdapter, dstAdapter)
 	if err != nil {
 		return Migration{}, fmt.Errorf("failed to load migration config: %w", err)
 	}
@@ -439,10 +470,26 @@ func (m *Manager) startMigrationFromUploadedDB(ctx context.Context, migrationID 
 	}
 
 	// Try loading YAML config to reconstruct migration config
-	adapterFactory := m.createAdapterFactory(spectraConfigPath)
-	cfg, err := migration.LoadMigrationConfigFromYAML(configPath, adapterFactory)
+	yamlCfg, err := migration.LoadMigrationConfig(configPath)
 	if err == nil {
-		// Successfully reconstructed config - use it to resume migration
+		// Successfully loaded YAML - acquire adapters and reconstruct config
+
+		// Acquire adapters based on YAML service configuration
+		srcAdapter, err := m.acquireAdapterFromYAMLConfig(yamlCfg.Services.Source, spectraConfigPath)
+		if err != nil {
+			return Migration{}, fmt.Errorf("failed to acquire source adapter: %w", err)
+		}
+
+		dstAdapter, err := m.acquireAdapterFromYAMLConfig(yamlCfg.Services.Destination, spectraConfigPath)
+		if err != nil {
+			return Migration{}, fmt.Errorf("failed to acquire destination adapter: %w", err)
+		}
+
+		// Load migration config with provided adapters
+		cfg, err := migration.LoadMigrationConfigFromYAML(configPath, srcAdapter, dstAdapter)
+		if err != nil {
+			return Migration{}, fmt.Errorf("failed to load migration config: %w", err)
+		}
 
 		// CRITICAL: Force RemoveExisting to false for resumption (same as test logic)
 		cfg.Database.RemoveExisting = false
@@ -468,6 +515,7 @@ func (m *Manager) startMigrationFromUploadedDB(ctx context.Context, migrationID 
 		m.publishProgress(record.ID, "started", nil, nil)
 
 		// Resume migration using reconstructed config
+		// Note: Adapters are in cfg and will be cleaned up after migration completes
 		go m.RunMigrationFromConfig(record, cfg, opts, spectraConfigPath)
 
 		return Migration{
@@ -775,52 +823,57 @@ func (m *Manager) GetMigrationStatus(ctx context.Context, id string) (Status, er
 		return m.recordToStatus(record), nil
 	}
 
-	// In-memory record not found - try to query database directly
-	// This allows checking status of migrations that were started before server restart
-	dbPath, err := m.resolveDBPath("", id)
+	// In-memory record not found - use YAML config file as source of truth
+	// Check metadata first to get config path
+	meta, err := m.metadataMgr.GetMigrationMetadata(id)
 	if err != nil {
+		m.logger.Debug().
+			Err(err).
+			Str("migration_id", id).
+			Msg("failed to get migration metadata")
 		return Status{}, ErrMigrationNotFound
 	}
 
-	// Check if database file exists
-	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+	if meta.ConfigPath == "" {
+		m.logger.Debug().
+			Str("migration_id", id).
+			Msg("migration metadata has no config path")
 		return Status{}, ErrMigrationNotFound
 	}
 
-	// Open and inspect database
-	dbStatus, err := corebridgeDB.InspectMigrationStatusFromDB(ctx, m.logger, dbPath)
+	// Check if YAML config file exists
+	if _, err := os.Stat(meta.ConfigPath); os.IsNotExist(err) {
+		m.logger.Debug().
+			Str("migration_id", id).
+			Str("config_path", meta.ConfigPath).
+			Msg("YAML config file does not exist")
+		return Status{}, ErrMigrationNotFound
+	}
+
+	// Load YAML config file - this is the source of truth for status
+	yamlCfg, err := migration.LoadMigrationConfig(meta.ConfigPath)
 	if err != nil {
+		m.logger.Debug().
+			Err(err).
+			Str("migration_id", id).
+			Str("config_path", meta.ConfigPath).
+			Msg("failed to load YAML config file")
 		return Status{}, ErrMigrationNotFound
 	}
 
-	// Convert migration.MigrationStatus to API Status format
-	// We need to infer some fields that aren't in MigrationStatus
+	// Build status from YAML config
+	statusStr := strings.TrimSpace(yamlCfg.State.Status)
+	if statusStr == "" {
+		// No status in YAML - treat as unknown/completed
+		statusStr = MigrationStatusCompleted
+	}
+
 	status := Status{
 		Migration: Migration{
 			ID:        id,
-			StartedAt: time.Now().UTC(), // We don't have this in DB, use current time as fallback
-			Status:    MigrationStatusCompleted,
+			StartedAt: meta.CreatedAt,
+			Status:    statusStr,
 		},
-	}
-
-	if dbStatus.HasPending() {
-		status.Status = MigrationStatusRunning
-	} else if dbStatus.HasFailures() {
-		status.Status = MigrationStatusFailed
-	}
-
-	// Create result view from migration status
-	if !dbStatus.IsEmpty() {
-		status.Result = &ResultView{
-			Verification: VerificationView{
-				SrcTotal:   dbStatus.SrcTotal,
-				DstTotal:   dbStatus.DstTotal,
-				SrcPending: dbStatus.SrcPending,
-				DstPending: dbStatus.DstPending,
-				SrcFailed:  dbStatus.SrcFailed,
-				DstFailed:  dbStatus.DstFailed,
-			},
-		}
 	}
 
 	return status, nil
@@ -863,6 +916,55 @@ func (m *Manager) GetDB(migrationID string) *db.DB {
 	return m.dbPool.Get(migrationID)
 }
 
+// EnsureDB ensures a database connection is open for the given migration ID
+// If the DB is already open (in record or pool), returns it
+// If the DB was killed, reopens it using the stored path
+// If no path is stored, resolves the path and opens a new connection
+// This is the recommended way to get a DB connection when you're not sure if it's open
+func (m *Manager) EnsureDB(migrationID string) (*db.DB, error) {
+	// First check if we already have an open DB
+	dbInstance := m.GetDB(migrationID)
+	if dbInstance != nil {
+		return dbInstance, nil
+	}
+
+	// Resolve database path
+	dbPath, err := m.resolveDBPath("", migrationID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve database path for migration %s: %w", migrationID, err)
+	}
+
+	// Use EnsureOpen to open or reopen the connection
+	dbInstance, err = m.dbPool.EnsureOpen(migrationID, dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to ensure database is open for migration %s: %w", migrationID, err)
+	}
+
+	// Update record.DB if record exists
+	m.mu.Lock()
+	if record := m.migrations[migrationID]; record != nil {
+		record.DB = dbInstance
+	}
+	m.mu.Unlock()
+
+	return dbInstance, nil
+}
+
+// KillDBConnection kills the database connection for a migration but keeps the path
+// This allows the connection to be reopened later using EnsureDB
+// Use this when you need to temporarily close a connection (e.g., during ETL, phase transitions)
+func (m *Manager) KillDBConnection(migrationID string) error {
+	// Clear DB from record (if exists)
+	m.mu.Lock()
+	if record := m.migrations[migrationID]; record != nil {
+		record.DB = nil
+	}
+	m.mu.Unlock()
+
+	// Kill connection in pool (keeps path)
+	return m.dbPool.KillConnection(migrationID)
+}
+
 // GetDuckDBPool returns the DuckDB connection pool
 func (m *Manager) GetDuckDBPool() *corebridgeDB.DuckDBPool {
 	return m.duckdbPool
@@ -871,6 +973,28 @@ func (m *Manager) GetDuckDBPool() *corebridgeDB.DuckDBPool {
 // GetDuckDB retrieves a DuckDB connection for a migration
 func (m *Manager) GetDuckDB(migrationID string) *sql.DB {
 	return m.duckdbPool.Get(migrationID)
+}
+
+// EnsureDuckDB ensures a DuckDB connection is open for the given migration ID
+// If the connection is already open, returns it
+// If the connection was killed, reopens it using the stored path
+// If no path is stored, uses the provided duckdbPath to open a new connection
+// This is the recommended way to get a DuckDB connection when you're not sure if it's open
+func (m *Manager) EnsureDuckDB(migrationID, duckdbPath string) (*sql.DB, error) {
+	// Check if already open
+	if existing := m.duckdbPool.Get(migrationID); existing != nil {
+		return existing, nil
+	}
+
+	// Use EnsureOpen to open or reopen the connection
+	return m.duckdbPool.EnsureOpen(migrationID, duckdbPath)
+}
+
+// KillDuckDBConnection kills the DuckDB connection for a migration but keeps the path
+// This allows the connection to be reopened later using EnsureDuckDB
+// Use this when you need to temporarily close a connection (e.g., during ETL, phase transitions)
+func (m *Manager) KillDuckDBConnection(migrationID string) error {
+	return m.duckdbPool.KillConnection(migrationID)
 }
 
 // EnsureETLCompleted ensures ETL has completed for a migration
@@ -926,88 +1050,85 @@ func (m *Manager) updateMetadataForMigration(migrationID, name, configPath strin
 	return m.metadataMgr.UpdateMigrationMetadata(meta)
 }
 
-// createAdapterFactory creates an adapter factory for reconstructing adapters from YAML config
-func (m *Manager) createAdapterFactory(spectraConfigOverridePath string) migration.AdapterFactory {
-	return func(serviceType string, serviceCfg migration.ServiceConfigYAML, serviceConfigs map[string]any) (fstypes.FSAdapter, error) {
-		switch strings.ToLower(serviceType) {
-		case "spectra":
-			// Use override config if provided, otherwise try to extract from serviceConfigs
-			configPath := spectraConfigOverridePath
-			if configPath == "" {
-				// Try to get original config path from service name
-				// Look up the service definition to get the original config path
-				def, err := m.serviceMgr.GetServiceDefinition(serviceCfg.Name)
+// acquireAdapterFromYAMLConfig acquires an adapter based on YAML service configuration
+func (m *Manager) acquireAdapterFromYAMLConfig(serviceCfg migration.ServiceConfigYAML, spectraConfigOverridePath string) (fstypes.FSAdapter, error) {
+	serviceType := strings.ToLower(serviceCfg.Type)
+	switch serviceType {
+	case "spectra":
+		// Use override config if provided, otherwise try to extract from service name
+		configPath := spectraConfigOverridePath
+		if configPath == "" {
+			// Try to get original config path from service name
+			def, err := m.serviceMgr.GetServiceDefinition(serviceCfg.Name)
+			if err == nil && def.Spectra != nil {
+				configPath = def.Spectra.ConfigPath
+			} else {
+				// Try to find by world if name lookup fails
+				world := "primary"
+				if strings.Contains(strings.ToLower(serviceCfg.Name), "s1") {
+					world = "s1"
+				}
+				def, err := m.serviceMgr.GetServiceDefinitionByWorld(world)
 				if err == nil && def.Spectra != nil {
 					configPath = def.Spectra.ConfigPath
 				} else {
-					// Try to find by world if name lookup fails
-					// Extract world from service name
-					world := "primary"
-					if strings.Contains(strings.ToLower(serviceCfg.Name), "s1") {
-						world = "s1"
-					}
-					def, err := m.serviceMgr.GetServiceDefinitionByWorld(world)
-					if err == nil && def.Spectra != nil {
-						configPath = def.Spectra.ConfigPath
-					} else {
-						return nil, fmt.Errorf("spectra config path not found for service %s", serviceCfg.Name)
-					}
+					return nil, fmt.Errorf("spectra config path not found for service %s", serviceCfg.Name)
 				}
 			}
+		}
 
-			spectraFS, err := sdk.New(configPath)
-			if err != nil {
-				return nil, fmt.Errorf("failed to create SpectraFS: %w", err)
-			}
+		spectraFS, err := sdk.New(configPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create SpectraFS: %w", err)
+		}
 
-			rootID := serviceCfg.RootID
-			if rootID == "" {
-				rootID = "root"
-			}
+		rootID := serviceCfg.RootID
+		if rootID == "" {
+			rootID = "root"
+		}
 
-			// Extract world from service name or use default
-			world := "primary"
-			if strings.Contains(strings.ToLower(serviceCfg.Name), "s1") {
-				world = "s1"
+		// Extract world from service name or use default
+		world := "primary"
+		if strings.Contains(strings.ToLower(serviceCfg.Name), "s1") {
+			world = "s1"
+		} else {
+			// Try to get world from service definition
+			def, err := m.serviceMgr.GetServiceDefinition(serviceCfg.Name)
+			if err == nil && def.Spectra != nil {
+				world = def.Spectra.World
 			} else {
-				// Try to get world from service definition
-				def, err := m.serviceMgr.GetServiceDefinition(serviceCfg.Name)
+				// Try to find by world
+				def, err := m.serviceMgr.GetServiceDefinitionByWorld(world)
 				if err == nil && def.Spectra != nil {
 					world = def.Spectra.World
-				} else {
-					// Try to find by world
-					def, err := m.serviceMgr.GetServiceDefinitionByWorld(world)
-					if err == nil && def.Spectra != nil {
-						world = def.Spectra.World
-					}
 				}
 			}
-
-			adapter, err := fslib.NewSpectraFS(spectraFS, rootID, world)
-			if err != nil {
-				_ = spectraFS.Close()
-				return nil, fmt.Errorf("failed to create SpectraFS adapter: %w", err)
-			}
-
-			return adapter, nil
-
-		case "local":
-			// For local services, use RootPath
-			rootPath := serviceCfg.RootPath
-			if rootPath == "" {
-				return nil, fmt.Errorf("local service %s missing root path", serviceCfg.Name)
-			}
-
-			adapter, err := fslib.NewLocalFS(rootPath)
-			if err != nil {
-				return nil, fmt.Errorf("failed to create LocalFS adapter: %w", err)
-			}
-
-			return adapter, nil
-
-		default:
-			return nil, fmt.Errorf("unsupported service type: %s", serviceType)
 		}
+
+		adapter, err := fslib.NewSpectraFS(spectraFS, rootID, world)
+		if err != nil {
+			_ = spectraFS.Close()
+			return nil, fmt.Errorf("failed to create SpectraFS adapter: %w", err)
+		}
+
+		return adapter, nil
+
+	case "local":
+		// For local services, use RootPath
+		rootPath := serviceCfg.RootPath
+		if rootPath == "" {
+			return nil, fmt.Errorf("local service %s missing root path", serviceCfg.Name)
+		}
+
+		adapter, err := fslib.NewLocalFS(rootPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create LocalFS adapter: %w", err)
+		}
+
+		return adapter, nil
+
+	default:
+		return nil, fmt.Errorf("unsupported service type: %s", serviceType)
 	}
 }
 
@@ -1072,6 +1193,7 @@ func (m *Manager) ExecuteMigrationFromConfigWithController(cfg migration.Config,
 	}
 
 	// CRITICAL: Always force RemoveExisting to false (anti-pattern to remove existing DB)
+	// TODO: This is a really stupid bandaid fix and we should update this nonsense at some point soon.
 	cfg.Database.RemoveExisting = false
 
 	// REQUIRED: Pass the pre-opened DB instance (API owns lifecycle)
@@ -1113,6 +1235,11 @@ func (m *Manager) RunMigrationFromConfig(record *MigrationRecord, cfg migration.
 		Str("source", cfg.Source.Name).
 		Str("destination", cfg.Destination.Name).
 		Msg("resuming migration from config")
+
+	// Extract adapters from config for cleanup after migration completes
+	// For resume scenarios, adapters are created fresh and need to be closed
+	srcAdapter := cfg.Source.Adapter
+	dstAdapter := cfg.Destination.Adapter
 
 	// Extract database path from config
 	dbPath := cfg.Database.Path
@@ -1214,6 +1341,14 @@ func (m *Manager) RunMigrationFromConfig(record *MigrationRecord, cfg migration.
 		record.Controller = nil // Clear controller reference
 		m.mu.Unlock()
 
+		// Close adapters (for resume scenarios, adapters are created fresh and need direct close)
+		// For normal migrations, ClearAdapters will handle cleanup via release functions
+		m.closeAdapters(srcAdapter, dstAdapter, record.ID)
+
+		// Clear adapter references from RootPlan if they exist (for normal migrations)
+		// Safe to call even if no adapters in plan (resume scenarios)
+		m.rootsMgr.ClearAdapters(record.ID)
+
 		m.logger.Info().
 			Str("migration_id", record.ID).
 			Msg("migration suspended (killswitch activated)")
@@ -1234,6 +1369,14 @@ func (m *Manager) RunMigrationFromConfig(record *MigrationRecord, cfg migration.
 		record.Controller = nil // Clear controller reference
 		m.mu.Unlock()
 
+		// Close adapters (for resume scenarios, adapters are created fresh and need direct close)
+		// For normal migrations, ClearAdapters will handle cleanup via release functions
+		m.closeAdapters(srcAdapter, dstAdapter, record.ID)
+
+		// Clear adapter references from RootPlan if they exist (for normal migrations)
+		// Safe to call even if no adapters in plan (resume scenarios)
+		m.rootsMgr.ClearAdapters(record.ID)
+
 		m.logger.Error().
 			Err(err).
 			Str("migration_id", record.ID).
@@ -1252,6 +1395,12 @@ func (m *Manager) RunMigrationFromConfig(record *MigrationRecord, cfg migration.
 	record.Result = &result
 	record.Controller = nil // Clear controller reference
 	m.mu.Unlock()
+
+	// Close adapters (API owns lifecycle for resume scenarios)
+	m.closeAdapters(srcAdapter, dstAdapter, record.ID)
+
+	// Clear adapter references from RootPlan if they exist (for normal migrations)
+	m.rootsMgr.ClearAdapters(record.ID)
 
 	m.logger.Info().
 		Str("migration_id", record.ID).
@@ -1298,6 +1447,39 @@ func (m *Manager) RunMigrationFromConfig(record *MigrationRecord, cfg migration.
 	dstStats := result.Runtime.Dst
 	m.publishProgress(record.ID, "completed", &srcStats, &dstStats)
 	m.closeSubscribers(record.ID)
+}
+
+// closeAdapters closes adapters if they implement the Closer interface
+// This is used for resume scenarios where adapters are created fresh
+func (m *Manager) closeAdapters(srcAdapter, dstAdapter fstypes.FSAdapter, migrationID string) {
+	if srcAdapter != nil {
+		if closer, ok := srcAdapter.(interface{ Close() error }); ok {
+			if err := closer.Close(); err != nil {
+				m.logger.Warn().
+					Err(err).
+					Str("migration_id", migrationID).
+					Msg("failed to close source adapter")
+			} else {
+				m.logger.Debug().
+					Str("migration_id", migrationID).
+					Msg("closed source adapter")
+			}
+		}
+	}
+	if dstAdapter != nil {
+		if closer, ok := dstAdapter.(interface{ Close() error }); ok {
+			if err := closer.Close(); err != nil {
+				m.logger.Warn().
+					Err(err).
+					Str("migration_id", migrationID).
+					Msg("failed to close destination adapter")
+			} else {
+				m.logger.Debug().
+					Str("migration_id", migrationID).
+					Msg("closed destination adapter")
+			}
+		}
+	}
 }
 
 func (m *Manager) recordToStatus(r *MigrationRecord) Status {

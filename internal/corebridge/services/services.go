@@ -237,12 +237,18 @@ func (m *ServiceManager) GetServiceDefinitionByWorld(world string) (ServiceDefin
 	return ServiceDefinition{}, ErrServiceNotFound
 }
 
-func (m *ServiceManager) AcquireAdapter(def ServiceDefinition, rootID, connectionID string, ) (fstypes.FSAdapter, func(), error) {
-	return m.AcquireAdapterWithOverride(def, rootID, connectionID, "")
+// RegisterSpectraSession registers a Spectra session with the ServiceManager
+// ServiceManager creates the session internally and owns it
+// Returns the sessionID that should be used when acquiring adapters
+// If connectionID is empty, ServiceManager generates a unique ID
+func (m *ServiceManager) RegisterSpectraSession(configPath, connectionID string) (string, error) {
+	return m.fsManager.RegisterSpectraSession(configPath, connectionID)
 }
 
-// AcquireAdapterWithOverride acquires an adapter, with optional Spectra config override path
-func (m *ServiceManager) AcquireAdapterWithOverride(def ServiceDefinition, rootID, connectionID, spectraConfigOverridePath string) (fstypes.FSAdapter, func(), error) {
+// AcquireAdapter acquires an adapter from a registered session
+// For Spectra: the session must be registered first using RegisterSpectraSession
+// The sessionID parameter should be the connectionID used when registering the session
+func (m *ServiceManager) AcquireAdapter(def ServiceDefinition, rootID, sessionID string) (fstypes.FSAdapter, func(), error) {
 	// Convert ServiceDefinition to Sylos-FS types
 	var fsDef fstypes.ServiceDefinition
 	switch def.Type {
@@ -264,10 +270,6 @@ func (m *ServiceManager) AcquireAdapterWithOverride(def ServiceDefinition, rootI
 		if def.Spectra == nil {
 			return nil, nil, fmt.Errorf("spectra service configuration missing")
 		}
-		configPath := def.Spectra.ConfigPath
-		if spectraConfigOverridePath != "" {
-			configPath = spectraConfigOverridePath
-		}
 		fsDef = fstypes.ServiceDefinition{
 			ID:   def.ID,
 			Name: def.Name,
@@ -277,22 +279,21 @@ func (m *ServiceManager) AcquireAdapterWithOverride(def ServiceDefinition, rootI
 				Name:       def.Spectra.Name,
 				World:      def.Spectra.World,
 				RootID:     def.Spectra.RootID,
-				ConfigPath: configPath,
+				ConfigPath: def.Spectra.ConfigPath, // Not used when session is registered
 			},
 		}
 	default:
 		return nil, nil, fmt.Errorf("unsupported service type: %s", def.Type)
 	}
 
+
 	// Acquire adapter from Sylos-FS
-	adapter, release, err := m.fsManager.AcquireAdapter(fsDef, rootID, connectionID)
+	// For Spectra: sessionID must match a registered session
+	adapter, release, err := m.fsManager.AcquireAdapter(fsDef, rootID, sessionID)
 	if err != nil {
+		fmt.Printf("ERROR acquiring adapter - rootID: %s, sessionID: %s, error: %v\n", rootID, sessionID, err)
 		return nil, nil, err
 	}
 
-	// Convert Sylos-FS adapter to Migration-Engine adapter
-	// Note: This assumes the adapters implement the same interface
-	// If they don't, we'll need to create a wrapper adapter
-	// For now, we assume compatibility and return the adapter directly
 	return adapter, release, nil
 }

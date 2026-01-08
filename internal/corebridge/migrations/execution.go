@@ -141,7 +141,8 @@ func (m *Manager) ExecuteMigration(migrationID string, srcDef, dstDef services.S
 // This allows the caller to control when to shutdown the migration
 // The migration engine takes ownership of the adapters and handles cleanup
 // dbInstance must be pre-opened by the API - the migration engine does not open databases
-func (m *Manager) ExecuteMigrationWithController(migrationID string, srcDef, dstDef services.ServiceDefinition, srcFolder, dstFolder fstypes.Folder, opts MigrationOptions, dbInstance *db.DB, resolveDBPath func(path, migrationID string) (string, error), acquireAdapter func(services.ServiceDefinition, string, string) (fstypes.FSAdapter, func(), error)) (*migration.MigrationController, error) {
+// srcAdapter and dstAdapter must be pre-acquired adapter instances
+func (m *Manager) ExecuteMigrationWithController(migrationID string, srcDef, dstDef services.ServiceDefinition, srcFolder, dstFolder fstypes.Folder, opts MigrationOptions, dbInstance *db.DB, resolveDBPath func(path, migrationID string) (string, error), srcAdapter, dstAdapter fstypes.FSAdapter) (*migration.MigrationController, error) {
 
 	dbPath, err := resolveDBPath(opts.DatabasePath, migrationID)
 	if err != nil {
@@ -153,25 +154,15 @@ func (m *Manager) ExecuteMigrationWithController(migrationID string, srcDef, dst
 		return nil, fmt.Errorf("database instance is required - migration engine does not open databases")
 	}
 
-	m.logger.Info().Str("migration_id", migrationID).Str("source", srcDef.ID).Str("root_id", srcFolder.ID()).Msg("acquiring source adapter")
-	// log the input args to this function call just below this for debugging
-	m.logger.Info().Str("migration_id", migrationID).Str("source_def", fmt.Sprintf("%+v", srcDef)).Str("src_folder", fmt.Sprintf("%+v", srcFolder)).Str("opts", fmt.Sprintf("%+v", opts)).Msg("input args to acquireAdapter")
-	srcAdapter, _, err := acquireAdapter(srcDef, srcFolder.ID(), opts.SourceConnectionID)
-	if err != nil {
-		m.logger.Error().Err(err).Str("migration_id", migrationID).Str("source", srcDef.ID).Msg("failed to acquire source adapter")
-		return nil, fmt.Errorf("source adapter: %w", err)
+	if srcAdapter == nil {
+		return nil, fmt.Errorf("source adapter is required")
 	}
-	m.logger.Info().Str("migration_id", migrationID).Msg("source adapter acquired")
-	// Note: Cleanup functions are not used. Once migration.StartMigration() is called,
-	// the migration engine takes ownership of the adapters and handles cleanup itself.
 
-	m.logger.Info().Str("migration_id", migrationID).Str("destination", dstDef.ID).Str("root_id", dstFolder.ID()).Msg("acquiring destination adapter")
-	dstAdapter, _, err := acquireAdapter(dstDef, dstFolder.ID(), opts.DestinationConnectionID)
-	if err != nil {
-		m.logger.Error().Err(err).Str("migration_id", migrationID).Str("destination", dstDef.ID).Msg("failed to acquire destination adapter")
-		return nil, fmt.Errorf("destination adapter: %w", err)
+	if dstAdapter == nil {
+		return nil, fmt.Errorf("destination adapter is required")
 	}
-	m.logger.Info().Str("migration_id", migrationID).Msg("destination adapter acquired - adapters ready, proceeding with config setup")
+
+	m.logger.Info().Str("migration_id", migrationID).Str("source", srcDef.ID).Str("destination", dstDef.ID).Msg("using pre-acquired adapters for migration")
 
 	cfg := migration.Config{
 		// REQUIRED: Pass the pre-opened DB instance (API owns lifecycle)

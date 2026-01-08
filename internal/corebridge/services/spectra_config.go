@@ -91,3 +91,48 @@ func LoadSpectraConfigOverride(dataDir, migrationID string) (string, bool, error
 
 	return overrideConfigPath, true, nil
 }
+
+// SaveSpectraConfigFromData saves a Spectra config from JSON data (map[string]any)
+// to the override config path with an absolute db_path
+func SaveSpectraConfigFromData(dataDir, migrationID string, configData map[string]any) (string, error) {
+	// Marshal the config data to JSON
+	configJSON, err := json.Marshal(configData)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal config data: %w", err)
+	}
+
+	// Parse into SpectraConfig struct to validate and override db_path
+	var config SpectraConfig
+	if err := json.Unmarshal(configJSON, &config); err != nil {
+		return "", fmt.Errorf("failed to parse config data: %w", err)
+	}
+
+	// Override db_path - put Spectra DB in migration-specific folder
+	spectraDBPath := ResolveSpectraDBPath(dataDir, migrationID)
+	absSpectraDBPath, err := filepath.Abs(spectraDBPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve absolute path for Spectra DB: %w", err)
+	}
+	config.Seed.DBPath = absSpectraDBPath
+
+	// Create override config file in migration-specific folder
+	migrationDir := filepath.Join(dataDir, migrationID)
+	overrideConfigPath := filepath.Join(migrationDir, "spectra-config.json")
+
+	// Ensure directory exists
+	if err := os.MkdirAll(filepath.Dir(overrideConfigPath), 0o755); err != nil {
+		return "", fmt.Errorf("failed to create directory for override config: %w", err)
+	}
+
+	// Write override config
+	overrideData, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal override config: %w", err)
+	}
+
+	if err := os.WriteFile(overrideConfigPath, overrideData, 0o644); err != nil {
+		return "", fmt.Errorf("failed to write override config: %w", err)
+	}
+
+	return overrideConfigPath, nil
+}

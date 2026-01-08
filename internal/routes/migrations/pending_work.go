@@ -65,7 +65,9 @@ func (h handler) markNodeForRetry(ctx *middleware.Context) {
 	}
 
 	// nodeID is a ULID - pass directly without hashing
-	result, err := h.core.MarkNodeForRetry(ctx.Request().Context(), migrationID, unescapedNodeID)
+	result, err := h.core.MarkNodesForRetry(ctx.Request().Context(), migrationID, corebridge.MarkRetryRequest{
+		NodeIDs: []string{unescapedNodeID},
+	})
 	if err != nil {
 		if errors.Is(err, corebridge.ErrMigrationNotFound) {
 			ctx.Error(http.StatusNotFound, "migration not found", err)

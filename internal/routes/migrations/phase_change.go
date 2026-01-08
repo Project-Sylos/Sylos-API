@@ -3,6 +3,7 @@ package migrations
 import (
 	"context"
 	"net/http"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 
@@ -42,31 +43,42 @@ func (h handler) changePhase(ctx *middleware.Context, payload PhaseChangeRequest
 		payload.Options.MigrationID = migrationID
 	}
 
-	// Launch phase change in goroutine and return immediately
-	// Use background context since the HTTP request context will be canceled when handler returns
-	go func() {
-		bgCtx := context.Background()
-		migration, err := h.core.ChangePhase(bgCtx, migrationID, payload.Phase, payload.StartMigrationRequest)
-		if err != nil {
-			// Errors are logged by the core bridge
-			h.logger.Error().
-				Err(err).
-				Str("migration_id", migrationID).
-				Str("phase", payload.Phase).
-				Msg("failed to change phase in background")
-			return
-		}
-
-		h.logger.Info().
-			Str("migration_id", migration.ID).
+	// Validate synchronously before starting background operation
+	// This allows us to return immediate errors to the client
+	bgCtx := context.Background()
+	migration, err := h.core.ChangePhase(bgCtx, migrationID, payload.Phase, payload.StartMigrationRequest)
+	if err != nil {
+		// Return error response with success: false
+		h.logger.Error().
+			Err(err).
+			Str("migration_id", migrationID).
 			Str("phase", payload.Phase).
-			Str("status", migration.Status).
-			Msg("phase change started in background")
-	}()
+			Msg("failed to change phase")
+		
+		// Determine appropriate HTTP status code
+		statusCode := http.StatusInternalServerError
+		if strings.Contains(err.Error(), "invalid phase") || 
+		   strings.Contains(err.Error(), "pending retries") ||
+		   strings.Contains(err.Error(), "running background tasks") ||
+		   strings.Contains(err.Error(), "DuckDB file not found") {
+			statusCode = http.StatusBadRequest
+		}
+		
+		ctx.Response(statusCode, corebridge.Migration{
+			ID:      migrationID,
+			Status:  "error",
+			Success: false,
+		})
+		return
+	}
+
+	// Phase change accepted, ETL will run in background
+	h.logger.Info().
+		Str("migration_id", migration.ID).
+		Str("phase", payload.Phase).
+		Str("status", migration.Status).
+		Msg("phase change started in background")
 
 	// Return immediately with accepted status
-	ctx.Response(http.StatusAccepted, corebridge.Migration{
-		ID:     migrationID,
-		Status: "starting", // Indicates it's being started asynchronously
-	})
+	ctx.Response(http.StatusAccepted, migration)
 }

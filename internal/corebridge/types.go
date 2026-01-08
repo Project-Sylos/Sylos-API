@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/Project-Sylos/Migration-Engine/pkg/migration"
-	"github.com/Project-Sylos/Sylos-API/internal/corebridge/database"
 	fstypes "github.com/Project-Sylos/Sylos-FS/pkg/types"
 )
 
@@ -119,6 +118,7 @@ type SetRootRequest struct {
 	ServiceID    string           `json:"serviceId"`
 	ConnectionID string           `json:"connectionId,omitempty"`
 	Root         FolderDescriptor `json:"root"`
+	Config       map[string]any   `json:"config,omitempty"` // Optional service-specific config (e.g., Spectra config JSON)
 }
 
 type SetRootResponse struct {
@@ -137,6 +137,7 @@ type Migration struct {
 	DestinationID string    `json:"destinationId"`
 	StartedAt     time.Time `json:"startedAt"`
 	Status        string    `json:"status"`
+	Success       bool      `json:"success,omitempty"` // Indicates if operation succeeded
 }
 
 type Status struct {
@@ -201,13 +202,23 @@ type QueueStats struct {
 	Workers      int    `json:"workers"`
 }
 
-// QueueObserverMetrics represents queue metrics from the migration engine observer
-type QueueObserverMetrics struct {
+// ExternalQueueMetrics contains user-facing metrics published to BoltDB for API access.
+type ExternalQueueMetrics struct {
+	// Monotonic counters
+	FilesDiscoveredTotal   int64 `json:"files_discovered_total"`
+	FoldersDiscoveredTotal int64 `json:"folders_discovered_total"`
+
+	// EMA-smoothed rates (2-5 second window)
+	DiscoveryRateItemsPerSec float64 `json:"discovery_rate_items_per_sec"`
+
+	// Verification counts (for O(1) stats bucket lookups)
+	TotalDiscovered int64 `json:"total_discovered"` // files + folders
+	TotalPending    int   `json:"-"`                // pending across all rounds (from DB) - internal use only, not displayed
+	TotalFailed     int   `json:"-"`                // failed across all rounds - internal use only, not displayed
+
+	// Current state (for API)
 	QueueStats
-	AverageExecutionTime time.Duration `json:"averageExecutionTime"` // in nanoseconds
-	TasksPerSecond       float64       `json:"tasksPerSecond"`
-	TotalCompleted       int           `json:"totalCompleted"`
-	LastPollTime         time.Time     `json:"lastPollTime"`
+	Round int `json:"round"`
 }
 
 // QueueMetricsResponse represents all queue metrics for a migration
@@ -215,9 +226,9 @@ type QueueMetricsResponse struct {
 	Success      bool                  `json:"success"`             // Whether the operation succeeded
 	ErrorCode    string                `json:"errorCode,omitempty"` // Error code if success is false (e.g., "DATABASE_NOT_AVAILABLE")
 	Error        string                `json:"error,omitempty"`     // Human-readable error message if success is false
-	SrcTraversal *QueueObserverMetrics `json:"srcTraversal,omitempty"`
-	DstTraversal *QueueObserverMetrics `json:"dstTraversal,omitempty"`
-	Copy         *QueueObserverMetrics `json:"copy,omitempty"`
+	SrcTraversal *ExternalQueueMetrics `json:"srcTraversal,omitempty"`
+	DstTraversal *ExternalQueueMetrics `json:"dstTraversal,omitempty"`
+	Copy         *ExternalQueueMetrics `json:"copy,omitempty"`
 }
 
 // LogEntry represents a single log entry from the database
@@ -308,11 +319,28 @@ type PathNodes struct {
 	Dst *PathNodeItem `json:"dst,omitempty"`
 }
 
+type FileSizeStats struct {
+	Src int64 `json:"src"`
+	Dst int64 `json:"dst"`
+}
+
+// PathReviewStats represents statistics for path review
+type PathReviewStats struct {
+	PendingCount        int           `json:"pendingCount"`
+	FailedCount         int           `json:"failedCount"`
+	ExcludedCount       int           `json:"excludedCount"`
+	PendingRetriesCount int           `json:"pendingRetriesCount"` // Count of items with traversal_status = 'pending'
+	FoldersCount        int           `json:"foldersCount"`
+	FilesCount          int           `json:"filesCount"`
+	FoldersRatio        float64       `json:"foldersRatio"` // Rounded to 2 decimal places
+	FilesRatio          float64       `json:"filesRatio"`   // Rounded to 2 decimal places
+	TotalFileSize       FileSizeStats `json:"totalFileSize"`
+}
+
 // ListChildrenDiffsResponse wraps the diff result with pagination metadata
 type ListChildrenDiffsResponse struct {
 	Items      map[string]PathNodes `json:"items"` // path -> {src?: {...}, dst?: {...}}
 	Pagination PaginationInfo       `json:"pagination"`
-	Stats      *PathReviewStats     `json:"stats,omitempty"` // Statistics for the search results (optional)
 }
 
 // ExclusionRequest represents a request to exclude/unexclude nodes
@@ -352,17 +380,16 @@ type SweepResponse struct {
 
 // PendingWorkResponse represents the response for checking pending work
 type PendingWorkResponse struct {
-	HasPendingExclusions   bool `json:"hasPendingExclusions"`   // True if count > 0
-	HasPendingRetries      bool `json:"hasPendingRetries"`      // True if count > 0
-	HasPathReviewChanges   bool `json:"hasPathReviewChanges"`   // True if user made changes (exclusions/retries) since last sweep completion
-	PendingExclusionsCount int  `json:"pendingExclusionsCount"` // Number of items in exclusion-holding buckets
-	PendingRetriesCount    int  `json:"pendingRetriesCount"`    // Number of items marked as "pending" in status-lookup buckets
+	HasPendingRetries    bool `json:"hasPendingRetries"`    // True if count > 0
+	HasPathReviewChanges bool `json:"hasPathReviewChanges"` // True if user made changes (exclusions/retries) since last sweep completion
+	PendingRetriesCount  int  `json:"pendingRetriesCount"`  // Number of items marked as "pending" in status-lookup buckets
 }
 
 // MarkRetryRequest represents a request to mark nodes for retry
 type MarkRetryRequest struct {
-	NodeIDs []string `json:"nodeIDs,omitempty"` // Array of node IDs to mark for retry
-	All     bool     `json:"all,omitempty"`     // If true, mark all failed items
+	NodeIDs      []string `json:"nodeIDs,omitempty"`      // Array of node IDs to mark for retry
+	All          bool     `json:"all,omitempty"`          // If true, mark all failed items
+	MarkAsFailed bool     `json:"markAsFailed,omitempty"` // If true, mark nodes as failed instead of retry
 }
 
 // MarkRetryResponse represents the response from marking a node for retry
@@ -371,9 +398,6 @@ type MarkRetryResponse struct {
 	Error   string `json:"error,omitempty"`
 	TaskID  string `json:"taskID,omitempty"` // Background task ID for 'all' operations
 }
-
-// PathReviewStats represents statistics for path review (aliased from database package)
-type PathReviewStats = database.PathReviewStats
 
 // SearchCondition represents a single search condition
 type SearchCondition struct {
@@ -385,8 +409,9 @@ type SearchCondition struct {
 // SearchRequest represents a request to search path review items
 // If Conditions is empty or nil, lists all items (same as diff endpoint with path="/")
 type SearchRequest struct {
-	Conditions []SearchCondition `json:"conditions,omitempty"` // Search conditions
-	Sort       *SortOption       `json:"sort,omitempty"`       // Sort options (field and direction)
+	Conditions       []SearchCondition `json:"conditions,omitempty"`       // Search conditions
+	Sort             *SortOption       `json:"sort,omitempty"`             // Sort options (field and direction)
+	StatusSearchType string            `json:"statusSearchType,omitempty"` // Which status type(s) to search by: "traversal", "copy", or "both" (default: "both")
 }
 
 // SortOption represents sorting options for search results
@@ -437,11 +462,14 @@ type Bridge interface {
 	UnexcludeNodes(ctx context.Context, migrationID string, req ExclusionRequest) (*ExclusionResponse, error)
 	CheckPendingWork(ctx context.Context, migrationID string) (PendingWorkResponse, error)
 	ChangePhase(ctx context.Context, migrationID string, phase string, req StartMigrationRequest) (Migration, error)
-	MarkNodeForRetry(ctx context.Context, migrationID string, nodeID string) (*MarkRetryResponse, error)
+	MarkNodesForRetry(ctx context.Context, migrationID string, req MarkRetryRequest) (*MarkRetryResponse, error)
 	UnmarkNodeForRetry(ctx context.Context, migrationID string, nodeID string) (*MarkRetryResponse, error)
 	GetBackgroundTasks(ctx context.Context, migrationID string) ([]BackgroundTask, error)
+	GetRunningBackgroundTasks(ctx context.Context, migrationID string) ([]BackgroundTask, error)
+	GetBackgroundTask(ctx context.Context, migrationID, taskID string) (*BackgroundTask, error)
 	GetPathReviewStats(ctx context.Context, migrationID string) (*PathReviewStats, error)
 	SearchPathReviewItems(ctx context.Context, migrationID string, req SearchRequest, offset, limit int) (ListChildrenDiffsResponse, error)
+	TriggerRetrySweep(ctx context.Context, migrationID string, config SweepConfigRequest) (SweepResponse, error)
 }
 
 const (

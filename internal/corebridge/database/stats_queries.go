@@ -11,14 +11,15 @@ import (
 
 // PathReviewStats represents statistics for path review
 type PathReviewStats struct {
-	PendingCount   int                    `json:"pendingCount"`
-	FailedCount    int                    `json:"failedCount"`
-	ExcludedCount  int                    `json:"excludedCount"`
-	FoldersCount   int                    `json:"foldersCount"`
-	FilesCount     int                    `json:"filesCount"`
-	FoldersRatio   float64                `json:"foldersRatio"` // Rounded to 2 decimal places
-	FilesRatio     float64                `json:"filesRatio"`   // Rounded to 2 decimal places
-	TotalFileSize  FileSizeStats          `json:"totalFileSize"`
+	PendingCount        int           `json:"pendingCount"`
+	FailedCount         int           `json:"failedCount"`
+	ExcludedCount       int           `json:"excludedCount"`
+	PendingRetriesCount int           `json:"pendingRetriesCount"` // Count of items with traversal_status = 'pending'
+	FoldersCount        int           `json:"foldersCount"`
+	FilesCount          int           `json:"filesCount"`
+	FoldersRatio        float64       `json:"foldersRatio"` // Rounded to 2 decimal places
+	FilesRatio          float64       `json:"filesRatio"`   // Rounded to 2 decimal places
+	TotalFileSize       FileSizeStats `json:"totalFileSize"`
 }
 
 // FileSizeStats represents file size statistics grouped by src/dst
@@ -41,9 +42,9 @@ func GetPathReviewStatsDuckDB(ctx context.Context, logger zerolog.Logger, duckdb
 	pendingQuery := `
 	SELECT COUNT(DISTINCT path) 
 	FROM (
-		SELECT path FROM src_nodes WHERE traversal_status = 'pending'
+		SELECT path FROM src_nodes WHERE copy_status = 'pending'
 		UNION
-		SELECT path FROM dst_nodes WHERE traversal_status = 'pending'
+		SELECT path FROM dst_nodes WHERE copy_status = 'pending'
 	) AS pending_paths
 	`
 	err := duckdbConn.QueryRowContext(ctx, pendingQuery).Scan(&stats.PendingCount)
@@ -52,6 +53,7 @@ func GetPathReviewStatsDuckDB(ctx context.Context, logger zerolog.Logger, duckdb
 	}
 
 	// Query for failed items (merged count of unique paths)
+	// This is the only one that should be traversal status actually.
 	failedQuery := `
 	SELECT COUNT(DISTINCT path) 
 	FROM (
@@ -69,14 +71,28 @@ func GetPathReviewStatsDuckDB(ctx context.Context, logger zerolog.Logger, duckdb
 	excludedQuery := `
 	SELECT COUNT(DISTINCT path) 
 	FROM (
-		SELECT path FROM src_nodes WHERE traversal_status IN ('exclusion_explicit', 'exclusion_inherited')
+		SELECT path FROM src_nodes WHERE copy_status IN ('exclusion_explicit', 'exclusion_inherited')
 		UNION
-		SELECT path FROM dst_nodes WHERE traversal_status IN ('exclusion_explicit', 'exclusion_inherited')
+		SELECT path FROM dst_nodes WHERE copy_status IN ('exclusion_explicit', 'exclusion_inherited')
 	) AS excluded_paths
 	`
 	err = duckdbConn.QueryRowContext(ctx, excludedQuery).Scan(&stats.ExcludedCount)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query excluded count: %w", err)
+	}
+
+	// Query for pending retries (items with traversal_status = 'pending')
+	pendingRetriesQuery := `
+	SELECT COUNT(DISTINCT path) 
+	FROM (
+		SELECT path FROM src_nodes WHERE traversal_status = 'pending'
+		UNION
+		SELECT path FROM dst_nodes WHERE traversal_status = 'pending'
+	) AS pending_retries_paths
+	`
+	err = duckdbConn.QueryRowContext(ctx, pendingRetriesQuery).Scan(&stats.PendingRetriesCount)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query pending retries count: %w", err)
 	}
 
 	// Query for folders and files count (merged, unique paths)
@@ -122,4 +138,3 @@ func GetPathReviewStatsDuckDB(ctx context.Context, logger zerolog.Logger, duckdb
 
 	return stats, nil
 }
-

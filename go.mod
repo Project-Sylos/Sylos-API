@@ -52,3 +52,5 @@ require (
 replace github.com/Project-Sylos/Migration-Engine => ../Migration-Engine
 
 replace github.com/Project-Sylos/Sylos-FS => ../Sylos-FS
+
+replace github.com/Project-Sylos/Spectra => ../Spectra

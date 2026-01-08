@@ -103,11 +103,7 @@ func (m *Manager) RecoverInterruptedETL() {
 		}
 
 		// Check if ETL is already running (shouldn't be on startup, but check anyway)
-		record.ETLMutex.Lock()
-		etlRunning := record.ETLRunning
-		record.ETLMutex.Unlock()
-
-		if etlRunning {
+		if record.GetETLRunning() {
 			m.logger.Debug().
 				Str("migration_id", meta.ID).
 				Msg("ETL already marked as running, skipping recovery")

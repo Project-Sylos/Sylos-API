@@ -152,6 +152,7 @@ func (m *Manager) SetRoot(ctx context.Context, req SetRootRequest) (SetRootRespo
 			DepthLevel:   req.Root.DepthLevel,
 			Type:         req.Root.Type,
 		},
+		Config: req.Config, // Copy config from request
 	}
 	resp, err := m.rootsMgr.SetRoot(ctx, rootsReq)
 	if err != nil {
@@ -234,6 +235,7 @@ func (m *Manager) StartMigration(ctx context.Context, req StartMigrationRequest)
 }
 
 // ChangePhase changes the migration phase (traversal or copy) with pending work validation
+// It first runs ETL from DuckDB to BoltDB to create a fresh BoltDB file, then starts the migration
 func (m *Manager) ChangePhase(ctx context.Context, migrationID string, phase string, req StartMigrationRequest) (Migration, error) {
 	// Validate phase
 	if phase != "traversal" && phase != "copy" {
@@ -251,27 +253,102 @@ func (m *Manager) ChangePhase(ctx context.Context, migrationID string, phase str
 		return Migration{}, fmt.Errorf("cannot start copy phase: there are pending retries. Please run traversal phase first")
 	}
 
-	// Run exclusion sweep if there are pending exclusions (blocking)
-	if pendingWork.HasPendingExclusions {
-		m.logger.Info().
-			Str("migration_id", migrationID).
-			Str("phase", phase).
-			Msg("running exclusion sweep before phase change")
-
-		// Run exclusion sweep synchronously before starting the phase
-		_, err := m.TriggerExclusionSweep(ctx, migrationID, SweepConfigRequest{})
-		if err != nil {
-			return Migration{}, fmt.Errorf("failed to run exclusion sweep: %w", err)
-		}
-
-		m.logger.Info().
-			Str("migration_id", migrationID).
-			Msg("exclusion sweep completed, proceeding with phase change")
+	// Get migration metadata to find paths
+	metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
+	meta, err := metaMgr.GetMigrationMetadata(migrationID)
+	if err != nil {
+		return Migration{}, fmt.Errorf("failed to get migration metadata: %w", err)
 	}
 
-	// Start the migration (which will handle the phase based on checkpoint state)
-	// The Migration Engine will automatically handle traversal vs copy based on checkpoint state
-	return m.StartMigration(ctx, req)
+	// Derive database path from config path
+	dbPath := strings.TrimSuffix(meta.ConfigPath, ".yaml") + ".db"
+	if dbPath == ".db" {
+		dbPath, err = database.ResolveDatabasePath(m.cfg.Runtime.DataDir, "", migrationID)
+		if err != nil {
+			return Migration{}, fmt.Errorf("failed to resolve database path: %w", err)
+		}
+	}
+
+	// Check if there are any running background tasks
+	runningTasks := m.bgTaskMgr.GetRunningTasks(migrationID)
+	if len(runningTasks) > 0 {
+		return Migration{}, fmt.Errorf("cannot change phase: there are %d running background tasks. Please wait for them to complete", len(runningTasks))
+	}
+
+	// Verify DuckDB exists (migration should be in Awaiting-Path-Review)
+	duckdbExists, err := database.CheckDuckDBExists(dbPath)
+	if err != nil {
+		return Migration{}, fmt.Errorf("failed to check DuckDB existence: %w", err)
+	}
+	if !duckdbExists {
+		return Migration{}, fmt.Errorf("DuckDB file not found. Migration must be in 'Awaiting-Path-Review' status before changing phase")
+	}
+
+	// Force close all DB connections before ETL (ETL will open its own instances)
+	// This ensures files are not locked when ETL tries to open them
+
+	// Close DuckDB connection
+	if err := m.migrationsMgr.KillDuckDBConnection(migrationID); err != nil {
+		m.logger.Warn().
+			Err(err).
+			Str("migration_id", migrationID).
+			Msg("failed to close DuckDB connection (may not be open), proceeding anyway")
+	} else {
+		m.logger.Info().
+			Str("migration_id", migrationID).
+			Msg("closed DuckDB connection before phase change ETL")
+	}
+
+	// Close BoltDB connection
+	if err := m.migrationsMgr.CloseDB(migrationID); err != nil {
+		m.logger.Warn().
+			Err(err).
+			Str("migration_id", migrationID).
+			Msg("failed to close BoltDB connection (may not be open), proceeding anyway")
+	} else {
+		m.logger.Info().
+			Str("migration_id", migrationID).
+			Msg("closed BoltDB connection before phase change ETL")
+	}
+
+	// Get or create migration record
+	record := m.migrationsMgr.GetRecord(migrationID)
+	if record == nil {
+		// Create a temporary record for ETL tracking
+		record = &migrations.MigrationRecord{
+			ID: migrationID,
+		}
+	}
+
+	// Trigger ETL from DuckDB to BoltDB in background
+	// After ETL completes, it will trigger StartMigration
+	go func() {
+		m.migrationsMgr.RunETLFromDuckToBolt(record, dbPath, meta.ConfigPath, func() {
+			// ETL completed successfully, now start the migration
+			m.logger.Info().
+				Str("migration_id", migrationID).
+				Str("phase", phase).
+				Msg("ETL completed, starting migration phase")
+
+			// Start the migration (which will handle the phase based on checkpoint state)
+			// The Migration Engine will automatically handle traversal vs copy based on checkpoint state
+			_, err := m.StartMigration(ctx, req)
+			if err != nil {
+				m.logger.Error().
+					Err(err).
+					Str("migration_id", migrationID).
+					Str("phase", phase).
+					Msg("failed to start migration after ETL")
+			}
+		})
+	}()
+
+	// Return immediately with accepted status
+	return Migration{
+		ID:      migrationID,
+		Status:  "preparing", // Indicates ETL is running before phase change
+		Success: true,
+	}, nil
 }
 
 func (m *Manager) GetMigrationStatus(ctx context.Context, id string) (Status, error) {
@@ -749,7 +826,7 @@ func (m *Manager) GetQueueMetrics(ctx context.Context, migrationID string) (*Que
 		Success: true, // Operation succeeded
 	}
 	if dbMetrics.SrcTraversal != nil {
-		metrics.SrcTraversal = &QueueObserverMetrics{
+		metrics.SrcTraversal = &ExternalQueueMetrics{
 			QueueStats: QueueStats{
 				Name:         dbMetrics.SrcTraversal.Name,
 				Round:        dbMetrics.SrcTraversal.Round,
@@ -758,14 +835,17 @@ func (m *Manager) GetQueueMetrics(ctx context.Context, migrationID string) (*Que
 				TotalTracked: dbMetrics.SrcTraversal.TotalTracked,
 				Workers:      dbMetrics.SrcTraversal.Workers,
 			},
-			AverageExecutionTime: dbMetrics.SrcTraversal.AverageExecutionTime,
-			TasksPerSecond:       dbMetrics.SrcTraversal.TasksPerSecond,
-			TotalCompleted:       dbMetrics.SrcTraversal.TotalCompleted,
-			LastPollTime:         dbMetrics.SrcTraversal.LastPollTime,
+			FilesDiscoveredTotal:     dbMetrics.SrcTraversal.FilesDiscoveredTotal,
+			FoldersDiscoveredTotal:   dbMetrics.SrcTraversal.FoldersDiscoveredTotal,
+			DiscoveryRateItemsPerSec: dbMetrics.SrcTraversal.DiscoveryRateItemsPerSec,
+			TotalDiscovered:          dbMetrics.SrcTraversal.TotalDiscovered,
+			TotalPending:             dbMetrics.SrcTraversal.TotalPending,
+			TotalFailed:              dbMetrics.SrcTraversal.TotalFailed,
+			Round:                    dbMetrics.SrcTraversal.Round,
 		}
 	}
 	if dbMetrics.DstTraversal != nil {
-		metrics.DstTraversal = &QueueObserverMetrics{
+		metrics.DstTraversal = &ExternalQueueMetrics{
 			QueueStats: QueueStats{
 				Name:         dbMetrics.DstTraversal.Name,
 				Round:        dbMetrics.DstTraversal.Round,
@@ -774,14 +854,17 @@ func (m *Manager) GetQueueMetrics(ctx context.Context, migrationID string) (*Que
 				TotalTracked: dbMetrics.DstTraversal.TotalTracked,
 				Workers:      dbMetrics.DstTraversal.Workers,
 			},
-			AverageExecutionTime: dbMetrics.DstTraversal.AverageExecutionTime,
-			TasksPerSecond:       dbMetrics.DstTraversal.TasksPerSecond,
-			TotalCompleted:       dbMetrics.DstTraversal.TotalCompleted,
-			LastPollTime:         dbMetrics.DstTraversal.LastPollTime,
+			FilesDiscoveredTotal:     dbMetrics.DstTraversal.FilesDiscoveredTotal,
+			FoldersDiscoveredTotal:   dbMetrics.DstTraversal.FoldersDiscoveredTotal,
+			DiscoveryRateItemsPerSec: dbMetrics.DstTraversal.DiscoveryRateItemsPerSec,
+			TotalDiscovered:          dbMetrics.DstTraversal.TotalDiscovered,
+			TotalPending:             dbMetrics.DstTraversal.TotalPending,
+			TotalFailed:              dbMetrics.DstTraversal.TotalFailed,
+			Round:                    dbMetrics.DstTraversal.Round,
 		}
 	}
 	if dbMetrics.Copy != nil {
-		metrics.Copy = &QueueObserverMetrics{
+		metrics.Copy = &ExternalQueueMetrics{
 			QueueStats: QueueStats{
 				Name:         dbMetrics.Copy.Name,
 				Round:        dbMetrics.Copy.Round,
@@ -790,10 +873,13 @@ func (m *Manager) GetQueueMetrics(ctx context.Context, migrationID string) (*Que
 				TotalTracked: dbMetrics.Copy.TotalTracked,
 				Workers:      dbMetrics.Copy.Workers,
 			},
-			AverageExecutionTime: dbMetrics.Copy.AverageExecutionTime,
-			TasksPerSecond:       dbMetrics.Copy.TasksPerSecond,
-			TotalCompleted:       dbMetrics.Copy.TotalCompleted,
-			LastPollTime:         dbMetrics.Copy.LastPollTime,
+			FilesDiscoveredTotal:     dbMetrics.Copy.FilesDiscoveredTotal,
+			FoldersDiscoveredTotal:   dbMetrics.Copy.FoldersDiscoveredTotal,
+			DiscoveryRateItemsPerSec: dbMetrics.Copy.DiscoveryRateItemsPerSec,
+			TotalDiscovered:          dbMetrics.Copy.TotalDiscovered,
+			TotalPending:             dbMetrics.Copy.TotalPending,
+			TotalFailed:              dbMetrics.Copy.TotalFailed,
+			Round:                    dbMetrics.Copy.Round,
 		}
 	}
 
@@ -936,7 +1022,6 @@ func (m *Manager) ListChildrenDiffs(ctx context.Context, req ListChildrenDiffsRe
 
 	var dbItems map[string]database.PathNodes
 	var dbPagination database.PaginationInfo
-	var dbStats *database.PathReviewStats
 
 	if useDuckDB {
 		// Use DuckDB for path review operations
@@ -965,16 +1050,10 @@ func (m *Manager) ListChildrenDiffs(ctx context.Context, req ListChildrenDiffsRe
 			}
 		}
 
-		dbItems, dbPagination, dbStats, err = database.GetChildrenDiffsFromDuckDB(ctx, m.logger, duckdbConn, req.Path, req.Offset, req.Limit, req.FoldersOnly, sortField, sortDir)
+		dbItems, dbPagination, err = database.GetChildrenDiffsFromDuckDB(ctx, m.logger, duckdbConn, req.Path, req.Offset, req.Limit, req.FoldersOnly, sortField, sortDir)
 		if err != nil {
 			return ListChildrenDiffsResponse{}, fmt.Errorf("failed to get children diffs from DuckDB: %w", err)
 		}
-	}
-
-	// Convert database stats to corebridge stats (aliased type, so just assign pointer)
-	var stats *PathReviewStats
-	if dbStats != nil {
-		stats = dbStats
 	}
 
 	// Convert database types to corebridge types
@@ -1029,7 +1108,6 @@ func (m *Manager) ListChildrenDiffs(ctx context.Context, req ListChildrenDiffsRe
 			TotalFiles:   dbPagination.TotalFiles,
 			HasMore:      dbPagination.HasMore,
 		},
-		Stats: stats,
 	}, nil
 }
 
@@ -1102,16 +1180,16 @@ func (m *Manager) SearchPathReviewItems(ctx context.Context, migrationID string,
 		}
 	}
 
-	// Call database search function
-	dbItems, dbPagination, dbStats, err := database.SearchPathReviewItemsDuckDB(ctx, m.logger, duckdbConn, dbConditions, offset, limit, sortField, sortDir)
-	if err != nil {
-		return ListChildrenDiffsResponse{}, fmt.Errorf("failed to search path review items: %w", err)
+	// Extract statusSearchType from request (default to "both")
+	statusSearchType := req.StatusSearchType
+	if statusSearchType == "" {
+		statusSearchType = "both"
 	}
 
-	// Convert database stats to corebridge stats (aliased type, so just assign pointer)
-	var stats *PathReviewStats
-	if dbStats != nil {
-		stats = dbStats
+	// Call database search function
+	dbItems, dbPagination, err := database.SearchPathReviewItemsDuckDB(ctx, m.logger, duckdbConn, dbConditions, offset, limit, sortField, sortDir, statusSearchType)
+	if err != nil {
+		return ListChildrenDiffsResponse{}, fmt.Errorf("failed to search path review items: %w", err)
 	}
 
 	// Convert database types to corebridge types (same as ListChildrenDiffs)
@@ -1166,7 +1244,6 @@ func (m *Manager) SearchPathReviewItems(ctx context.Context, migrationID string,
 			TotalFiles:   dbPagination.TotalFiles,
 			HasMore:      dbPagination.HasMore,
 		},
-		Stats: stats,
 	}, nil
 }
 
@@ -1403,198 +1480,26 @@ func (m *Manager) UnexcludeNodes(ctx context.Context, migrationID string, req Ex
 	}, nil
 }
 
-// TriggerExclusionSweep triggers an exclusion sweep for a migration
-func (m *Manager) TriggerExclusionSweep(ctx context.Context, migrationID string, config SweepConfigRequest) (SweepResponse, error) {
-	// Get metadata to find config path
-	metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
-	meta, err := metaMgr.GetMigrationMetadata(migrationID)
-	if err != nil {
-		return SweepResponse{
-			Success: false,
-			Error:   "migration not found",
-		}, ErrMigrationNotFound
-	}
-
-	// Check if config path exists
-	configPath := meta.ConfigPath
-	if configPath == "" {
-		// Try to derive from migration ID
-		dbPath, err := database.ResolveDatabasePath(m.cfg.Runtime.DataDir, "", migrationID)
-		if err != nil {
-			return SweepResponse{
-				Success: false,
-				Error:   "failed to resolve database path",
-			}, fmt.Errorf("failed to resolve database path: %w", err)
-		}
-		configPath = database.ConfigPathFromDatabasePath(dbPath)
-	}
-
-	// Check if config file exists
-	if _, err := os.Stat(configPath); os.IsNotExist(err) {
-		return SweepResponse{
-			Success: false,
-			Error:   fmt.Sprintf("migration config file not found: %s", configPath),
-		}, fmt.Errorf("migration config file not found: %s", configPath)
-	}
-
-	// Check if Spectra override config exists
-	overridePath, exists, _ := services.LoadSpectraConfigOverride(m.cfg.Runtime.DataDir, migrationID)
-	var spectraConfigPath string
-	if exists {
-		spectraConfigPath = overridePath
-	}
-
-	// Load YAML config and reconstruct adapters
-	adapterFactory := m.createAdapterFactoryForSweep(spectraConfigPath)
-	migrationCfg, err := migration.LoadMigrationConfigFromYAML(configPath, adapterFactory)
-	if err != nil {
-		return SweepResponse{
-			Success: false,
-			Error:   fmt.Sprintf("failed to load migration config: %v", err),
-		}, fmt.Errorf("failed to load migration config: %w", err)
-	}
-
-	// Get or open DB instance
-	dbInstance := m.migrationsMgr.GetDB(migrationID)
-	if dbInstance == nil {
-		// Try to open DB
-		dbPath := migrationCfg.Database.Path
-		if dbPath == "" {
-			return SweepResponse{
-				Success: false,
-				Error:   "database path not found in config",
-			}, fmt.Errorf("database path not found in config")
-		}
-
-		// Open database using migration.SetupDatabase (same pattern as ExcludeNode)
-		var errOpen error
-		dbInstance, _, errOpen = migration.SetupDatabase(migration.DatabaseConfig{
-			Path:           dbPath,
-			RemoveExisting: false,
-		})
-		if errOpen != nil {
-			return SweepResponse{
-				Success: false,
-				Error:   "failed to open database",
-			}, fmt.Errorf("failed to open database: %w", errOpen)
-		}
-	}
-
-	// Build sweep config with defaults and overrides
-	sweepCfg := migration.SweepConfig{
-		BoltDB:      dbInstance,
-		SrcAdapter:  migrationCfg.Source.Adapter,
-		DstAdapter:  migrationCfg.Destination.Adapter,
-		WorkerCount: m.selectWorkerCountForSweep(config.WorkerCount),
-		MaxRetries:  m.selectMaxRetriesForSweep(config.MaxRetries),
-	}
-
-	// Apply optional config overrides
-	if config.LogAddress != "" {
-		sweepCfg.LogAddress = config.LogAddress
-	} else if m.cfg.Runtime.LogAddress != "" {
-		sweepCfg.LogAddress = m.cfg.Runtime.LogAddress
-	}
-
-	if config.LogLevel != "" {
-		sweepCfg.LogLevel = config.LogLevel
-	} else if m.cfg.Runtime.LogLevel != "" {
-		sweepCfg.LogLevel = m.cfg.Runtime.LogLevel
-	} else {
-		sweepCfg.LogLevel = "info"
-	}
-
-	if config.SkipListener != nil {
-		sweepCfg.SkipListener = *config.SkipListener
-	} else {
-		sweepCfg.SkipListener = true // Default to skip listener
-	}
-
-	if config.StartupDelaySec > 0 {
-		sweepCfg.StartupDelay = time.Duration(config.StartupDelaySec) * time.Second
-	} else {
-		sweepCfg.StartupDelay = 500 * time.Millisecond
-	}
-
-	if config.ProgressTickMillis > 0 {
-		sweepCfg.ProgressTick = time.Duration(config.ProgressTickMillis) * time.Millisecond
-	} else {
-		sweepCfg.ProgressTick = 1 * time.Second
-	}
-
-	// Check if DuckDB is available (status is Awaiting-Path-Review)
-	useDuckDB := false
-	yamlCfg, err := migration.LoadMigrationConfig(configPath)
-	if err == nil {
-		status := strings.TrimSpace(yamlCfg.State.Status)
-		if status == "Awaiting-Path-Review" {
-			useDuckDB = true
-		}
-	}
-
-	// Use background context for shutdown (HTTP request context gets canceled when handler returns)
-	bgCtx := context.Background()
-
-	if useDuckDB {
-		// Use DuckDB-based exclusion sweep
-		dbPath := migrationCfg.Database.Path
-		duckdbPath := database.GetDuckDBPath(dbPath)
-		duckdbPool := m.migrationsMgr.GetDuckDBPool()
-
-		// Start sweep in goroutine with background task tracking
-		taskID := m.bgTaskMgr.StartTask(migrationID, BackgroundTaskTypeExclusionSweep)
-		go func() {
-			defer m.bgTaskMgr.CompleteTask(migrationID, taskID)
-
-			// Open DuckDB connection
-			duckdbConn, err := duckdbPool.OpenDuckDB(migrationID, duckdbPath)
-			if err != nil {
-				m.logger.Error().
-					Err(err).
-					Str("migration_id", migrationID).
-					Msg("failed to open DuckDB for exclusion sweep")
-				m.bgTaskMgr.FailTask(migrationID, taskID, err)
-				return
-			}
-			defer duckdbPool.Close(migrationID)
-
-			// Run DuckDB-based exclusion sweep
-			err = database.RunExclusionSweepDuckDB(bgCtx, m.logger, duckdbConn)
-			if err != nil {
-				m.logger.Error().
-					Err(err).
-					Str("migration_id", migrationID).
-					Msg("exclusion sweep failed in DuckDB")
-				m.bgTaskMgr.FailTask(migrationID, taskID, err)
-				return
-			}
-
-			m.logger.Info().
-				Str("migration_id", migrationID).
-				Msg("exclusion sweep completed in DuckDB")
-
-			// Clear path review changes flag on successful sweep completion
-			if err := m.markPathReviewChanges(migrationID, false); err != nil {
-				m.logger.Warn().Err(err).Str("migration_id", migrationID).Msg("failed to clear path review changes flag")
-			}
-		}()
-	} else {
-		// Exclusion sweep is only available during path review phase (Awaiting-Path-Review)
-		// For other phases, exclusion sweeps are handled by the migration engine during traversal
-		return SweepResponse{
-			Success: false,
-			Error:   "exclusion sweep is only available during path review phase (Awaiting-Path-Review status)",
-		}, fmt.Errorf("exclusion sweep not available: migration status is not Awaiting-Path-Review")
-	}
-
-	return SweepResponse{
-		Success: true,
-		Message: "Exclusion sweep started",
-	}, nil
-}
-
 // TriggerRetrySweep triggers a retry sweep for a migration
+// It first runs ETL from DuckDB to BoltDB to sync path review changes, then starts the retry sweep
 func (m *Manager) TriggerRetrySweep(ctx context.Context, migrationID string, config SweepConfigRequest) (SweepResponse, error) {
+	// Check for running background tasks (prevent overlapping operations)
+	runningTasks := m.bgTaskMgr.GetRunningTasks(migrationID)
+	if len(runningTasks) > 0 {
+		return SweepResponse{
+			Success: false,
+			Error:   fmt.Sprintf("cannot start retry sweep: there are %d running background tasks. Please wait for them to complete", len(runningTasks)),
+		}, fmt.Errorf("cannot start retry sweep: there are %d running background tasks", len(runningTasks))
+	}
+
+	// Check if retry sweep is already running
+	if m.bgTaskMgr.HasRunningTask(migrationID, BackgroundTaskTypeRetrySweep) {
+		return SweepResponse{
+			Success: false,
+			Error:   "retry sweep is already running for this migration",
+		}, fmt.Errorf("retry sweep is already running")
+	}
+
 	// Get metadata to find config path
 	metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
 	meta, err := metaMgr.GetMigrationMetadata(migrationID)
@@ -1625,6 +1530,75 @@ func (m *Manager) TriggerRetrySweep(ctx context.Context, migrationID string, con
 			Success: false,
 			Error:   fmt.Sprintf("migration config file not found: %s", configPath),
 		}, fmt.Errorf("migration config file not found: %s", configPath)
+	}
+
+	// Derive database path from config path
+	dbPath := strings.TrimSuffix(configPath, ".yaml") + ".db"
+	if dbPath == ".db" {
+		dbPath, err = database.ResolveDatabasePath(m.cfg.Runtime.DataDir, "", migrationID)
+		if err != nil {
+			return SweepResponse{
+				Success: false,
+				Error:   "failed to resolve database path",
+			}, fmt.Errorf("failed to resolve database path: %w", err)
+		}
+	}
+
+	// Verify DuckDB exists (migration should be in Awaiting-Path-Review)
+	duckdbExists, err := database.CheckDuckDBExists(dbPath)
+	if err != nil {
+		return SweepResponse{
+			Success: false,
+			Error:   "failed to check DuckDB existence",
+		}, fmt.Errorf("failed to check DuckDB existence: %w", err)
+	}
+	if !duckdbExists {
+		return SweepResponse{
+			Success: false,
+			Error:   "DuckDB file not found. Migration must be in 'Awaiting-Path-Review' status before retry sweep",
+		}, fmt.Errorf("DuckDB file not found")
+	}
+
+	// Check if there are pending retries
+	pendingWork, err := m.CheckPendingWork(ctx, migrationID)
+	if err != nil {
+		// If we can't check, log warning but continue (DuckDB might not be accessible)
+		m.logger.Warn().
+			Err(err).
+			Str("migration_id", migrationID).
+			Msg("failed to check pending work, proceeding anyway")
+	} else if !pendingWork.HasPendingRetries {
+		return SweepResponse{
+			Success: false,
+			Error:   "no pending retries found. Nothing to retry",
+		}, fmt.Errorf("no pending retries found")
+	}
+
+	// Force close all DB connections before ETL (ETL will open its own instances)
+	// This ensures files are not locked when ETL tries to open them
+
+	// Close DuckDB connection
+	if err := m.migrationsMgr.KillDuckDBConnection(migrationID); err != nil {
+		m.logger.Warn().
+			Err(err).
+			Str("migration_id", migrationID).
+			Msg("failed to close DuckDB connection (may not be open), proceeding anyway")
+	} else {
+		m.logger.Info().
+			Str("migration_id", migrationID).
+			Msg("closed DuckDB connection before retry sweep ETL")
+	}
+
+	// Close BoltDB connection
+	if err := m.migrationsMgr.CloseDB(migrationID); err != nil {
+		m.logger.Warn().
+			Err(err).
+			Str("migration_id", migrationID).
+			Msg("failed to close BoltDB connection (may not be open), proceeding anyway")
+	} else {
+		m.logger.Info().
+			Str("migration_id", migrationID).
+			Msg("closed BoltDB connection before retry sweep ETL")
 	}
 
 	// Check if Spectra override config exists
@@ -1649,135 +1623,246 @@ func (m *Manager) TriggerRetrySweep(ctx context.Context, migrationID string, con
 		maxKnownDepth = -1
 	}
 
-	// Step 1: Update checkpoint state to Filters-Set with retry metadata
-	// This must be done before running the retry sweep
-	// TODO: Use migration.SetStatusFiltersSet(yamlCfg, true, maxKnownDepth) when SDK is updated
-	// For now, set state directly (SDK may not have SetStatusFiltersSet yet)
-	yamlCfg.State.Status = "Filters-Set"
-	// Note: IsRetrySweep and MaxKnownDepth fields may need to be set once SDK is updated
-	// These fields should be in StateConfig: IsRetrySweep *bool, MaxKnownDepth *int
-
+	// Step 1: Update status to Preparing-For-Retry when retry is triggered
+	// This signals that we're preparing for a retry sweep
+	// The ETL function will update to ETL-Duck-To-Bolt-In-Progress when ETL starts
+	// Then to Filters-Set when ETL completes
+	yamlCfg.State.Status = "Preparing-For-Retry"
 	if err := migration.SaveMigrationConfig(configPath, yamlCfg); err != nil {
 		return SweepResponse{
 			Success: false,
-			Error:   fmt.Sprintf("failed to update checkpoint state: %v", err),
+			Error:   fmt.Sprintf("failed to update status to Preparing-For-Retry: %v", err),
 		}, fmt.Errorf("failed to save migration config: %w", err)
 	}
 
 	m.logger.Info().
 		Str("migration_id", migrationID).
-		Str("checkpoint_status", "Filters-Set").
+		Str("status", "Preparing-For-Retry").
 		Int("max_known_depth", maxKnownDepth).
-		Msg("updated checkpoint state to Filters-Set for retry sweep")
+		Msg("updated status to Preparing-For-Retry (retry sweep triggered)")
 
-	// Load full config with adapters for sweep execution
-	adapterFactory := m.createAdapterFactoryForSweep(spectraConfigPath)
-	migrationCfg, err := migration.LoadMigrationConfigFromYAML(configPath, adapterFactory)
-	if err != nil {
-		return SweepResponse{
-			Success: false,
-			Error:   fmt.Sprintf("failed to load migration config with adapters: %v", err),
-		}, fmt.Errorf("failed to load migration config: %w", err)
-	}
-
-	// Get or open DB instance
-	dbInstance := m.migrationsMgr.GetDB(migrationID)
-	if dbInstance == nil {
-		// Try to open DB
-		dbPath := migrationCfg.Database.Path
-		if dbPath == "" {
-			return SweepResponse{
-				Success: false,
-				Error:   "database path not found in config",
-			}, fmt.Errorf("database path not found in config")
-		}
-
-		// Open database using migration.SetupDatabase (same pattern as ExcludeNode)
-		var errOpen error
-		dbInstance, _, errOpen = migration.SetupDatabase(migration.DatabaseConfig{
-			Path:           dbPath,
-			RemoveExisting: false,
-		})
-		if errOpen != nil {
-			return SweepResponse{
-				Success: false,
-				Error:   "failed to open database",
-			}, fmt.Errorf("failed to open database: %w", errOpen)
+	// Get or create migration record
+	record := m.migrationsMgr.GetRecord(migrationID)
+	if record == nil {
+		// Create a temporary record for ETL tracking
+		record = &migrations.MigrationRecord{
+			ID: migrationID,
 		}
 	}
 
-	// Build sweep config with defaults and overrides
-	sweepCfg := migration.SweepConfig{
-		BoltDB:        dbInstance,
-		SrcAdapter:    migrationCfg.Source.Adapter,
-		DstAdapter:    migrationCfg.Destination.Adapter,
-		WorkerCount:   m.selectWorkerCountForSweep(config.WorkerCount),
-		MaxRetries:    m.selectMaxRetriesForSweep(config.MaxRetries),
-		MaxKnownDepth: maxKnownDepth,
-	}
+	// Retry sweep is like running discovery phase again - it's not a background task
+	// but we'll track it for UI visibility
+	taskID := m.bgTaskMgr.StartTask(migrationID, BackgroundTaskTypeRetrySweep)
 
-	// Apply optional config overrides
-	if config.LogAddress != "" {
-		sweepCfg.LogAddress = config.LogAddress
-	} else if m.cfg.Runtime.LogAddress != "" {
-		sweepCfg.LogAddress = m.cfg.Runtime.LogAddress
-	}
-
-	if config.LogLevel != "" {
-		sweepCfg.LogLevel = config.LogLevel
-	} else if m.cfg.Runtime.LogLevel != "" {
-		sweepCfg.LogLevel = m.cfg.Runtime.LogLevel
-	} else {
-		sweepCfg.LogLevel = "info"
-	}
-
-	if config.SkipListener != nil {
-		sweepCfg.SkipListener = *config.SkipListener
-	} else {
-		sweepCfg.SkipListener = true // Default to skip listener
-	}
-
-	if config.StartupDelaySec > 0 {
-		sweepCfg.StartupDelay = time.Duration(config.StartupDelaySec) * time.Second
-	} else {
-		sweepCfg.StartupDelay = 500 * time.Millisecond
-	}
-
-	if config.ProgressTickMillis > 0 {
-		sweepCfg.ProgressTick = time.Duration(config.ProgressTickMillis) * time.Millisecond
-	} else {
-		sweepCfg.ProgressTick = 1 * time.Second
-	}
-
-	// Use background context for shutdown (HTTP request context gets canceled when handler returns)
-	sweepCfg.ShutdownContext = context.Background()
-
-	// Start sweep in goroutine (hybrid async pattern)
+	// Trigger ETL from DuckDB to BoltDB in background
+	// After ETL completes, run retry sweep, then ETL back to DuckDB
 	go func() {
-		stats, err := migration.RunRetrySweep(sweepCfg)
-		if err != nil {
-			m.logger.Error().
-				Err(err).
+		defer func() {
+			// Handle panic recovery
+			if r := recover(); r != nil {
+				m.bgTaskMgr.FailTask(migrationID, taskID, fmt.Errorf("panic: %v", r))
+				panic(r) // Re-panic
+			}
+		}()
+
+		m.migrationsMgr.RunETLFromDuckToBolt(record, dbPath, configPath, func() {
+			// ETL from DuckDB to BoltDB completed successfully
+			m.logger.Info().
 				Str("migration_id", migrationID).
-				Msg("retry sweep failed")
-			return
-		}
+				Msg("ETL from DuckDB to BoltDB completed, starting retry sweep")
 
-		m.logger.Info().
-			Str("migration_id", migrationID).
-			Dur("duration", stats.Duration).
-			Int("src_round", stats.Src.Round).
-			Int("src_pending", stats.Src.Pending).
-			Int("src_in_progress", stats.Src.InProgress).
-			Int("dst_round", stats.Dst.Round).
-			Int("dst_pending", stats.Dst.Pending).
-			Int("dst_in_progress", stats.Dst.InProgress).
-			Msg("retry sweep completed")
+			// Update task progress
+			m.bgTaskMgr.UpdateTaskProgress(migrationID, taskID, map[string]any{
+				"stage": "running_sweep",
+			})
 
-		// Clear path review changes flag on successful sweep completion
-		if err := m.markPathReviewChanges(migrationID, false); err != nil {
-			m.logger.Warn().Err(err).Str("migration_id", migrationID).Msg("failed to clear path review changes flag")
-		}
+			// Acquire adapters for sweep execution
+			srcAdapter, err := m.acquireAdapterFromYAMLConfigForSweep(yamlCfg.Services.Source, spectraConfigPath)
+			if err != nil {
+				m.logger.Error().
+					Err(err).
+					Str("migration_id", migrationID).
+					Msg("failed to acquire source adapter for retry sweep")
+				m.bgTaskMgr.FailTask(migrationID, taskID, fmt.Errorf("failed to acquire source adapter: %w", err))
+				return
+			}
+
+			dstAdapter, err := m.acquireAdapterFromYAMLConfigForSweep(yamlCfg.Services.Destination, spectraConfigPath)
+			if err != nil {
+				m.logger.Error().
+					Err(err).
+					Str("migration_id", migrationID).
+					Msg("failed to acquire destination adapter for retry sweep")
+				m.bgTaskMgr.FailTask(migrationID, taskID, fmt.Errorf("failed to acquire destination adapter: %w", err))
+				return
+			}
+
+			// Load full config with adapters for sweep execution
+			migrationCfg, err := migration.LoadMigrationConfigFromYAML(configPath, srcAdapter, dstAdapter)
+			if err != nil {
+				m.logger.Error().
+					Err(err).
+					Str("migration_id", migrationID).
+					Msg("failed to load migration config with adapters for retry sweep")
+				m.bgTaskMgr.FailTask(migrationID, taskID, fmt.Errorf("failed to load migration config: %w", err))
+				return
+			}
+
+			// Open the new BoltDB instance created by ETL
+			// ETL created a fresh BoltDB, so we need to open it
+			dbInstance, _, err := migration.SetupDatabase(migration.DatabaseConfig{
+				Path:           dbPath,
+				RemoveExisting: false,
+			})
+			if err != nil {
+				m.logger.Error().
+					Err(err).
+					Str("migration_id", migrationID).
+					Str("db_path", dbPath).
+					Msg("failed to open BoltDB after ETL")
+				m.bgTaskMgr.FailTask(migrationID, taskID, fmt.Errorf("failed to open BoltDB: %w", err))
+				return
+			}
+			defer dbInstance.Close()
+
+			// Build sweep config with defaults and overrides
+			sweepCfg := migration.SweepConfig{
+				BoltDB:        dbInstance,
+				SrcAdapter:    migrationCfg.Source.Adapter,
+				DstAdapter:    migrationCfg.Destination.Adapter,
+				WorkerCount:   m.selectWorkerCountForSweep(config.WorkerCount),
+				MaxRetries:    m.selectMaxRetriesForSweep(config.MaxRetries),
+				MaxKnownDepth: maxKnownDepth,
+			}
+
+			// Apply optional config overrides
+			if config.LogAddress != "" {
+				sweepCfg.LogAddress = config.LogAddress
+			} else if m.cfg.Runtime.LogAddress != "" {
+				sweepCfg.LogAddress = m.cfg.Runtime.LogAddress
+			}
+
+			if config.LogLevel != "" {
+				sweepCfg.LogLevel = config.LogLevel
+			} else if m.cfg.Runtime.LogLevel != "" {
+				sweepCfg.LogLevel = m.cfg.Runtime.LogLevel
+			} else {
+				sweepCfg.LogLevel = "info"
+			}
+
+			if config.SkipListener != nil {
+				sweepCfg.SkipListener = *config.SkipListener
+			} else {
+				sweepCfg.SkipListener = true // Default to skip listener
+			}
+
+			if config.StartupDelaySec > 0 {
+				sweepCfg.StartupDelay = time.Duration(config.StartupDelaySec) * time.Second
+			} else {
+				sweepCfg.StartupDelay = 500 * time.Millisecond
+			}
+
+			if config.ProgressTickMillis > 0 {
+				sweepCfg.ProgressTick = time.Duration(config.ProgressTickMillis) * time.Millisecond
+			} else {
+				sweepCfg.ProgressTick = 1 * time.Second
+			}
+
+			// Use background context for shutdown
+			sweepCfg.ShutdownContext = context.Background()
+
+			// Run retry sweep (this is like running discovery phase again)
+			m.logger.Info().
+				Str("migration_id", migrationID).
+				Msg("starting retry sweep (discovery phase)")
+
+			stats, err := migration.RunRetrySweep(sweepCfg)
+			if err != nil {
+				m.logger.Error().
+					Err(err).
+					Str("migration_id", migrationID).
+					Msg("retry sweep failed")
+				m.bgTaskMgr.FailTask(migrationID, taskID, err)
+				return
+			}
+
+			m.logger.Info().
+				Str("migration_id", migrationID).
+				Dur("duration", stats.Duration).
+				Int("src_round", stats.Src.Round).
+				Int("src_pending", stats.Src.Pending).
+				Int("src_in_progress", stats.Src.InProgress).
+				Int("dst_round", stats.Dst.Round).
+				Int("dst_pending", stats.Dst.Pending).
+				Int("dst_in_progress", stats.Dst.InProgress).
+				Msg("retry sweep completed")
+
+			// Update task progress
+			m.bgTaskMgr.UpdateTaskProgress(migrationID, taskID, map[string]any{
+				"stage": "etl_to_duckdb",
+			})
+
+			// After retry sweep completes, run ETL from BoltDB to DuckDB
+			// This creates a new DuckDB with the updated data
+			m.logger.Info().
+				Str("migration_id", migrationID).
+				Msg("retry sweep completed, running ETL from BoltDB to DuckDB")
+
+			// Update task progress
+			m.bgTaskMgr.UpdateTaskProgress(migrationID, taskID, map[string]any{
+				"stage": "etl_to_duckdb",
+			})
+
+			// Run ETL from BoltDB to DuckDB (creates new DuckDB)
+			// This will update status to Awaiting-Path-Review and open DuckDB connection
+			m.migrationsMgr.RunETLFromBoltToDuck(record, dbPath, configPath, dbInstance)
+
+			// After ETL completes, open DuckDB connection for path review
+			// runETL already handles opening the connection, but let's ensure it's open
+			duckdbPath := database.GetDuckDBPath(dbPath)
+			duckdbPool := m.migrationsMgr.GetDuckDBPool()
+			if duckdbPool != nil {
+				duckdbConn, err := duckdbPool.OpenDuckDB(migrationID, duckdbPath)
+				if err != nil {
+					m.logger.Warn().
+						Err(err).
+						Str("migration_id", migrationID).
+						Msg("failed to open DuckDB connection after ETL (may already be open)")
+				} else {
+					m.logger.Info().
+						Str("migration_id", migrationID).
+						Msg("opened DuckDB connection for path review")
+					_ = duckdbConn // Connection is managed by pool
+				}
+			}
+
+			// Ensure YAML config status is set to Awaiting-Path-Review
+			// runETL should have done this, but let's verify
+			updatedYamlCfg, err := migration.LoadMigrationConfig(configPath)
+			if err == nil {
+				if updatedYamlCfg.State.Status != "Awaiting-Path-Review" {
+					updatedYamlCfg.State.Status = "Awaiting-Path-Review"
+					if err := migration.SaveMigrationConfig(configPath, updatedYamlCfg); err != nil {
+						m.logger.Warn().
+							Err(err).
+							Str("migration_id", migrationID).
+							Msg("failed to update status to Awaiting-Path-Review")
+					} else {
+						m.logger.Info().
+							Str("migration_id", migrationID).
+							Msg("updated status to Awaiting-Path-Review after retry sweep")
+					}
+				}
+			}
+
+			// Clear path review changes flag on successful sweep completion
+			if err := m.markPathReviewChanges(migrationID, false); err != nil {
+				m.logger.Warn().Err(err).Str("migration_id", migrationID).Msg("failed to clear path review changes flag")
+			}
+
+			// Mark task as completed
+			m.bgTaskMgr.CompleteTask(migrationID, taskID)
+		})
 	}()
 
 	return SweepResponse{
@@ -1807,87 +1892,85 @@ func (m *Manager) selectMaxRetriesForSweep(value int) int {
 	return 3
 }
 
-// createAdapterFactoryForSweep creates an adapter factory for reconstructing adapters from YAML config
-// This mirrors the logic in migrations.Manager.createAdapterFactory
-func (m *Manager) createAdapterFactoryForSweep(spectraConfigOverridePath string) migration.AdapterFactory {
-	return func(serviceType string, serviceCfg migration.ServiceConfigYAML, serviceConfigs map[string]any) (fstypes.FSAdapter, error) {
-		switch strings.ToLower(serviceType) {
-		case "spectra":
-			// Use override config if provided, otherwise try to extract from serviceConfigs
-			configPath := spectraConfigOverridePath
-			if configPath == "" {
-				// Try to get original config path from service name
-				def, err := m.serviceMgr.GetServiceDefinition(serviceCfg.Name)
+// acquireAdapterFromYAMLConfigForSweep acquires an adapter based on YAML service configuration for sweep operations
+func (m *Manager) acquireAdapterFromYAMLConfigForSweep(serviceCfg migration.ServiceConfigYAML, spectraConfigOverridePath string) (fstypes.FSAdapter, error) {
+	serviceType := strings.ToLower(serviceCfg.Type)
+	switch serviceType {
+	case "spectra":
+		// Use override config if provided, otherwise try to extract from service name
+		configPath := spectraConfigOverridePath
+		if configPath == "" {
+			// Try to get original config path from service name
+			def, err := m.serviceMgr.GetServiceDefinition(serviceCfg.Name)
+			if err == nil && def.Spectra != nil {
+				configPath = def.Spectra.ConfigPath
+			} else {
+				// Try to find by world if name lookup fails
+				world := "primary"
+				if strings.Contains(strings.ToLower(serviceCfg.Name), "s1") {
+					world = "s1"
+				}
+				def, err := m.serviceMgr.GetServiceDefinitionByWorld(world)
 				if err == nil && def.Spectra != nil {
 					configPath = def.Spectra.ConfigPath
 				} else {
-					// Try to find by world if name lookup fails
-					world := "primary"
-					if strings.Contains(strings.ToLower(serviceCfg.Name), "s1") {
-						world = "s1"
-					}
-					def, err := m.serviceMgr.GetServiceDefinitionByWorld(world)
-					if err == nil && def.Spectra != nil {
-						configPath = def.Spectra.ConfigPath
-					} else {
-						return nil, fmt.Errorf("spectra config path not found for service %s", serviceCfg.Name)
-					}
+					return nil, fmt.Errorf("spectra config path not found for service %s", serviceCfg.Name)
 				}
 			}
+		}
 
-			spectraFS, err := sdk.New(configPath)
-			if err != nil {
-				return nil, fmt.Errorf("failed to create SpectraFS: %w", err)
-			}
+		spectraFS, err := sdk.New(configPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create SpectraFS: %w", err)
+		}
 
-			rootID := serviceCfg.RootID
-			if rootID == "" {
-				rootID = "root"
-			}
+		rootID := serviceCfg.RootID
+		if rootID == "" {
+			rootID = "root"
+		}
 
-			// Extract world from service name or use default
-			world := "primary"
-			if strings.Contains(strings.ToLower(serviceCfg.Name), "s1") {
-				world = "s1"
+		// Extract world from service name or use default
+		world := "primary"
+		if strings.Contains(strings.ToLower(serviceCfg.Name), "s1") {
+			world = "s1"
+		} else {
+			// Try to get world from service definition
+			def, err := m.serviceMgr.GetServiceDefinition(serviceCfg.Name)
+			if err == nil && def.Spectra != nil {
+				world = def.Spectra.World
 			} else {
-				// Try to get world from service definition
-				def, err := m.serviceMgr.GetServiceDefinition(serviceCfg.Name)
+				// Try to find by world
+				def, err := m.serviceMgr.GetServiceDefinitionByWorld(world)
 				if err == nil && def.Spectra != nil {
 					world = def.Spectra.World
-				} else {
-					// Try to find by world
-					def, err := m.serviceMgr.GetServiceDefinitionByWorld(world)
-					if err == nil && def.Spectra != nil {
-						world = def.Spectra.World
-					}
 				}
 			}
-
-			adapter, err := fslib.NewSpectraFS(spectraFS, rootID, world)
-			if err != nil {
-				_ = spectraFS.Close()
-				return nil, fmt.Errorf("failed to create SpectraFS adapter: %w", err)
-			}
-
-			return adapter, nil
-
-		case "local":
-			// For local services, use RootPath
-			rootPath := serviceCfg.RootPath
-			if rootPath == "" {
-				return nil, fmt.Errorf("local service %s missing root path", serviceCfg.Name)
-			}
-
-			adapter, err := fslib.NewLocalFS(rootPath)
-			if err != nil {
-				return nil, fmt.Errorf("failed to create LocalFS adapter: %w", err)
-			}
-
-			return adapter, nil
-
-		default:
-			return nil, fmt.Errorf("unsupported service type: %s", serviceType)
 		}
+
+		adapter, err := fslib.NewSpectraFS(spectraFS, rootID, world)
+		if err != nil {
+			_ = spectraFS.Close()
+			return nil, fmt.Errorf("failed to create SpectraFS adapter: %w", err)
+		}
+
+		return adapter, nil
+
+	case "local":
+		// For local services, use RootPath
+		rootPath := serviceCfg.RootPath
+		if rootPath == "" {
+			return nil, fmt.Errorf("local service %s missing root path", serviceCfg.Name)
+		}
+
+		adapter, err := fslib.NewLocalFS(rootPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create LocalFS adapter: %w", err)
+		}
+
+		return adapter, nil
+
+	default:
+		return nil, fmt.Errorf("unsupported service type: %s", serviceType)
 	}
 }
 
@@ -1914,54 +1997,25 @@ func (m *Manager) markPathReviewChanges(migrationID string, hasChanges bool) err
 
 // CheckPendingWork checks if there are pending exclusions or retries for a migration
 func (m *Manager) CheckPendingWork(ctx context.Context, migrationID string) (PendingWorkResponse, error) {
-	// Get DB instance
-	dbInstance := m.migrationsMgr.GetDB(migrationID)
-	if dbInstance == nil {
-		// Try to get DB path and open it
-		metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
-		meta, err := metaMgr.GetMigrationMetadata(migrationID)
-		if err != nil {
-			return PendingWorkResponse{}, ErrMigrationNotFound
-		}
-
-		// Derive database path from config path
-		dbPath := strings.TrimSuffix(meta.ConfigPath, ".yaml") + ".db"
-		if dbPath == ".db" {
-			dbPath, err = database.ResolveDatabasePath(m.cfg.Runtime.DataDir, "", migrationID)
-			if err != nil {
-				return PendingWorkResponse{}, fmt.Errorf("failed to resolve database path: %w", err)
-			}
-		}
-
-		// Check if database file exists
-		if _, err := os.Stat(dbPath); os.IsNotExist(err) {
-			return PendingWorkResponse{}, ErrMigrationNotFound
-		}
-
-		// Open database for read
-		var errOpen error
-		dbInstance, _, errOpen = migration.SetupDatabase(migration.DatabaseConfig{
-			Path:           dbPath,
-			RemoveExisting: false,
-		})
-		if errOpen != nil {
-			return PendingWorkResponse{}, fmt.Errorf("failed to open database: %w", errOpen)
-		}
-		defer func() {
-			if err := dbInstance.Close(); err != nil {
-				m.logger.Warn().Err(err).Str("migration_id", migrationID).Msg("failed to close database after checking pending work")
-			}
-		}()
-	}
-
-	// Count pending exclusions
-	exclusionsCount, err := database.CountPendingExclusions(ctx, m.logger, dbInstance)
+	// Prepare path review context (gets DuckDB connection)
+	prc, err := m.preparePathReviewContext(ctx, migrationID)
 	if err != nil {
-		return PendingWorkResponse{}, fmt.Errorf("failed to count pending exclusions: %w", err)
+		// If DuckDB is not available (migration not in path review phase), return zero counts
+		// This is expected for migrations that haven't reached path review yet
+		if err == ErrMigrationNotFound {
+			return PendingWorkResponse{}, err
+		}
+		// For other errors (like DuckDB not available), return zero counts
+		// This allows the UI to still show the migration even if DuckDB isn't ready
+		return PendingWorkResponse{
+			HasPendingRetries:    false,
+			HasPathReviewChanges: false,
+			PendingRetriesCount:  0,
+		}, nil
 	}
 
-	// Count pending retries
-	retriesCount, err := database.CountPendingRetries(ctx, m.logger, dbInstance)
+	// Count pending retries from DuckDB
+	retriesCount, err := database.CountPendingRetriesDuckDB(ctx, m.logger, prc.DuckDBConn)
 	if err != nil {
 		return PendingWorkResponse{}, fmt.Errorf("failed to count pending retries: %w", err)
 	}
@@ -1975,22 +2029,10 @@ func (m *Manager) CheckPendingWork(ctx context.Context, migrationID string) (Pen
 	}
 
 	return PendingWorkResponse{
-		HasPendingExclusions:   exclusionsCount > 0,
-		HasPendingRetries:      retriesCount > 0,
-		HasPathReviewChanges:   hasUnsavedChanges,
-		PendingExclusionsCount: exclusionsCount,
-		PendingRetriesCount:    retriesCount,
+		HasPendingRetries:    retriesCount > 0,
+		HasPathReviewChanges: hasUnsavedChanges,
+		PendingRetriesCount:  retriesCount,
 	}, nil
-}
-
-// MarkNodeForRetry marks a failed node for retry
-// Accepts either a single nodeID (for backward compatibility) or a MarkRetryRequest
-func (m *Manager) MarkNodeForRetry(ctx context.Context, migrationID string, nodeID string) (*MarkRetryResponse, error) {
-	// For backward compatibility, treat single nodeID as a request with one node
-	req := MarkRetryRequest{
-		NodeIDs: []string{nodeID},
-	}
-	return m.MarkNodesForRetry(ctx, migrationID, req)
 }
 
 // MarkNodesForRetry marks nodes for retry based on MarkRetryRequest
@@ -2195,7 +2237,7 @@ func (m *Manager) UnmarkNodeForRetry(ctx context.Context, migrationID string, no
 }
 
 // GetPathReviewStats returns statistics for path review
-func (m *Manager) GetPathReviewStats(ctx context.Context, migrationID string) (*database.PathReviewStats, error) {
+func (m *Manager) GetPathReviewStats(ctx context.Context, migrationID string) (*PathReviewStats, error) {
 	// Prepare path review context
 	prc, err := m.preparePathReviewContext(ctx, migrationID)
 	if err != nil {
@@ -2211,12 +2253,35 @@ func (m *Manager) GetPathReviewStats(ctx context.Context, migrationID string) (*
 		return nil, fmt.Errorf("failed to get path review stats: %w", err)
 	}
 
-	return stats, nil
+	return &PathReviewStats{
+		PendingCount:        stats.PendingCount,
+		FailedCount:         stats.FailedCount,
+		ExcludedCount:       stats.ExcludedCount,
+		PendingRetriesCount: stats.PendingRetriesCount,
+		FoldersCount:        stats.FoldersCount,
+		FilesCount:          stats.FilesCount,
+		FoldersRatio:        stats.FoldersRatio,
+		FilesRatio:          stats.FilesRatio,
+		TotalFileSize: FileSizeStats{
+			Src: stats.TotalFileSize.Src,
+			Dst: stats.TotalFileSize.Dst,
+		},
+	}, nil
 }
 
 // GetBackgroundTasks returns all background tasks for a migration
 func (m *Manager) GetBackgroundTasks(ctx context.Context, migrationID string) ([]BackgroundTask, error) {
 	return m.bgTaskMgr.GetTasks(migrationID), nil
+}
+
+// GetRunningBackgroundTasks returns only running background tasks for a migration
+func (m *Manager) GetRunningBackgroundTasks(ctx context.Context, migrationID string) ([]BackgroundTask, error) {
+	return m.bgTaskMgr.GetRunningTasks(migrationID), nil
+}
+
+// GetBackgroundTask returns a specific background task by ID for a migration
+func (m *Manager) GetBackgroundTask(ctx context.Context, migrationID, taskID string) (*BackgroundTask, error) {
+	return m.bgTaskMgr.GetTask(migrationID, taskID)
 }
 
 // convertMetadata converts internal metadata to public API metadata

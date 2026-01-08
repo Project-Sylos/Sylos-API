@@ -15,8 +15,6 @@ func (h handler) stats(ctx *middleware.Context) {
 		return
 	}
 
-	h.logger.Info().Str("migration_id", migrationID).Msg("getting path review stats")
-
 	stats, err := h.core.GetPathReviewStats(ctx.Request().Context(), migrationID)
 	if err != nil {
 		ctx.Error(http.StatusInternalServerError, "failed to get path review stats", err)

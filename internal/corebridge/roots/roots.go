@@ -37,6 +37,7 @@ type SetRootRequest struct {
 	ServiceID    string
 	ConnectionID string
 	Root         FolderDescriptor
+	Config       map[string]any `json:"config,omitempty"` // Optional service-specific config (e.g., Spectra config JSON)
 }
 
 // SetRootResponse represents a response from setting a root
@@ -61,18 +62,22 @@ type Manager struct {
 }
 
 type RootPlan struct {
-	HasSource               bool
-	SourceDefinition        services.ServiceDefinition
-	SourceRoot              fstypes.Folder
-	SourceConnectionID      string
-	HasDestination          bool
-	DestinationDefinition   services.ServiceDefinition
-	DestinationRoot         fstypes.Folder
-	DestinationConnectionID string
-	DatabasePath            string
-	RootSummary             migration.RootSeedSummary
-	Seeded                  bool
-	Seeding                 bool
+	HasSource                 bool
+	SourceDefinition          services.ServiceDefinition
+	SourceRoot                fstypes.Folder
+	SourceConnectionID        string // For Spectra: sessionID returned by RegisterSpectraSession
+	SourceAdapter             fstypes.FSAdapter
+	SourceAdapterRelease      func()
+	HasDestination            bool
+	DestinationDefinition     services.ServiceDefinition
+	DestinationRoot           fstypes.Folder
+	DestinationConnectionID   string // For Spectra: sessionID returned by RegisterSpectraSession
+	DestinationAdapter        fstypes.FSAdapter
+	DestinationAdapterRelease func()
+	DatabasePath              string
+	RootSummary               migration.RootSeedSummary
+	Seeded                    bool
+	Seeding                   bool
 }
 
 func NewManager(logger zerolog.Logger, dataDir string, serviceMgr *services.ServiceManager, resolveDBPath func(path, migrationID string) (string, error)) *Manager {
@@ -171,21 +176,147 @@ func (m *Manager) SetRoot(ctx context.Context, req SetRootRequest) (SetRootRespo
 		m.plans[migrationID] = plan
 	}
 
+	// Cleanup old adapters if root is being reset (do this while holding lock)
+	var oldRelease func()
+	if role == "source" && plan.SourceAdapterRelease != nil {
+		oldRelease = plan.SourceAdapterRelease
+		plan.SourceAdapter = nil
+		plan.SourceAdapterRelease = nil
+	} else if role == "destination" && plan.DestinationAdapterRelease != nil {
+		oldRelease = plan.DestinationAdapterRelease
+		plan.DestinationAdapter = nil
+		plan.DestinationAdapterRelease = nil
+	}
+
 	plan.Seeded = false
 	plan.Seeding = false
 	plan.DatabasePath = ""
 	plan.RootSummary = migration.RootSeedSummary{}
+	m.mu.Unlock()
+
+	// Release old adapter outside of lock (in case it needs to close connections)
+	if oldRelease != nil {
+		oldRelease()
+	}
+
+	// For Spectra services, use Sylos-FS's session-based pattern:
+	// 1. API registers a session with ServiceManager using RegisterSpectraSession(configPath, connectionID)
+	// 2. ServiceManager creates the session internally and owns it
+	// 3. API receives a sessionID and uses it to acquire adapters
+	// This ensures both source and destination adapters share the same *sdk.SpectraFS instance
+	connectionID := req.ConnectionID
+	var sessionID string
+	if serviceDef.Type == services.ServiceTypeSpectra {
+		m.mu.RLock()
+		existingSessionID := plan.SourceConnectionID
+		m.mu.RUnlock()
+
+		if existingSessionID == "" {
+			// No session registered yet - register one now
+			// Create or reuse override config with absolute DB path to avoid path resolution issues
+			var overridePath string
+			var err error
+
+			// Debug: Check what we received
+			fmt.Printf("DEBUG: req.Config is nil: %v, len: %d\n", req.Config == nil, len(req.Config))
+			if len(req.Config) > 0 {
+				fmt.Printf("DEBUG: req.Config keys: %v\n", getMapKeys(req.Config))
+			}
+
+			// If config was provided in the request, always use it (even if override exists)
+			if len(req.Config) > 0 {
+				fmt.Printf("Using config from request for migration %s (config keys: %v)\n", migrationID, getMapKeys(req.Config))
+				// Save config from request data
+				overridePath, err = services.SaveSpectraConfigFromData(m.dataDir, migrationID, req.Config)
+				if err != nil {
+					return SetRootResponse{}, fmt.Errorf("failed to save Spectra config from request: %w", err)
+				}
+				fmt.Printf("Saved config from request to: %s\n", overridePath)
+			} else {
+				fmt.Printf("No config provided in request for migration %s, checking for existing override\n", migrationID)
+				// Check if override config already exists
+				var exists bool
+				overridePath, exists, err = services.LoadSpectraConfigOverride(m.dataDir, migrationID)
+				if err != nil {
+					return SetRootResponse{}, fmt.Errorf("failed to check for existing Spectra config override: %w", err)
+				}
+				if !exists {
+					// Create new override config from original config path
+					overridePath, err = services.SaveSpectraConfigOverride(m.dataDir, migrationID, serviceDef.Spectra.ConfigPath)
+					if err != nil {
+						return SetRootResponse{}, fmt.Errorf("failed to create Spectra config override: %w", err)
+					}
+				}
+			}
+
+			// Determine connectionID for session registration
+			if connectionID == "" {
+				connectionID = fmt.Sprintf("spectra-%s", migrationID)
+			}
+
+			// Register session with ServiceManager (ServiceManager creates it internally)
+			fmt.Printf("Registering Spectra session for migration %s with config: %s, connectionID: %s\n", migrationID, overridePath, connectionID)
+			sessionID, err = m.serviceMgr.RegisterSpectraSession(overridePath, connectionID)
+			if err != nil {
+				return SetRootResponse{}, fmt.Errorf("failed to register Spectra session: %w", err)
+			}
+
+			// Store sessionID in plan for reuse
+			m.mu.Lock()
+			plan = m.plans[migrationID] // Re-fetch in case it was modified
+			if plan == nil {
+				m.mu.Unlock()
+				return SetRootResponse{}, fmt.Errorf("migration plan was deleted during session registration")
+			}
+			plan.SourceConnectionID = sessionID // Store sessionID for reuse
+			m.mu.Unlock()
+
+			fmt.Printf("Registered Spectra session successfully - sessionID: %s\n", sessionID)
+		} else {
+			// Session already registered - reuse the existing sessionID
+			sessionID = existingSessionID
+			fmt.Printf("Reusing existing Spectra session - sessionID: %s\n", sessionID)
+		}
+	} else {
+		// For non-Spectra services, use connectionID as-is
+		sessionID = connectionID
+	}
+
+
+	// Acquire adapter for the root being set (blocking I/O - do NOT hold lock)
+	// For Spectra: session must be registered first using RegisterSpectraSession()
+	// ServiceManager manages the session lifecycle - API just uses the sessionID
+	adapter, release, err := m.serviceMgr.AcquireAdapter(serviceDef, folder.ID(), sessionID)
+	if err != nil {
+		return SetRootResponse{}, fmt.Errorf("failed to acquire %s adapter: %w", role, err)
+	}
+
+	fmt.Printf("Acquired adapter - role: %s, sessionID: %s\n", role, sessionID)
+
+	// Re-acquire lock to update plan with new adapter
+	m.mu.Lock()
+	plan = m.plans[migrationID] // Re-fetch in case it was modified
+	if plan == nil {
+		// Plan was deleted while we were acquiring adapter - release the adapter we just acquired
+		m.mu.Unlock()
+		release()
+		return SetRootResponse{}, fmt.Errorf("migration plan was deleted during adapter acquisition")
+	}
 
 	if role == "source" {
 		plan.HasSource = true
 		plan.SourceDefinition = serviceDef
 		plan.SourceRoot = folder
-		plan.SourceConnectionID = req.ConnectionID
+		plan.SourceConnectionID = sessionID
+		plan.SourceAdapter = adapter
+		plan.SourceAdapterRelease = release
 	} else {
 		plan.HasDestination = true
 		plan.DestinationDefinition = serviceDef
 		plan.DestinationRoot = folder
-		plan.DestinationConnectionID = req.ConnectionID
+		plan.DestinationConnectionID = sessionID
+		plan.DestinationAdapter = adapter
+		plan.DestinationAdapterRelease = release
 	}
 
 	planReady := plan.HasSource && plan.HasDestination
@@ -401,4 +532,42 @@ func (m *Manager) GetPlan(migrationID string) *RootPlan {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.plans[migrationID]
+}
+
+// ClearAdapters clears adapter references from a RootPlan after migration completes
+// For Spectra: ServiceManager automatically closes sessions when all adapters are released
+// The API doesn't need to (and shouldn't) manually close sessions - ServiceManager handles that
+func (m *Manager) ClearAdapters(migrationID string) {
+	m.mu.Lock()
+	plan := m.plans[migrationID]
+	var srcRelease, dstRelease func()
+	if plan != nil {
+		// Extract release functions before clearing
+		srcRelease = plan.SourceAdapterRelease
+		dstRelease = plan.DestinationAdapterRelease
+		// Clear references
+		plan.SourceAdapter = nil
+		plan.SourceAdapterRelease = nil
+		plan.DestinationAdapter = nil
+		plan.DestinationAdapterRelease = nil
+	}
+	m.mu.Unlock()
+
+	// Call release functions outside of lock (they may perform I/O)
+	// These decrement reference counts and ServiceManager will close sessions when count reaches zero
+	if srcRelease != nil {
+		srcRelease()
+	}
+	if dstRelease != nil {
+		dstRelease()
+	}
+}
+
+// getMapKeys returns the keys of a map for debugging purposes
+func getMapKeys(m map[string]any) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
 }

@@ -63,31 +63,33 @@ func (m *Manager) SpawnLogTerminal(logAddress string) error {
 		m.logTerminal = nil
 	}
 
-	// Find the Migration Engine directory
-	// Try relative path from current working directory first (for development)
-	migrationEnginePath := "../Migration-Engine"
-	// TODO: Use the actual imported path, not this hacky nonsense. PLEASE FIX.
-	if _, err := os.Stat(migrationEnginePath); os.IsNotExist(err) {
-		// Fallback: try relative to executable
-		execPath, err := os.Executable()
-		if err == nil {
-			migrationEnginePath = filepath.Join(filepath.Dir(filepath.Dir(filepath.Dir(execPath))), "Migration-Engine")
-		}
-		// If still not found, try absolute path from go.mod replace directive
-		if _, err := os.Stat(migrationEnginePath); os.IsNotExist(err) {
-			return fmt.Errorf("Migration-Engine directory not found (tried %s)", migrationEnginePath)
-		}
-	}
-
-	spawnPath := filepath.Join(migrationEnginePath, "pkg", "logservice", "main", "spawn.go")
-	if _, err := os.Stat(spawnPath); os.IsNotExist(err) {
-		return fmt.Errorf("log service spawn.go not found at %s", spawnPath)
-	}
-
 	// Find an available terminal emulator
 	terminalCmd := FindTerminalEmulator()
 	if terminalCmd == "" {
 		return fmt.Errorf("no terminal emulator found (tried: xterm, gnome-terminal, konsole, x-terminal-emulator)")
+	}
+
+	// Get the current working directory to find the cmd directory
+	cwd, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("failed to get current working directory: %w", err)
+	}
+
+	// Try to find cmd/spawn-log-terminal/main.go relative to current directory
+	// First try current directory (if running from repo root)
+	spawnPath := filepath.Join(cwd, "cmd", "spawn-log-terminal", "main.go")
+	if _, err := os.Stat(spawnPath); os.IsNotExist(err) {
+		// Fallback: try relative to executable
+		execPath, err := os.Executable()
+		if err == nil {
+			execDir := filepath.Dir(execPath)
+			spawnPath = filepath.Join(execDir, "..", "cmd", "spawn-log-terminal", "main.go")
+			spawnPath = filepath.Clean(spawnPath)
+		}
+		// Check if it exists now
+		if _, err := os.Stat(spawnPath); os.IsNotExist(err) {
+			return fmt.Errorf("spawn-log-terminal not found at %s (ensure cmd/spawn-log-terminal/main.go exists)", spawnPath)
+		}
 	}
 
 	// Build the command to run in the new terminal

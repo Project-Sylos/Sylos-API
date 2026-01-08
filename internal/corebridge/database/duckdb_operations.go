@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"math"
 	"strings"
 
 	"github.com/rs/zerolog"
@@ -15,10 +14,10 @@ import (
 // sortField: field to sort by ("name", "path", "depth", "size", "type", "traversalStatus", etc.)
 // sortDir: sort direction ("asc" or "desc", defaults to "asc")
 // Returns items, pagination info, and stats (stats can be nil if calculation fails)
-func GetChildrenDiffsFromDuckDB(ctx context.Context, logger zerolog.Logger, duckdbConn *sql.DB, parentPath string, offset, limit int, foldersOnly bool, sortField, sortDir string) (map[string]PathNodes, PaginationInfo, *PathReviewStats, error) {
+func GetChildrenDiffsFromDuckDB(ctx context.Context, logger zerolog.Logger, duckdbConn *sql.DB, parentPath string, offset, limit int, foldersOnly bool, sortField, sortDir string) (map[string]PathNodes, PaginationInfo, error) {
 	// Check for context cancellation
 	if ctx.Err() != nil {
-		return map[string]PathNodes{}, PaginationInfo{}, nil, ctx.Err()
+		return map[string]PathNodes{}, PaginationInfo{}, ctx.Err()
 	}
 
 	// Build the query to get children from both src_nodes and dst_nodes
@@ -32,7 +31,7 @@ func GetChildrenDiffsFromDuckDB(ctx context.Context, logger zerolog.Logger, duck
 		WHERE parent_path = ?
 	),
 	dst_children AS (
-		SELECT path, parent_path, name, type, size, mtime, depth, traversal_status, copy_status, id, parent_id, service_id, parent_service_id
+		SELECT path, parent_path, name, type, size, mtime, depth, traversal_status, id, parent_id, service_id, parent_service_id
 		FROM dst_nodes
 		WHERE parent_path = ?
 	),
@@ -54,7 +53,6 @@ func GetChildrenDiffsFromDuckDB(ctx context.Context, logger zerolog.Logger, duck
 			s.traversal_status AS src_traversal_status,
 			d.traversal_status AS dst_traversal_status,
 			s.copy_status AS src_copy_status,
-			d.copy_status AS dst_copy_status,
 			s.id AS src_id,
 			d.id AS dst_id,
 			s.parent_id AS src_parent_id,
@@ -81,7 +79,7 @@ func GetChildrenDiffsFromDuckDB(ctx context.Context, logger zerolog.Logger, duck
 	// Execute query
 	rows, err := duckdbConn.QueryContext(ctx, query, parentPath, parentPath, limit, offset)
 	if err != nil {
-		return nil, PaginationInfo{}, nil, fmt.Errorf("failed to query DuckDB for children: %w", err)
+		return nil, PaginationInfo{}, fmt.Errorf("failed to query DuckDB for children: %w", err)
 	}
 	defer rows.Close()
 
@@ -90,7 +88,7 @@ func GetChildrenDiffsFromDuckDB(ctx context.Context, logger zerolog.Logger, duck
 
 	for rows.Next() {
 		if ctx.Err() != nil {
-			return nil, PaginationInfo{}, nil, ctx.Err()
+			return nil, PaginationInfo{}, ctx.Err()
 		}
 
 		var path, srcPath, dstPath sql.NullString
@@ -100,7 +98,7 @@ func GetChildrenDiffsFromDuckDB(ctx context.Context, logger zerolog.Logger, duck
 		var srcMtime, dstMtime sql.NullString
 		var srcDepth, dstDepth sql.NullInt64
 		var srcTraversalStatus, dstTraversalStatus sql.NullString
-		var srcCopyStatus, dstCopyStatus sql.NullString
+		var srcCopyStatus sql.NullString
 		var srcID, dstID sql.NullString
 		var srcParentID, dstParentID sql.NullString
 		var srcServiceID, dstServiceID sql.NullString
@@ -114,7 +112,7 @@ func GetChildrenDiffsFromDuckDB(ctx context.Context, logger zerolog.Logger, duck
 			&srcMtime, &dstMtime,
 			&srcDepth, &dstDepth,
 			&srcTraversalStatus, &dstTraversalStatus,
-			&srcCopyStatus, &dstCopyStatus,
+			&srcCopyStatus,
 			&srcID, &dstID,
 			&srcParentID, &dstParentID,
 			&srcServiceID, &dstServiceID,
@@ -164,7 +162,6 @@ func GetChildrenDiffsFromDuckDB(ctx context.Context, logger zerolog.Logger, duck
 				Type:            getStringValue(dstType),
 				Size:            getInt64Value(dstSize),
 				TraversalStatus: getStringValue(dstTraversalStatus),
-				CopyStatus:      getStringValue(dstCopyStatus),
 			}
 		}
 
@@ -172,69 +169,19 @@ func GetChildrenDiffsFromDuckDB(ctx context.Context, logger zerolog.Logger, duck
 	}
 
 	if err := rows.Err(); err != nil {
-		return nil, PaginationInfo{}, nil, fmt.Errorf("error iterating DuckDB rows: %w", err)
+		return nil, PaginationInfo{}, fmt.Errorf("error iterating DuckDB rows: %w", err)
 	}
 
-	// Get stats for all matching items (before pagination)
-	stats, err := GetChildrenDiffsStatsFromDuckDB(ctx, logger, duckdbConn, parentPath, foldersOnly)
+	total := 0
+	// do a sql query to get the total number of items
+	totalQuery := `SELECT COUNT(*) FROM (SELECT path FROM src_nodes WHERE parent_path = ? UNION SELECT path FROM dst_nodes WHERE parent_path = ?) AS all_children`
+	err = duckdbConn.QueryRowContext(ctx, totalQuery, parentPath, parentPath).Scan(&total)
 	if err != nil {
-		logger.Warn().Err(err).Msg("failed to get stats from DuckDB")
-		stats = nil // Continue without stats
-	}
-
-	// Get total count for pagination (can use stats if available)
-	var total int
-	if stats != nil {
-		total = stats.FoldersCount + stats.FilesCount
-	} else {
-		// Fallback to separate count query
-		totalQuery := `
-		SELECT COUNT(*) FROM (
-			SELECT path FROM src_nodes WHERE parent_path = ?
-			UNION
-			SELECT path FROM dst_nodes WHERE parent_path = ?
-		) AS all_children
-		`
-		if foldersOnly {
-			totalQuery = `
-			SELECT COUNT(*) FROM (
-				SELECT path FROM src_nodes WHERE parent_path = ? AND type = 'folder'
-				UNION
-				SELECT path FROM dst_nodes WHERE parent_path = ? AND type = 'folder'
-			) AS all_children
-			`
-		}
-
-		err = duckdbConn.QueryRowContext(ctx, totalQuery, parentPath, parentPath).Scan(&total)
-		if err != nil {
-			logger.Warn().Err(err).Msg("failed to get total count from DuckDB")
-			total = len(items) // Fallback to items count
-		}
+		return nil, PaginationInfo{}, fmt.Errorf("failed to get total count from DuckDB: %w", err)
 	}
 
 	// Get folders and files count from stats if available, otherwise count from paginated items
 	var foldersCount, filesCount int
-	if stats != nil {
-		foldersCount = stats.FoldersCount
-		filesCount = stats.FilesCount
-	} else {
-		// Count folders and files from paginated items (fallback)
-		for _, pn := range items {
-			if pn.Src != nil {
-				if pn.Src.Type == "folder" {
-					foldersCount++
-				} else {
-					filesCount++
-				}
-			} else if pn.Dst != nil {
-				if pn.Dst.Type == "folder" {
-					foldersCount++
-				} else {
-					filesCount++
-				}
-			}
-		}
-	}
 
 	pagination := PaginationInfo{
 		Offset:       offset,
@@ -245,94 +192,7 @@ func GetChildrenDiffsFromDuckDB(ctx context.Context, logger zerolog.Logger, duck
 		HasMore:      (offset + limit) < total,
 	}
 
-	return items, pagination, stats, nil
-}
-
-// GetChildrenDiffsStatsFromDuckDB calculates statistics for children matching the query (without pagination)
-// Uses the same base query as GetChildrenDiffsFromDuckDB but calculates stats instead of returning items
-func GetChildrenDiffsStatsFromDuckDB(ctx context.Context, logger zerolog.Logger, duckdbConn *sql.DB, parentPath string, foldersOnly bool) (*PathReviewStats, error) {
-	if ctx.Err() != nil {
-		return nil, ctx.Err()
-	}
-
-	// Query for counts and stats (same base structure as GetChildrenDiffsFromDuckDB)
-	statsQuery := `
-	WITH src_children AS (
-		SELECT path, type, size, traversal_status
-		FROM src_nodes
-		WHERE parent_path = ?
-	),
-	dst_children AS (
-		SELECT path, type, size, traversal_status
-		FROM dst_nodes
-		WHERE parent_path = ?
-	),
-	merged AS (
-		SELECT 
-			COALESCE(s.path, d.path) AS path,
-			COALESCE(s.type, d.type) AS type,
-			s.size AS src_size,
-			d.size AS dst_size,
-			COALESCE(s.traversal_status, d.traversal_status) AS traversal_status
-		FROM src_children s
-		FULL OUTER JOIN dst_children d ON s.path = d.path
-	)
-	`
-
-	if foldersOnly {
-		statsQuery += ` WHERE (type = 'folder' OR type IS NULL)`
-	}
-
-	statsQuery += `
-	SELECT 
-		COUNT(DISTINCT path) AS total_count,
-		COUNT(DISTINCT CASE WHEN type = 'folder' THEN path END) AS folders_count,
-		COUNT(DISTINCT CASE WHEN type = 'file' THEN path END) AS files_count,
-		COUNT(DISTINCT CASE WHEN traversal_status = 'pending' THEN path END) AS pending_count,
-		COUNT(DISTINCT CASE WHEN traversal_status = 'failed' THEN path END) AS failed_count,
-		COUNT(DISTINCT CASE WHEN traversal_status IN ('exclusion_explicit', 'exclusion_inherited') THEN path END) AS excluded_count,
-		COALESCE(SUM(CASE WHEN type = 'file' THEN src_size ELSE 0 END), 0) AS src_total_size,
-		COALESCE(SUM(CASE WHEN type = 'file' THEN dst_size ELSE 0 END), 0) AS dst_total_size
-	FROM merged
-	`
-
-	var totalCount, foldersCount, filesCount, pendingCount, failedCount, excludedCount int
-	var srcTotalSize, dstTotalSize int64
-
-	err := duckdbConn.QueryRowContext(ctx, statsQuery, parentPath, parentPath).Scan(
-		&totalCount,
-		&foldersCount,
-		&filesCount,
-		&pendingCount,
-		&failedCount,
-		&excludedCount,
-		&srcTotalSize,
-		&dstTotalSize,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get stats from DuckDB: %w", err)
-	}
-
-	// Calculate ratios (rounded to 2 decimal places)
-	var foldersRatio, filesRatio float64
-	if totalCount > 0 {
-		foldersRatio = math.Round(float64(foldersCount)/float64(totalCount)*10000) / 100
-		filesRatio = math.Round(float64(filesCount)/float64(totalCount)*10000) / 100
-	}
-
-	return &PathReviewStats{
-		PendingCount:  pendingCount,
-		FailedCount:   failedCount,
-		ExcludedCount: excludedCount,
-		FoldersCount:  foldersCount,
-		FilesCount:    filesCount,
-		FoldersRatio:  foldersRatio,
-		FilesRatio:    filesRatio,
-		TotalFileSize: FileSizeStats{
-			Src: srcTotalSize,
-			Dst: dstTotalSize,
-		},
-	}, nil
+	return items, pagination, nil
 }
 
 // FindNodePathByIDDuckDB finds the path of a node by its ULID in DuckDB
@@ -362,8 +222,10 @@ func FindNodePathByIDDuckDB(ctx context.Context, logger zerolog.Logger, duckdbCo
 }
 
 // SetNodeExclusionDuckDB sets the exclusion status for a node in DuckDB
-// Updates the immediate node's traversal_status, then triggers background propagation
+// For src nodes: updates both traversal_status and copy_status (exclusion primarily means "don't copy")
+// For dst nodes: only updates traversal_status (dst nodes don't have copy_status and shouldn't be excluded)
 // When excluding, sets immediate node to 'exclusion_explicit', children get 'exclusion_inherited' via propagation
+// If src node has a corresponding dst node, also updates the dst node's traversal_status
 func SetNodeExclusionDuckDB(ctx context.Context, logger zerolog.Logger, duckdbConn *sql.DB, nodePath string, excluded bool) error {
 	// Determine the new status
 	// For exclusion: immediate node gets 'exclusion_explicit', children get 'exclusion_inherited' via propagation
@@ -373,30 +235,16 @@ func SetNodeExclusionDuckDB(ctx context.Context, logger zerolog.Logger, duckdbCo
 		newStatus = "exclusion_explicit"
 	}
 
-	// Update the immediate node's traversal_status
-	// First, try to update in src_nodes
+	// Update src_nodes: both traversal_status and copy_status
+	// This is the primary use case - exclusion means "don't copy this src item to dst"
 	updateSrcQuery := `
 	UPDATE src_nodes 
-	SET traversal_status = ?
+	SET traversal_status = ?, copy_status = ?
 	WHERE path = ?
 	`
-	result, err := duckdbConn.ExecContext(ctx, updateSrcQuery, newStatus, nodePath)
+	_, err := duckdbConn.ExecContext(ctx, updateSrcQuery, newStatus, newStatus, nodePath)
 	if err != nil {
 		return fmt.Errorf("failed to update src_nodes: %w", err)
-	}
-
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected == 0 {
-		// Try dst_nodes
-		updateDstQuery := `
-		UPDATE dst_nodes 
-		SET traversal_status = ?
-		WHERE path = ?
-		`
-		_, err = duckdbConn.ExecContext(ctx, updateDstQuery, newStatus, nodePath)
-		if err != nil {
-			return fmt.Errorf("failed to update dst_nodes: %w", err)
-		}
 	}
 
 	logger.Info().
@@ -414,6 +262,8 @@ func SetNodeExclusionDuckDB(ctx context.Context, logger zerolog.Logger, duckdbCo
 // PropagateExclusionDuckDB propagates exclusion status to all children in DuckDB
 // This runs in a background goroutine
 // Uses path prefix matching to update all descendants in a single query
+// For src_nodes: updates both traversal_status and copy_status (exclusion means "don't copy")
+// For dst_nodes: only updates traversal_status (for consistency, though dst nodes don't need exclusion)
 func PropagateExclusionDuckDB(ctx context.Context, logger zerolog.Logger, duckdbConn *sql.DB, parentPath string, excluded bool) error {
 	newStatus := "pending"
 	if excluded {
@@ -425,13 +275,14 @@ func PropagateExclusionDuckDB(ctx context.Context, logger zerolog.Logger, duckdb
 	// The trailing '/' ensures we only match direct children and descendants, not siblings
 	// Example: excluding "/root/folder_1" will match "/root/folder_1/child" but NOT "/root/folder_10"
 	// DuckDB supports STARTS_WITH function for safer prefix matching
-	updateQuery := `
+	// Update both traversal_status and copy_status for src_nodes
+	updateSrcQuery := `
 	UPDATE src_nodes 
-	SET traversal_status = ?
+	SET traversal_status = ?, copy_status = ?
 	WHERE STARTS_WITH(path, ? || '/')
 	`
 
-	result, err := duckdbConn.ExecContext(ctx, updateQuery, newStatus, parentPath)
+	result, err := duckdbConn.ExecContext(ctx, updateSrcQuery, newStatus, newStatus, parentPath)
 	if err != nil {
 		return fmt.Errorf("failed to propagate exclusion in src_nodes: %w", err)
 	}
@@ -441,33 +292,14 @@ func PropagateExclusionDuckDB(ctx context.Context, logger zerolog.Logger, duckdb
 		Str("parent_path", parentPath).
 		Bool("excluded", excluded).
 		Int64("src_rows_affected", srcRowsAffected).
-		Msg("propagated exclusion to src_nodes children")
-
-	// Also update dst_nodes
-	updateDstQuery := `
-	UPDATE dst_nodes 
-	SET traversal_status = ?
-	WHERE STARTS_WITH(path, ? || '/')
-	`
-
-	result, err = duckdbConn.ExecContext(ctx, updateDstQuery, newStatus, parentPath)
-	if err != nil {
-		return fmt.Errorf("failed to propagate exclusion in dst_nodes: %w", err)
-	}
-
-	dstRowsAffected, _ := result.RowsAffected()
-	logger.Info().
-		Str("parent_path", parentPath).
-		Bool("excluded", excluded).
-		Int64("dst_rows_affected", dstRowsAffected).
-		Msg("propagated exclusion to dst_nodes children")
+		Msg("propagated exclusion to src_nodes children (traversal_status and copy_status)")
 
 	return nil
 }
 
 // MarkNodeForRetryDuckDB marks a node for retry in DuckDB
 // For src nodes: marks the src node as pending, and if it has a corresponding dst node,
-// marks all dst children with NotOnSrc status as pending too.
+// marks all dst children with not_on_src status as pending too.
 // For dst nodes: just marks the dst node as pending.
 func MarkNodeForRetryDuckDB(ctx context.Context, logger zerolog.Logger, duckdbConn *sql.DB, nodePath string) error {
 	// First, determine if this is a src or dst node and get the corresponding node info
@@ -501,7 +333,7 @@ func MarkNodeForRetryDuckDB(ctx context.Context, logger zerolog.Logger, duckdbCo
 		updateSrcQuery := `
 		UPDATE src_nodes 
 		SET traversal_status = 'pending'
-		WHERE path = ? AND traversal_status = 'failed'
+		WHERE path = ?
 		`
 		result, err := duckdbConn.ExecContext(ctx, updateSrcQuery, nodePath)
 		if err != nil {
@@ -522,11 +354,11 @@ func MarkNodeForRetryDuckDB(ctx context.Context, logger zerolog.Logger, duckdbCo
 			getDstPathQuery := `SELECT path FROM dst_nodes WHERE id = ? LIMIT 1`
 			err = duckdbConn.QueryRowContext(ctx, getDstPathQuery, dstID.String).Scan(&dstPath)
 			if err == nil {
-				// Mark all dst children with NotOnSrc status as pending
+				// Mark all dst children with not_on_src status as pending
 				updateDstChildrenQuery := `
 				UPDATE dst_nodes 
 				SET traversal_status = 'pending'
-				WHERE parent_path = ? AND traversal_status = 'NotOnSrc'
+				WHERE parent_path = ? AND traversal_status = 'not_on_src'
 				`
 				result, err = duckdbConn.ExecContext(ctx, updateDstChildrenQuery, dstPath)
 				if err != nil {
@@ -540,7 +372,7 @@ func MarkNodeForRetryDuckDB(ctx context.Context, logger zerolog.Logger, duckdbCo
 						Str("src_path", nodePath).
 						Str("dst_path", dstPath).
 						Int64("dst_children_updated", dstChildrenAffected).
-						Msg("marked dst children with NotOnSrc status as pending for retry")
+						Msg("marked dst children with not_on_src status as pending for retry")
 				}
 			} else if err != sql.ErrNoRows {
 				logger.Warn().
@@ -559,7 +391,7 @@ func MarkNodeForRetryDuckDB(ctx context.Context, logger zerolog.Logger, duckdbCo
 		updateDstQuery := `
 		UPDATE dst_nodes 
 		SET traversal_status = 'pending'
-		WHERE path = ? AND traversal_status = 'failed'
+		WHERE path = ?
 		`
 		result, err := duckdbConn.ExecContext(ctx, updateDstQuery, nodePath)
 		if err != nil {
@@ -653,9 +485,10 @@ func MarkAllFailedAsExcludedDuckDB(ctx context.Context, logger zerolog.Logger, d
 	}
 
 	// Step 3: Mark all failed items as exclusion_explicit
+	// For src_nodes: update both traversal_status and copy_status (exclusion means "don't copy")
 	updateSrcQuery := `
 	UPDATE src_nodes 
-	SET traversal_status = 'exclusion_explicit'
+	SET traversal_status = 'exclusion_explicit', copy_status = 'exclusion_explicit'
 	WHERE traversal_status = 'failed'
 	`
 	result, err := duckdbConn.ExecContext(ctx, updateSrcQuery)
@@ -664,6 +497,7 @@ func MarkAllFailedAsExcludedDuckDB(ctx context.Context, logger zerolog.Logger, d
 	}
 	srcRowsAffected, _ := result.RowsAffected()
 
+	// For dst_nodes: only update traversal_status (dst nodes don't have copy_status)
 	updateDstQuery := `
 	UPDATE dst_nodes 
 	SET traversal_status = 'exclusion_explicit'
@@ -704,7 +538,7 @@ func MarkAllFailedAsExcludedDuckDB(ctx context.Context, logger zerolog.Logger, d
 // This function:
 // 1. Marks all failed items in src_nodes from 'failed' → 'pending'
 // 2. For each src node with a dst_id, finds the corresponding dst node path
-// 3. Marks all dst children with NotOnSrc status as pending
+// 3. Marks all dst children with not_on_src status as pending
 func RetryAllFailedDuckDB(ctx context.Context, logger zerolog.Logger, duckdbConn *sql.DB) error {
 	// Check for context cancellation
 	if ctx.Err() != nil {
@@ -728,7 +562,7 @@ func RetryAllFailedDuckDB(ctx context.Context, logger zerolog.Logger, duckdbConn
 		Msg("marked all failed src nodes as pending")
 
 	// Step 2: For all src nodes that now have 'pending' status and have a dst_id,
-	// find their corresponding dst paths and mark dst children with NotOnSrc as pending
+	// find their corresponding dst paths and mark dst children with not_on_src as pending
 	// Use a CTE to batch process this efficiently
 	updateDstChildrenQuery := `
 	WITH src_with_dst AS (
@@ -742,7 +576,7 @@ func RetryAllFailedDuckDB(ctx context.Context, logger zerolog.Logger, duckdbConn
 	UPDATE dst_nodes
 	SET traversal_status = 'pending'
 	WHERE parent_path IN (SELECT dst_path FROM src_with_dst)
-	  AND traversal_status = 'NotOnSrc'
+	  AND traversal_status = 'not_on_src'
 	`
 
 	result, err = duckdbConn.ExecContext(ctx, updateDstChildrenQuery)
@@ -753,42 +587,131 @@ func RetryAllFailedDuckDB(ctx context.Context, logger zerolog.Logger, duckdbConn
 	dstRowsAffected, _ := result.RowsAffected()
 	logger.Info().
 		Int64("dst_children_rows_affected", dstRowsAffected).
-		Msg("marked dst children with NotOnSrc status as pending for retry")
+		Msg("marked dst children with not_on_src status as pending for retry")
 
 	return nil
 }
 
 // UnmarkNodeForRetryDuckDB unmarks a node for retry in DuckDB
+// For src nodes: marks the src node as failed, and if it has a corresponding dst node,
+// marks all dst children with pending status as not_on_src again.
+// For dst nodes: just marks the dst node as failed
 func UnmarkNodeForRetryDuckDB(ctx context.Context, logger zerolog.Logger, duckdbConn *sql.DB, nodePath string) error {
-	// Update traversal_status from "pending" back to "failed"
-	updateQuery := `
-	UPDATE src_nodes 
-	SET traversal_status = 'failed'
-	WHERE path = ? AND traversal_status = 'pending'
-	`
+	// First, determine if this is a src or dst node and get the corresponding node info
+	var isSrc bool
+	var dstID sql.NullString
+	var srcID sql.NullString
 
-	result, err := duckdbConn.ExecContext(ctx, updateQuery, nodePath)
-	if err != nil {
-		return fmt.Errorf("failed to unmark node for retry in src_nodes: %w", err)
+	// Check src_nodes first
+	checkSrcQuery := `SELECT id, dst_id FROM src_nodes WHERE path = ? LIMIT 1`
+	err := duckdbConn.QueryRowContext(ctx, checkSrcQuery, nodePath).Scan(&srcID, &dstID)
+	if err == nil {
+		isSrc = true
+	} else if err != sql.ErrNoRows {
+		return fmt.Errorf("failed to check src_nodes: %w", err)
+	} else {
+		// Not in src_nodes, check dst_nodes
+		checkDstQuery := `SELECT id, src_id FROM dst_nodes WHERE path = ? LIMIT 1`
+		var dstIDForCheck sql.NullString
+		err = duckdbConn.QueryRowContext(ctx, checkDstQuery, nodePath).Scan(&dstIDForCheck, &srcID)
+		if err != nil {
+			if err == sql.ErrNoRows {
+				return fmt.Errorf("node with path %s not found in src_nodes or dst_nodes", nodePath)
+			}
+			return fmt.Errorf("failed to check dst_nodes: %w", err)
+		}
+		isSrc = false
 	}
 
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected == 0 {
-		// Try dst_nodes
+	if isSrc {
+		// Update src node from "pending" to "failed"
+		updateSrcQuery := `
+		UPDATE src_nodes 
+		SET traversal_status = 'failed'
+		WHERE path = ?
+		`
+		result, err := duckdbConn.ExecContext(ctx, updateSrcQuery, nodePath)
+		if err != nil {
+			return fmt.Errorf("failed to unmark src node for retry: %w", err)
+		}
+
+		srcRowsAffected, _ := result.RowsAffected()
+		if srcRowsAffected == 0 {
+			logger.Warn().
+				Str("node_path", nodePath).
+				Msg("src node not found or not in 'pending' status")
+		}
+
+		// If src node has a corresponding dst node, mark its children (that are pending) as not_on_src again
+		if dstID.Valid && dstID.String != "" {
+			// Find the dst node path using dst_id
+			var dstPath string
+			getDstPathQuery := `SELECT path FROM dst_nodes WHERE id = ? LIMIT 1`
+			err = duckdbConn.QueryRowContext(ctx, getDstPathQuery, dstID.String).Scan(&dstPath)
+			if err == nil {
+				// Mark all dst children with pending status as not_on_src again
+				updateDstChildrenQuery := `
+				UPDATE dst_nodes 
+				SET traversal_status = 'not_on_src'
+				WHERE parent_path = ? AND traversal_status = 'pending'
+				`
+				result, err = duckdbConn.ExecContext(ctx, updateDstChildrenQuery, dstPath)
+				if err != nil {
+					logger.Warn().
+						Err(err).
+						Str("dst_path", dstPath).
+						Msg("failed to update dst children for unmark retry")
+				} else {
+					dstChildrenAffected, _ := result.RowsAffected()
+					if dstChildrenAffected > 0 {
+						logger.Info().
+							Str("src_path", nodePath).
+							Str("dst_path", dstPath).
+							Int64("dst_children_updated", dstChildrenAffected).
+							Msg("marked dst children back to not_on_src status")
+					}
+				}
+			} else if err != sql.ErrNoRows {
+				logger.Warn().
+					Err(err).
+					Str("dst_id", dstID.String).
+					Msg("failed to find corresponding dst node path")
+			}
+		}
+
+		// If no rows were affected in src_nodes, the node is not in pending status
+		if srcRowsAffected == 0 {
+			return fmt.Errorf("node is not in pending status, cannot unmark for retry")
+		}
+
+		logger.Info().
+			Str("node_path", nodePath).
+			Int64("src_rows_affected", srcRowsAffected).
+			Bool("is_src", true).
+			Msg("unmarked src node for retry in DuckDB")
+	} else {
+		// For dst nodes, just mark the node as failed
 		updateDstQuery := `
 		UPDATE dst_nodes 
 		SET traversal_status = 'failed'
-		WHERE path = ? AND traversal_status = 'pending'
+		WHERE path = ?
 		`
-		_, err = duckdbConn.ExecContext(ctx, updateDstQuery, nodePath)
+		result, err := duckdbConn.ExecContext(ctx, updateDstQuery, nodePath)
 		if err != nil {
-			return fmt.Errorf("failed to unmark node for retry in dst_nodes: %w", err)
+			return fmt.Errorf("failed to unmark dst node for retry: %w", err)
 		}
-	}
 
-	logger.Info().
-		Str("node_path", nodePath).
-		Msg("unmarked node for retry in DuckDB")
+		dstRowsAffected, _ := result.RowsAffected()
+		if dstRowsAffected == 0 {
+			return fmt.Errorf("node is not in pending status, cannot unmark for retry")
+		}
+
+		logger.Info().
+			Str("node_path", nodePath).
+			Int64("dst_rows_affected", dstRowsAffected).
+			Bool("is_src", false).
+			Msg("unmarked dst node for retry in DuckDB")
+	}
 
 	return nil
 }
@@ -903,14 +826,18 @@ type SearchCondition struct {
 // Returns all nodes (not just children of a specific path) that match the conditions
 // For path and name fields, uses LIKE '%value%' for substring matching
 // Uses two-phase approach: first paginate paths (entities), then join data
-func SearchPathReviewItemsDuckDB(ctx context.Context, logger zerolog.Logger, duckdbConn *sql.DB, conditions []SearchCondition, offset, limit int, sortField, sortDir string) (map[string]PathNodes, PaginationInfo, *PathReviewStats, error) {
+// statusSearchType specifies which status type(s) to search by when using status conditions: "traversal", "copy", or "both" (default: "both")
+func SearchPathReviewItemsDuckDB(ctx context.Context, logger zerolog.Logger, duckdbConn *sql.DB, conditions []SearchCondition, offset, limit int, sortField, sortDir string, statusSearchType string) (map[string]PathNodes, PaginationInfo, error) {
 	// Check for context cancellation
 	if ctx.Err() != nil {
-		return map[string]PathNodes{}, PaginationInfo{}, nil, ctx.Err()
+		return map[string]PathNodes{}, PaginationInfo{}, ctx.Err()
 	}
 
+	// Normalize statusSearchType: default to "both" if empty or invalid
+	normalizedStatusType := normalizeStatusSearchType(statusSearchType)
+
 	// Build WHERE clause filters for path selection phase (using EXISTS)
-	pathFilterClause, pathFilterArgs := buildPathFilterClause(conditions)
+	pathFilterClause, pathFilterArgs := buildPathFilterClause(conditions, normalizedStatusType)
 
 	// For path selection (Phase A), we can only sort by path itself
 	// For other sort fields, we'll sort after the join in Phase B
@@ -920,9 +847,8 @@ func SearchPathReviewItemsDuckDB(ctx context.Context, logger zerolog.Logger, duc
 	}
 	pathOrderBy := "path " + direction
 
-	// Phase A: Get unique paths with filters applied and pagination
-	// This ensures correct pagination on entities (paths), not joined rows
-	query := `
+	// Build the core query (with pagination)
+	mainQuery := `
 	WITH all_paths AS (
 		SELECT DISTINCT path FROM src_nodes
 		UNION
@@ -972,7 +898,22 @@ func SearchPathReviewItemsDuckDB(ctx context.Context, logger zerolog.Logger, duc
 	)
 	SELECT * FROM merged`
 
+	// Build the total count query (with SAME FILTERS as main, but without limit/offset)
+	totalQuery := `
+	WITH all_paths AS (
+		SELECT DISTINCT path FROM src_nodes
+		UNION
+		SELECT DISTINCT path FROM dst_nodes
+	),
+	filtered_paths AS (
+		SELECT path
+		FROM all_paths
+		WHERE path != '/'` + pathFilterClause + `
+	)
+	SELECT COUNT(*) FROM filtered_paths`
+
 	// If sorting by a field other than path, apply final sort after join
+	query := mainQuery
 	if sortField != "" && sortField != "path" {
 		finalOrderBy := buildOrderByClause(sortField, sortDir)
 		query += " ORDER BY " + finalOrderBy
@@ -983,10 +924,10 @@ func SearchPathReviewItemsDuckDB(ctx context.Context, logger zerolog.Logger, duc
 	// Build args: pathFilterArgs, then limit, offset
 	args := append(pathFilterArgs, limit, offset)
 
-	// Execute query
+	// Execute query for results
 	rows, err := duckdbConn.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, PaginationInfo{}, nil, fmt.Errorf("failed to query DuckDB for search: %w", err)
+		return nil, PaginationInfo{}, fmt.Errorf("failed to query DuckDB for search: %w", err)
 	}
 	defer rows.Close()
 
@@ -995,7 +936,7 @@ func SearchPathReviewItemsDuckDB(ctx context.Context, logger zerolog.Logger, duc
 
 	for rows.Next() {
 		if ctx.Err() != nil {
-			return nil, PaginationInfo{}, nil, ctx.Err()
+			return nil, PaginationInfo{}, ctx.Err()
 		}
 
 		var path, srcPath, dstPath sql.NullString
@@ -1027,7 +968,7 @@ func SearchPathReviewItemsDuckDB(ctx context.Context, logger zerolog.Logger, duc
 			&srcParentServiceID, &dstParentServiceID,
 		)
 		if err != nil {
-			return nil, PaginationInfo{}, nil, fmt.Errorf("failed to scan row: %w", err)
+			return nil, PaginationInfo{}, fmt.Errorf("failed to scan row: %w", err)
 		}
 
 		// Build path key (use path from result)
@@ -1076,46 +1017,19 @@ func SearchPathReviewItemsDuckDB(ctx context.Context, logger zerolog.Logger, duc
 	}
 
 	if err := rows.Err(); err != nil {
-		return nil, PaginationInfo{}, nil, fmt.Errorf("error iterating DuckDB rows: %w", err)
+		return nil, PaginationInfo{}, fmt.Errorf("error iterating DuckDB rows: %w", err)
 	}
 
-	// Get stats for all matching items (before pagination)
-	stats, err := SearchPathReviewStatsDuckDB(ctx, logger, duckdbConn, conditions)
+	total := 0
+
+	// Get total count for pagination (same filters as the paged query)
+	err = duckdbConn.QueryRowContext(ctx, totalQuery, pathFilterArgs...).Scan(&total)
 	if err != nil {
-		logger.Warn().Err(err).Msg("failed to get stats from DuckDB search")
-		stats = nil // Continue without stats
-	}
-
-	// Get total count for pagination
-	var total int
-	if stats != nil {
-		total = stats.FoldersCount + stats.FilesCount
-	} else {
-		// Fallback: count items in current page (approximation)
-		total = len(items)
+		return nil, PaginationInfo{}, fmt.Errorf("failed to get total count from DuckDB: %w", err)
 	}
 
 	// Count folders and files from items or stats
 	var totalFolders, totalFiles int
-	if stats != nil {
-		totalFolders = stats.FoldersCount
-		totalFiles = stats.FilesCount
-	} else {
-		// Count from items
-		for _, pn := range items {
-			typ := ""
-			if pn.Src != nil {
-				typ = pn.Src.Type
-			} else if pn.Dst != nil {
-				typ = pn.Dst.Type
-			}
-			if typ == "folder" {
-				totalFolders++
-			} else if typ == "file" {
-				totalFiles++
-			}
-		}
-	}
 
 	hasMore := offset+limit < total
 
@@ -1128,7 +1042,7 @@ func SearchPathReviewItemsDuckDB(ctx context.Context, logger zerolog.Logger, duc
 		HasMore:      hasMore,
 	}
 
-	return items, pagination, stats, nil
+	return items, pagination, nil
 }
 
 // buildSearchWhereClause builds a WHERE clause from search conditions
@@ -1185,10 +1099,27 @@ func buildStatsWhereClause(conditions []SearchCondition) (string, []any) {
 	return strings.Join(clauses, " AND "), args
 }
 
+// normalizeStatusSearchType normalizes the status search type value
+// Returns "traversal", "copy", or "both" (default: "both")
+func normalizeStatusSearchType(statusType string) string {
+	statusType = strings.ToLower(strings.TrimSpace(statusType))
+	switch statusType {
+	case "traversal":
+		return "traversal"
+	case "copy":
+		return "copy"
+	case "both":
+		return "both"
+	default:
+		return "both" // Default to both if empty or invalid
+	}
+}
+
 // buildPathFilterClause builds EXISTS-based WHERE clause filters for path selection phase
 // Returns SQL clause and arguments for filtering paths before pagination
 // Uses EXISTS to check conditions against src_nodes and/or dst_nodes
-func buildPathFilterClause(conditions []SearchCondition) (string, []any) {
+// statusSearchType specifies which status type(s) to check: "traversal", "copy", or "both"
+func buildPathFilterClause(conditions []SearchCondition, statusSearchType string) (string, []any) {
 	if len(conditions) == 0 {
 		return "", nil
 	}
@@ -1197,7 +1128,7 @@ func buildPathFilterClause(conditions []SearchCondition) (string, []any) {
 	var args []any
 
 	for _, cond := range conditions {
-		clause, clauseArgs := buildPathFilterCondition(cond)
+		clause, clauseArgs := buildPathFilterCondition(cond, statusSearchType)
 		if clause != "" {
 			clauses = append(clauses, clause)
 			args = append(args, clauseArgs...)
@@ -1214,8 +1145,22 @@ func buildPathFilterClause(conditions []SearchCondition) (string, []any) {
 
 // buildPathFilterCondition builds an EXISTS-based condition for path filtering
 // Returns SQL that checks if a path exists in src_nodes OR dst_nodes matching the condition
-func buildPathFilterCondition(cond SearchCondition) (string, []any) {
+// statusSearchType specifies which status type(s) to check: "traversal", "copy", or "both"
+// If statusSearchType is "traversal", only traversalStatus conditions are processed
+// If statusSearchType is "copy", only copyStatus conditions are processed
+// If statusSearchType is "both", both traversalStatus and copyStatus conditions are processed
+func buildPathFilterCondition(cond SearchCondition, statusSearchType string) (string, []any) {
 	valueStr := fmt.Sprintf("%v", cond.Value)
+
+	// Filter status conditions based on statusSearchType
+	if cond.Field == "traversalStatus" && statusSearchType == "copy" {
+		// Skip traversalStatus conditions when only searching by copy status
+		return "", nil
+	}
+	if cond.Field == "copyStatus" && statusSearchType == "traversal" {
+		// Skip copyStatus conditions when only searching by traversal status
+		return "", nil
+	}
 
 	switch cond.Field {
 	case "path":
@@ -1242,36 +1187,12 @@ func buildPathFilterCondition(cond SearchCondition) (string, []any) {
 	case "traversalStatus":
 		// Traversal status filter: case-insensitive exact match
 		// Special handling: "excluded" matches both "exclusion_explicit" and "exclusion_inherited"
-		valueUpper := strings.ToUpper(valueStr)
-		if valueUpper == "EXCLUDED" {
-			// Match both exclusion types
-			return `(
-				EXISTS (SELECT 1 FROM src_nodes s WHERE s.path = all_paths.path AND UPPER(s.traversal_status) IN ('EXCLUSION_EXPLICIT', 'EXCLUSION_INHERITED'))
-				OR EXISTS (SELECT 1 FROM dst_nodes d WHERE d.path = all_paths.path AND UPPER(d.traversal_status) IN ('EXCLUSION_EXPLICIT', 'EXCLUSION_INHERITED'))
-			)`, []any{}
-		}
-		// Regular exact match for other statuses
-		return `(
-			EXISTS (SELECT 1 FROM src_nodes s WHERE s.path = all_paths.path AND UPPER(s.traversal_status) = UPPER(?))
-			OR EXISTS (SELECT 1 FROM dst_nodes d WHERE d.path = all_paths.path AND UPPER(d.traversal_status) = UPPER(?))
-		)`, []any{valueStr, valueStr}
+		return buildTraversalStatusFilter(valueStr)
 
 	case "copyStatus":
 		// Copy status filter: case-insensitive exact match
 		// Special handling: "excluded" matches both "exclusion_explicit" and "exclusion_inherited"
-		valueUpper := strings.ToUpper(valueStr)
-		if valueUpper == "EXCLUDED" {
-			// Match both exclusion types
-			return `(
-				EXISTS (SELECT 1 FROM src_nodes s WHERE s.path = all_paths.path AND UPPER(s.copy_status) IN ('EXCLUSION_EXPLICIT', 'EXCLUSION_INHERITED'))
-				OR EXISTS (SELECT 1 FROM dst_nodes d WHERE d.path = all_paths.path AND UPPER(d.copy_status) IN ('EXCLUSION_EXPLICIT', 'EXCLUSION_INHERITED'))
-			)`, []any{}
-		}
-		// Regular exact match for other statuses
-		return `(
-			EXISTS (SELECT 1 FROM src_nodes s WHERE s.path = all_paths.path AND UPPER(s.copy_status) = UPPER(?))
-			OR EXISTS (SELECT 1 FROM dst_nodes d WHERE d.path = all_paths.path AND UPPER(d.copy_status) = UPPER(?))
-		)`, []any{valueStr, valueStr}
+		return buildCopyStatusFilter(valueStr)
 
 	case "depth":
 		// Depth filter: numeric comparison (only available in src_nodes/dst_nodes, use OR logic)
@@ -1345,6 +1266,40 @@ func buildPathFilterCondition(cond SearchCondition) (string, []any) {
 	}
 
 	return "", nil // Unknown field, skip
+}
+
+// buildTraversalStatusFilter builds a filter for traversal status
+func buildTraversalStatusFilter(valueStr string) (string, []any) {
+	valueUpper := strings.ToUpper(valueStr)
+	if valueUpper == "EXCLUDED" {
+		// Match both exclusion types
+		return `(
+			EXISTS (SELECT 1 FROM src_nodes s WHERE s.path = all_paths.path AND UPPER(s.traversal_status) IN ('EXCLUSION_EXPLICIT', 'EXCLUSION_INHERITED'))
+			OR EXISTS (SELECT 1 FROM dst_nodes d WHERE d.path = all_paths.path AND UPPER(d.traversal_status) IN ('EXCLUSION_EXPLICIT', 'EXCLUSION_INHERITED'))
+		)`, []any{}
+	}
+	// Regular exact match for other statuses
+	return `(
+		EXISTS (SELECT 1 FROM src_nodes s WHERE s.path = all_paths.path AND UPPER(s.traversal_status) = UPPER(?))
+		OR EXISTS (SELECT 1 FROM dst_nodes d WHERE d.path = all_paths.path AND UPPER(d.traversal_status) = UPPER(?))
+	)`, []any{valueStr, valueStr}
+}
+
+// buildCopyStatusFilter builds a filter for copy status
+func buildCopyStatusFilter(valueStr string) (string, []any) {
+	valueUpper := strings.ToUpper(valueStr)
+	if valueUpper == "EXCLUDED" {
+		// Match both exclusion types
+		return `(
+			EXISTS (SELECT 1 FROM src_nodes s WHERE s.path = all_paths.path AND UPPER(s.copy_status) IN ('EXCLUSION_EXPLICIT', 'EXCLUSION_INHERITED'))
+			OR EXISTS (SELECT 1 FROM dst_nodes d WHERE d.path = all_paths.path AND UPPER(d.copy_status) IN ('EXCLUSION_EXPLICIT', 'EXCLUSION_INHERITED'))
+		)`, []any{}
+	}
+	// Regular exact match for other statuses
+	return `(
+		EXISTS (SELECT 1 FROM src_nodes s WHERE s.path = all_paths.path AND UPPER(s.copy_status) = UPPER(?))
+		OR EXISTS (SELECT 1 FROM dst_nodes d WHERE d.path = all_paths.path AND UPPER(d.copy_status) = UPPER(?))
+	)`, []any{valueStr, valueStr}
 }
 
 // buildConditionClause builds a SQL condition clause for a single SearchCondition
@@ -1437,83 +1392,30 @@ func buildConditionClause(cond SearchCondition, isStatsQuery bool) (string, []an
 	}
 }
 
-// SearchPathReviewStatsDuckDB calculates statistics for search results matching the conditions
-func SearchPathReviewStatsDuckDB(ctx context.Context, logger zerolog.Logger, duckdbConn *sql.DB, conditions []SearchCondition) (*PathReviewStats, error) {
+// CountPendingRetriesDuckDB counts the number of pending items in DuckDB
+// Returns the total count of items with traversal_status = 'pending' across both src_nodes and dst_nodes
+func CountPendingRetriesDuckDB(ctx context.Context, logger zerolog.Logger, duckdbConn *sql.DB) (int, error) {
+	// Check for context cancellation
 	if ctx.Err() != nil {
-		return nil, ctx.Err()
+		return 0, ctx.Err()
 	}
 
-	// Build the same base query as SearchPathReviewItemsDuckDB but for stats
-	// Include name field so we can filter by name in stats as well
-	statsQuery := `
-	WITH merged AS (
-		SELECT 
-			COALESCE(s.path, d.path) AS path,
-			COALESCE(s.name, d.name) AS name,
-			COALESCE(s.type, d.type) AS type,
-			s.size AS src_size,
-			d.size AS dst_size,
-			COALESCE(s.traversal_status, d.traversal_status) AS traversal_status
-		FROM src_nodes s
-		FULL OUTER JOIN dst_nodes d ON s.path = d.path
-	)
-	SELECT 
-		COUNT(DISTINCT path) AS total_count,
-		COUNT(DISTINCT CASE WHEN type = 'folder' THEN path END) AS folders_count,
-		COUNT(DISTINCT CASE WHEN type = 'file' THEN path END) AS files_count,
-		COUNT(DISTINCT CASE WHEN traversal_status = 'pending' THEN path END) AS pending_count,
-		COUNT(DISTINCT CASE WHEN traversal_status = 'failed' THEN path END) AS failed_count,
-		COUNT(DISTINCT CASE WHEN traversal_status IN ('exclusion_explicit', 'exclusion_inherited') THEN path END) AS excluded_count,
-		COALESCE(SUM(CASE WHEN type = 'file' THEN src_size ELSE 0 END), 0) AS src_total_size,
-		COALESCE(SUM(CASE WHEN type = 'file' THEN dst_size ELSE 0 END), 0) AS dst_total_size
-	FROM merged
+	// Count items with 'pending' traversal_status from both src_nodes and dst_nodes
+	// Use UNION to get unique paths, then count
+	query := `
+	SELECT COUNT(DISTINCT path) 
+	FROM (
+		SELECT path FROM src_nodes WHERE traversal_status = 'pending'
+		UNION
+		SELECT path FROM dst_nodes WHERE traversal_status = 'pending'
+	) AS pending_paths
 	`
 
-	// Build WHERE clause from conditions (using stats-specific field names)
-	whereClause, args := buildStatsWhereClause(conditions)
-
-	// Always exclude root item (path = '/')
-	whereConditions := []string{"path != '/'"}
-	if whereClause != "" {
-		whereConditions = append(whereConditions, whereClause)
-	}
-	statsQuery += " WHERE " + strings.Join(whereConditions, " AND ")
-
-	var totalCount, foldersCount, filesCount, pendingCount, failedCount, excludedCount int
-	var srcTotalSize, dstTotalSize int64
-
-	err := duckdbConn.QueryRowContext(ctx, statsQuery, args...).Scan(
-		&totalCount,
-		&foldersCount,
-		&filesCount,
-		&pendingCount,
-		&failedCount,
-		&excludedCount,
-		&srcTotalSize,
-		&dstTotalSize,
-	)
+	var count int
+	err := duckdbConn.QueryRowContext(ctx, query).Scan(&count)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get stats from DuckDB: %w", err)
+		return 0, fmt.Errorf("failed to count pending retries: %w", err)
 	}
 
-	// Calculate ratios (rounded to 2 decimal places)
-	var foldersRatio, filesRatio float64
-	if totalCount > 0 {
-		foldersRatio = math.Round(float64(foldersCount)/float64(totalCount)*10000) / 100
-		filesRatio = math.Round(float64(filesCount)/float64(totalCount)*10000) / 100
-	}
-
-	return &PathReviewStats{
-		PendingCount:  pendingCount,
-		FailedCount:   failedCount,
-		ExcludedCount: excludedCount,
-		FoldersCount:  foldersCount,
-		FilesCount:    filesCount,
-		FoldersRatio:  foldersRatio,
-		FilesRatio:    filesRatio,
-		TotalFileSize: FileSizeStats{
-			Src: srcTotalSize,
-			Dst: dstTotalSize,
-		},
-	}, nil
+	return count, nil
 }

@@ -330,6 +330,7 @@ Get real-time queue statistics for a running migration.
 **Response (200 OK):**
 ```json
 {
+  "success": true,
   "srcTraversal": {
     "name": "src",
     "round": 3,
@@ -337,10 +338,9 @@ Get real-time queue statistics for a running migration.
     "inProgress": 8,
     "totalTracked": 50,
     "workers": 4,
-    "averageExecutionTime": 125000000,
-    "tasksPerSecond": 12.5,
-    "totalCompleted": 1250,
-    "lastPollTime": "2025-01-15T10:30:45.123456Z"
+    "files_discovered_total": 5420,
+    "folders_discovered_total": 1230,
+    "discovery_rate_items_per_sec": 45.3
   },
   "dstTraversal": {
     "name": "dst",
@@ -349,10 +349,9 @@ Get real-time queue statistics for a running migration.
     "inProgress": 3,
     "totalTracked": 18,
     "workers": 2,
-    "averageExecutionTime": 98000000,
-    "tasksPerSecond": 8.2,
-    "totalCompleted": 450,
-    "lastPollTime": "2025-01-15T10:30:45.123456Z"
+    "files_discovered_total": 2100,
+    "folders_discovered_total": 580,
+    "discovery_rate_items_per_sec": 22.1
   },
   "copy": null
 }
@@ -360,7 +359,8 @@ Get real-time queue statistics for a running migration.
 
 **Notes:**
 - Queue objects may be `null` if the queue hasn't started yet
-- `averageExecutionTime` is in nanoseconds (divide by 1e6 for milliseconds)
+- `files_discovered_total` and `folders_discovered_total` are monotonic counters
+- `discovery_rate_items_per_sec` is EMA-smoothed (alpha=0.2, ~5s window) combining files + folders
 - Poll every 200ms - 1s for real-time updates
 - Observer updates metrics every 200ms
 

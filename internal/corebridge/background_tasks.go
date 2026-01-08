@@ -228,6 +228,26 @@ func (m *BackgroundTaskManager) HasRunningTask(migrationID string, taskType Back
 	return false
 }
 
+// GetTask returns a specific task by ID for a migration
+func (m *BackgroundTaskManager) GetTask(migrationID, taskID string) (*BackgroundTask, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	tasks, exists := m.tasks[migrationID]
+	if !exists {
+		return nil, fmt.Errorf("no tasks found for migration %s", migrationID)
+	}
+
+	task, exists := tasks[taskID]
+	if !exists {
+		return nil, fmt.Errorf("task %s not found for migration %s", taskID, migrationID)
+	}
+
+	// Return a copy to avoid race conditions
+	result := *task
+	return &result, nil
+}
+
 // CleanupCompletedTasks removes completed/failed tasks older than the specified duration
 func (m *BackgroundTaskManager) CleanupCompletedTasks(olderThan time.Duration) {
 	m.mu.Lock()
