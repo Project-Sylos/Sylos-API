@@ -17,6 +17,7 @@ type PathReviewContext struct {
 	DBPath      string
 	DuckDBPath  string
 	DuckDBConn  *sql.DB
+	ReviewPhase string // "traversal" or "copy" - indicates which phase we're reviewing
 }
 
 // preparePathReviewContext prepares the context for path review operations
@@ -39,14 +40,19 @@ func (m *Manager) preparePathReviewContext(ctx context.Context, migrationID stri
 		}
 	}
 
-	// Check if DuckDB is available (status is Awaiting-Path-Review)
+	// Check if DuckDB is available (status is Awaiting-Path-Review or Awaiting-Copy-Review)
 	useDuckDB := false
+	var reviewPhase string // "traversal" or "copy"
 	if meta.ConfigPath != "" {
 		yamlCfg, err := migration.LoadMigrationConfig(meta.ConfigPath)
 		if err == nil {
 			status := strings.TrimSpace(yamlCfg.State.Status)
 			if status == "Awaiting-Path-Review" {
 				useDuckDB = true
+				reviewPhase = "traversal"
+			} else if status == "Awaiting-Copy-Review" {
+				useDuckDB = true
+				reviewPhase = "copy"
 			} else if status == "Preparing-Path-Review" {
 				// Ensure ETL is running or completed
 				err := m.migrationsMgr.EnsureETLCompleted(migrationID, meta.ConfigPath, dbPath)
@@ -55,15 +61,22 @@ func (m *Manager) preparePathReviewContext(ctx context.Context, migrationID stri
 				}
 				// Re-check status after ETL
 				yamlCfg, err = migration.LoadMigrationConfig(meta.ConfigPath)
-				if err == nil && strings.TrimSpace(yamlCfg.State.Status) == "Awaiting-Path-Review" {
-					useDuckDB = true
+				if err == nil {
+					updatedStatus := strings.TrimSpace(yamlCfg.State.Status)
+					if updatedStatus == "Awaiting-Path-Review" {
+						useDuckDB = true
+						reviewPhase = "traversal"
+					} else if updatedStatus == "Awaiting-Copy-Review" {
+						useDuckDB = true
+						reviewPhase = "copy"
+					}
 				}
 			}
 		}
 	}
 
 	if !useDuckDB {
-		return nil, fmt.Errorf("DuckDB not available: migration status is not Awaiting-Path-Review")
+		return nil, fmt.Errorf("DuckDB not available: migration status is not Awaiting-Path-Review or Awaiting-Copy-Review")
 	}
 
 	// Get or open DuckDB connection
@@ -87,6 +100,7 @@ func (m *Manager) preparePathReviewContext(ctx context.Context, migrationID stri
 		DBPath:      dbPath,
 		DuckDBPath:  duckdbPath,
 		DuckDBConn:  duckdbConn,
+		ReviewPhase: reviewPhase,
 	}, nil
 }
 

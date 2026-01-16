@@ -11,15 +11,13 @@ import (
 
 // PathReviewStats represents statistics for path review
 type PathReviewStats struct {
-	PendingCount        int           `json:"pendingCount"`
-	FailedCount         int           `json:"failedCount"`
-	ExcludedCount       int           `json:"excludedCount"`
-	PendingRetriesCount int           `json:"pendingRetriesCount"` // Count of items with traversal_status = 'pending'
-	FoldersCount        int           `json:"foldersCount"`
-	FilesCount          int           `json:"filesCount"`
-	FoldersRatio        float64       `json:"foldersRatio"` // Rounded to 2 decimal places
-	FilesRatio          float64       `json:"filesRatio"`   // Rounded to 2 decimal places
-	TotalFileSize       FileSizeStats `json:"totalFileSize"`
+	TraversalStatusCounts map[string]int `json:"traversalStatusCounts"` // Counts by traversal_status (pending, failed, successful, exclusion_explicit, exclusion_inherited, not_on_src, not_on_dst)
+	CopyStatusCounts      map[string]int `json:"copyStatusCounts"`      // Counts by copy_status (pending, failed, successful, exclusion_explicit, exclusion_inherited)
+	FoldersCount          int            `json:"foldersCount"`
+	FilesCount            int            `json:"filesCount"`
+	FoldersRatio          float64        `json:"foldersRatio"` // Rounded to 2 decimal places
+	FilesRatio            float64        `json:"filesRatio"`   // Rounded to 2 decimal places
+	TotalFileSize         FileSizeStats  `json:"totalFileSize"`
 }
 
 // FileSizeStats represents file size statistics grouped by src/dst
@@ -36,63 +34,91 @@ func GetPathReviewStatsDuckDB(ctx context.Context, logger zerolog.Logger, duckdb
 		return nil, ctx.Err()
 	}
 
-	stats := &PathReviewStats{}
-
-	// Query for pending items (merged count of unique paths)
-	pendingQuery := `
-	SELECT COUNT(DISTINCT path) 
-	FROM (
-		SELECT path FROM src_nodes WHERE copy_status = 'pending'
-		UNION
-		SELECT path FROM dst_nodes WHERE copy_status = 'pending'
-	) AS pending_paths
-	`
-	err := duckdbConn.QueryRowContext(ctx, pendingQuery).Scan(&stats.PendingCount)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query pending count: %w", err)
+	// Initialize all expected status values to 0 so they always appear in the response
+	stats := &PathReviewStats{
+		TraversalStatusCounts: map[string]int{
+			"pending":             0,
+			"failed":              0,
+			"successful":          0,
+			"exclusion_explicit":  0,
+			"exclusion_inherited": 0,
+			"not_on_src":          0,
+			"not_on_dst":          0,
+		},
+		CopyStatusCounts: map[string]int{
+			"pending":             0,
+			"failed":              0,
+			"successful":          0,
+			"exclusion_explicit":  0,
+			"exclusion_inherited": 0,
+		},
 	}
 
-	// Query for failed items (merged count of unique paths)
-	// This is the only one that should be traversal status actually.
-	failedQuery := `
-	SELECT COUNT(DISTINCT path) 
+	// Query for traversal status counts (merged counts from src_nodes and dst_nodes)
+	// Filter out NULL and empty strings
+	traversalStatusQuery := `
+	SELECT 
+		COALESCE(NULLIF(traversal_status, ''), 'unknown') AS status,
+		COUNT(DISTINCT path) AS count
 	FROM (
-		SELECT path FROM src_nodes WHERE traversal_status = 'failed'
+		SELECT path, traversal_status FROM src_nodes 
+		WHERE traversal_status IS NOT NULL AND traversal_status != ''
 		UNION
-		SELECT path FROM dst_nodes WHERE traversal_status = 'failed'
-	) AS failed_paths
+		SELECT path, traversal_status FROM dst_nodes 
+		WHERE traversal_status IS NOT NULL AND traversal_status != ''
+	) AS all_traversal_statuses
+	GROUP BY COALESCE(NULLIF(traversal_status, ''), 'unknown')
 	`
-	err = duckdbConn.QueryRowContext(ctx, failedQuery).Scan(&stats.FailedCount)
+	rows, err := duckdbConn.QueryContext(ctx, traversalStatusQuery)
 	if err != nil {
-		return nil, fmt.Errorf("failed to query failed count: %w", err)
+		return nil, fmt.Errorf("failed to query traversal status counts: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var status string
+		var count int
+		if err := rows.Scan(&status, &count); err != nil {
+			return nil, fmt.Errorf("failed to scan traversal status row: %w", err)
+		}
+		// Only update if status is a known value (ignore 'unknown' which shouldn't happen)
+		if status != "unknown" {
+			stats.TraversalStatusCounts[status] = count
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating traversal status rows: %w", err)
 	}
 
-	// Query for excluded items (merged count of unique paths)
-	excludedQuery := `
-	SELECT COUNT(DISTINCT path) 
-	FROM (
-		SELECT path FROM src_nodes WHERE copy_status IN ('exclusion_explicit', 'exclusion_inherited')
-		UNION
-		SELECT path FROM dst_nodes WHERE copy_status IN ('exclusion_explicit', 'exclusion_inherited')
-	) AS excluded_paths
+	// Query for copy status counts (only from src_nodes - dst_nodes don't have copy_status field)
+	// Filter out NULL and empty strings
+	copyStatusQuery := `
+	SELECT 
+		COALESCE(NULLIF(copy_status, ''), 'unknown') AS status,
+		COUNT(DISTINCT path) AS count
+	FROM src_nodes
+	WHERE copy_status IS NOT NULL AND copy_status != ''
+	GROUP BY COALESCE(NULLIF(copy_status, ''), 'unknown')
 	`
-	err = duckdbConn.QueryRowContext(ctx, excludedQuery).Scan(&stats.ExcludedCount)
+	rows, err = duckdbConn.QueryContext(ctx, copyStatusQuery)
 	if err != nil {
-		return nil, fmt.Errorf("failed to query excluded count: %w", err)
+		return nil, fmt.Errorf("failed to query copy status counts: %w", err)
 	}
+	defer rows.Close()
 
-	// Query for pending retries (items with traversal_status = 'pending')
-	pendingRetriesQuery := `
-	SELECT COUNT(DISTINCT path) 
-	FROM (
-		SELECT path FROM src_nodes WHERE traversal_status = 'pending'
-		UNION
-		SELECT path FROM dst_nodes WHERE traversal_status = 'pending'
-	) AS pending_retries_paths
-	`
-	err = duckdbConn.QueryRowContext(ctx, pendingRetriesQuery).Scan(&stats.PendingRetriesCount)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query pending retries count: %w", err)
+	for rows.Next() {
+		var status string
+		var count int
+		if err := rows.Scan(&status, &count); err != nil {
+			return nil, fmt.Errorf("failed to scan copy status row: %w", err)
+		}
+		// Only update if status is a known value (ignore 'unknown' and empty strings)
+		if status != "unknown" && status != "" {
+			stats.CopyStatusCounts[status] = count
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating copy status rows: %w", err)
 	}
 
 	// Query for folders and files count (merged, unique paths)

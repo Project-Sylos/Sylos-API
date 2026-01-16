@@ -203,22 +203,34 @@ type QueueStats struct {
 }
 
 // ExternalQueueMetrics contains user-facing metrics published to BoltDB for API access.
+// This struct supports both traversal metrics and copy phase metrics.
+// Fields will be populated based on which phase is active.
 type ExternalQueueMetrics struct {
-	// Monotonic counters
-	FilesDiscoveredTotal   int64 `json:"files_discovered_total"`
-	FoldersDiscoveredTotal int64 `json:"folders_discovered_total"`
+	// Traversal phase metrics
+	FilesDiscoveredTotal     int64   `json:"files_discovered_total,omitempty"`
+	FoldersDiscoveredTotal   int64   `json:"folders_discovered_total,omitempty"`
+	DiscoveryRateItemsPerSec float64 `json:"discovery_rate_items_per_sec,omitempty"`
+	TotalDiscovered          int64   `json:"total_discovered,omitempty"` // files + folders
 
-	// EMA-smoothed rates (2-5 second window)
-	DiscoveryRateItemsPerSec float64 `json:"discovery_rate_items_per_sec"`
+	// Copy phase metrics (new format from engine)
+	Folders        int64   `json:"folders,omitempty"`          // Total folders created
+	Files          int64   `json:"files,omitempty"`            // Total files created
+	Total          int64   `json:"total,omitempty"`            // Total items (folders + files)
+	Bytes          int64   `json:"bytes,omitempty"`            // Total bytes transferred
+	ItemsPerSecond float64 `json:"items_per_second,omitempty"` // Combined items/sec (EMA-smoothed)
+	BytesPerSecond float64 `json:"bytes_per_second,omitempty"` // Bytes/sec transfer rate (EMA-smoothed)
 
-	// Verification counts (for O(1) stats bucket lookups)
-	TotalDiscovered int64 `json:"total_discovered"` // files + folders
-	TotalPending    int   `json:"-"`                // pending across all rounds (from DB) - internal use only, not displayed
-	TotalFailed     int   `json:"-"`                // failed across all rounds - internal use only, not displayed
+	// Common state fields (used by both phases)
+	Round        int    `json:"round"`
+	Pending      int    `json:"pending"`
+	InProgress   int    `json:"in_progress"`
+	Workers      int    `json:"workers"`
+	TotalPending int    `json:"total_pending,omitempty"` // Total pending from DB (copy phase)
+	TotalFailed  int    `json:"total_failed,omitempty"`  // Total failed from DB (copy phase)
+	Name         string `json:"name,omitempty"`          // Queue name ("copy", "src-traversal", etc.)
 
-	// Current state (for API)
-	QueueStats
-	Round int `json:"round"`
+	// Legacy fields for backward compatibility
+	TotalTracked int `json:"totalTracked,omitempty"` // For traversal phase compatibility
 }
 
 // QueueMetricsResponse represents all queue metrics for a migration
@@ -326,15 +338,13 @@ type FileSizeStats struct {
 
 // PathReviewStats represents statistics for path review
 type PathReviewStats struct {
-	PendingCount        int           `json:"pendingCount"`
-	FailedCount         int           `json:"failedCount"`
-	ExcludedCount       int           `json:"excludedCount"`
-	PendingRetriesCount int           `json:"pendingRetriesCount"` // Count of items with traversal_status = 'pending'
-	FoldersCount        int           `json:"foldersCount"`
-	FilesCount          int           `json:"filesCount"`
-	FoldersRatio        float64       `json:"foldersRatio"` // Rounded to 2 decimal places
-	FilesRatio          float64       `json:"filesRatio"`   // Rounded to 2 decimal places
-	TotalFileSize       FileSizeStats `json:"totalFileSize"`
+	TraversalStatusCounts map[string]int `json:"traversalStatusCounts"` // Counts by traversal_status (pending, failed, successful, exclusion_explicit, exclusion_inherited, not_on_src, not_on_dst)
+	CopyStatusCounts      map[string]int `json:"copyStatusCounts"`      // Counts by copy_status (pending, failed, successful, exclusion_explicit, exclusion_inherited)
+	FoldersCount          int            `json:"foldersCount"`
+	FilesCount            int            `json:"filesCount"`
+	FoldersRatio          float64        `json:"foldersRatio"` // Rounded to 2 decimal places
+	FilesRatio            float64        `json:"filesRatio"`   // Rounded to 2 decimal places
+	TotalFileSize         FileSizeStats  `json:"totalFileSize"`
 }
 
 // ListChildrenDiffsResponse wraps the diff result with pagination metadata
@@ -382,7 +392,7 @@ type SweepResponse struct {
 type PendingWorkResponse struct {
 	HasPendingRetries    bool `json:"hasPendingRetries"`    // True if count > 0
 	HasPathReviewChanges bool `json:"hasPathReviewChanges"` // True if user made changes (exclusions/retries) since last sweep completion
-	PendingRetriesCount  int  `json:"pendingRetriesCount"`  // Number of items marked as "pending" in status-lookup buckets
+	PendingRetriesCount  int  `json:"pendingRetriesCount"`  // Number of items marked as "pending" in status-lookup buckets (actual retry count)
 }
 
 // MarkRetryRequest represents a request to mark nodes for retry
@@ -463,7 +473,11 @@ type Bridge interface {
 	CheckPendingWork(ctx context.Context, migrationID string) (PendingWorkResponse, error)
 	ChangePhase(ctx context.Context, migrationID string, phase string, req StartMigrationRequest) (Migration, error)
 	MarkNodesForRetry(ctx context.Context, migrationID string, req MarkRetryRequest) (*MarkRetryResponse, error)
+	MarkNodesForRetryDiscovery(ctx context.Context, migrationID string, req MarkRetryRequest) (*MarkRetryResponse, error)
+	MarkNodesForRetryCopy(ctx context.Context, migrationID string, req MarkRetryRequest) (*MarkRetryResponse, error)
 	UnmarkNodeForRetry(ctx context.Context, migrationID string, nodeID string) (*MarkRetryResponse, error)
+	UnmarkNodeForRetryDiscovery(ctx context.Context, migrationID string, nodeID string) (*MarkRetryResponse, error)
+	UnmarkNodeForRetryCopy(ctx context.Context, migrationID string, nodeID string) (*MarkRetryResponse, error)
 	GetBackgroundTasks(ctx context.Context, migrationID string) ([]BackgroundTask, error)
 	GetRunningBackgroundTasks(ctx context.Context, migrationID string) ([]BackgroundTask, error)
 	GetBackgroundTask(ctx context.Context, migrationID, taskID string) (*BackgroundTask, error)

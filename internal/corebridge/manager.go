@@ -137,6 +137,11 @@ func (m *Manager) ListDrives(ctx context.Context, serviceID string) ([]DriveInfo
 }
 
 func (m *Manager) SetRoot(ctx context.Context, req SetRootRequest) (SetRootResponse, error) {
+	// Check phase lock - root selection is locked when traversal starts
+	if err := m.checkPhaseLock(req.MigrationID, "setRoot"); err != nil {
+		return SetRootResponse{}, err
+	}
+
 	rootsReq := roots.SetRootRequest{
 		MigrationID:  req.MigrationID,
 		Role:         req.Role,
@@ -320,25 +325,84 @@ func (m *Manager) ChangePhase(ctx context.Context, migrationID string, phase str
 		}
 	}
 
+	// Check if Spectra override config exists
+	overridePath, exists, _ := services.LoadSpectraConfigOverride(m.cfg.Runtime.DataDir, migrationID)
+	var spectraConfigPath string
+	if exists {
+		spectraConfigPath = overridePath
+	}
+
+	// Load YAML config to update status
+	yamlCfg, err := migration.LoadMigrationConfig(meta.ConfigPath)
+	if err != nil {
+		return Migration{}, fmt.Errorf("failed to load migration config: %w", err)
+	}
+
+	// Update status based on phase
+	if phase == "copy" {
+		// Update status to Preparing-For-Copy
+		yamlCfg.State.Status = "Preparing-For-Copy"
+		if err := migration.SaveMigrationConfig(meta.ConfigPath, yamlCfg); err != nil {
+			return Migration{}, fmt.Errorf("failed to update status to Preparing-For-Copy: %w", err)
+		}
+		m.logger.Info().
+			Str("migration_id", migrationID).
+			Msg("updated status to Preparing-For-Copy")
+	}
+
+	// Convert StartMigrationRequest to MigrationOptions
+	migOpts := migrations.MigrationOptions{
+		MigrationID:             req.Options.MigrationID,
+		DatabasePath:            req.Options.DatabasePath,
+		RemoveExistingDB:        req.Options.RemoveExistingDB,
+		UsePreseededDB:          req.Options.UsePreseededDB,
+		SourceConnectionID:      req.Options.SourceConnectionID,
+		DestinationConnectionID: req.Options.DestinationConnectionID,
+		WorkerCount:             req.Options.WorkerCount,
+		MaxRetries:              req.Options.MaxRetries,
+		CoordinatorLead:         req.Options.CoordinatorLead,
+		LogAddress:              req.Options.LogAddress,
+		LogLevel:                req.Options.LogLevel,
+		SkipListener:            req.Options.SkipListener,
+		StartupDelaySec:         req.Options.StartupDelaySec,
+		ProgressTickMillis:      req.Options.ProgressTickMillis,
+		Verification: migrations.VerificationOptions{
+			AllowPending:  req.Options.Verification.AllowPending,
+			AllowNotOnSrc: req.Options.Verification.AllowNotOnSrc,
+		},
+	}
+
 	// Trigger ETL from DuckDB to BoltDB in background
-	// After ETL completes, it will trigger StartMigration
+	// After ETL completes, it will trigger the appropriate phase (traversal or copy)
 	go func() {
 		m.migrationsMgr.RunETLFromDuckToBolt(record, dbPath, meta.ConfigPath, func() {
-			// ETL completed successfully, now start the migration
+			// ETL completed successfully, now start the appropriate phase
 			m.logger.Info().
 				Str("migration_id", migrationID).
 				Str("phase", phase).
 				Msg("ETL completed, starting migration phase")
 
-			// Start the migration (which will handle the phase based on checkpoint state)
-			// The Migration Engine will automatically handle traversal vs copy based on checkpoint state
-			_, err := m.StartMigration(ctx, req)
-			if err != nil {
-				m.logger.Error().
-					Err(err).
-					Str("migration_id", migrationID).
-					Str("phase", phase).
-					Msg("failed to start migration after ETL")
+			if phase == "copy" {
+				// Run copy phase
+				err := m.migrationsMgr.RunCopyPhase(record, dbPath, meta.ConfigPath, migOpts, spectraConfigPath)
+				if err != nil {
+					m.logger.Error().
+						Err(err).
+						Str("migration_id", migrationID).
+						Str("phase", phase).
+						Msg("failed to start copy phase after ETL")
+				}
+			} else {
+				// Start the migration (traversal phase)
+				// The Migration Engine will automatically handle traversal based on checkpoint state
+				_, err := m.StartMigration(ctx, req)
+				if err != nil {
+					m.logger.Error().
+						Err(err).
+						Str("migration_id", migrationID).
+						Str("phase", phase).
+						Msg("failed to start migration after ETL")
+				}
 			}
 		})
 	}()
@@ -827,59 +891,69 @@ func (m *Manager) GetQueueMetrics(ctx context.Context, migrationID string) (*Que
 	}
 	if dbMetrics.SrcTraversal != nil {
 		metrics.SrcTraversal = &ExternalQueueMetrics{
-			QueueStats: QueueStats{
-				Name:         dbMetrics.SrcTraversal.Name,
-				Round:        dbMetrics.SrcTraversal.Round,
-				Pending:      dbMetrics.SrcTraversal.Pending,
-				InProgress:   dbMetrics.SrcTraversal.InProgress,
-				TotalTracked: dbMetrics.SrcTraversal.TotalTracked,
-				Workers:      dbMetrics.SrcTraversal.Workers,
-			},
+			// Traversal phase metrics
 			FilesDiscoveredTotal:     dbMetrics.SrcTraversal.FilesDiscoveredTotal,
 			FoldersDiscoveredTotal:   dbMetrics.SrcTraversal.FoldersDiscoveredTotal,
 			DiscoveryRateItemsPerSec: dbMetrics.SrcTraversal.DiscoveryRateItemsPerSec,
 			TotalDiscovered:          dbMetrics.SrcTraversal.TotalDiscovered,
-			TotalPending:             dbMetrics.SrcTraversal.TotalPending,
-			TotalFailed:              dbMetrics.SrcTraversal.TotalFailed,
-			Round:                    dbMetrics.SrcTraversal.Round,
+
+			// Common state fields
+			Round:        dbMetrics.SrcTraversal.Round,
+			Pending:      dbMetrics.SrcTraversal.Pending,
+			InProgress:   dbMetrics.SrcTraversal.InProgress,
+			Workers:      dbMetrics.SrcTraversal.Workers,
+			Name:         dbMetrics.SrcTraversal.Name,
+			TotalPending: dbMetrics.SrcTraversal.TotalPending,
+			TotalFailed:  dbMetrics.SrcTraversal.TotalFailed,
+			TotalTracked: dbMetrics.SrcTraversal.TotalTracked,
 		}
 	}
 	if dbMetrics.DstTraversal != nil {
 		metrics.DstTraversal = &ExternalQueueMetrics{
-			QueueStats: QueueStats{
-				Name:         dbMetrics.DstTraversal.Name,
-				Round:        dbMetrics.DstTraversal.Round,
-				Pending:      dbMetrics.DstTraversal.Pending,
-				InProgress:   dbMetrics.DstTraversal.InProgress,
-				TotalTracked: dbMetrics.DstTraversal.TotalTracked,
-				Workers:      dbMetrics.DstTraversal.Workers,
-			},
+			// Traversal phase metrics
 			FilesDiscoveredTotal:     dbMetrics.DstTraversal.FilesDiscoveredTotal,
 			FoldersDiscoveredTotal:   dbMetrics.DstTraversal.FoldersDiscoveredTotal,
 			DiscoveryRateItemsPerSec: dbMetrics.DstTraversal.DiscoveryRateItemsPerSec,
 			TotalDiscovered:          dbMetrics.DstTraversal.TotalDiscovered,
-			TotalPending:             dbMetrics.DstTraversal.TotalPending,
-			TotalFailed:              dbMetrics.DstTraversal.TotalFailed,
-			Round:                    dbMetrics.DstTraversal.Round,
+
+			// Common state fields
+			Round:        dbMetrics.DstTraversal.Round,
+			Pending:      dbMetrics.DstTraversal.Pending,
+			InProgress:   dbMetrics.DstTraversal.InProgress,
+			Workers:      dbMetrics.DstTraversal.Workers,
+			Name:         dbMetrics.DstTraversal.Name,
+			TotalPending: dbMetrics.DstTraversal.TotalPending,
+			TotalFailed:  dbMetrics.DstTraversal.TotalFailed,
+			TotalTracked: dbMetrics.DstTraversal.TotalTracked,
 		}
 	}
 	if dbMetrics.Copy != nil {
 		metrics.Copy = &ExternalQueueMetrics{
-			QueueStats: QueueStats{
-				Name:         dbMetrics.Copy.Name,
-				Round:        dbMetrics.Copy.Round,
-				Pending:      dbMetrics.Copy.Pending,
-				InProgress:   dbMetrics.Copy.InProgress,
-				TotalTracked: dbMetrics.Copy.TotalTracked,
-				Workers:      dbMetrics.Copy.Workers,
-			},
+			// Copy phase metrics (new format from engine)
+			Folders:        dbMetrics.Copy.Folders,
+			Files:          dbMetrics.Copy.Files,
+			Total:          dbMetrics.Copy.Total,
+			Bytes:          dbMetrics.Copy.Bytes,
+			ItemsPerSecond: dbMetrics.Copy.ItemsPerSecond,
+			BytesPerSecond: dbMetrics.Copy.BytesPerSecond,
+
+			// Common state fields
+			Round:        dbMetrics.Copy.Round,
+			Pending:      dbMetrics.Copy.Pending,
+			InProgress:   dbMetrics.Copy.InProgress,
+			Workers:      dbMetrics.Copy.Workers,
+			TotalPending: dbMetrics.Copy.TotalPending,
+			TotalFailed:  dbMetrics.Copy.TotalFailed,
+			Name:         dbMetrics.Copy.Name,
+
+			// Legacy fields for backward compatibility
+			TotalTracked: dbMetrics.Copy.TotalTracked,
+
+			// Traversal phase fields (may be empty for copy phase)
 			FilesDiscoveredTotal:     dbMetrics.Copy.FilesDiscoveredTotal,
 			FoldersDiscoveredTotal:   dbMetrics.Copy.FoldersDiscoveredTotal,
 			DiscoveryRateItemsPerSec: dbMetrics.Copy.DiscoveryRateItemsPerSec,
 			TotalDiscovered:          dbMetrics.Copy.TotalDiscovered,
-			TotalPending:             dbMetrics.Copy.TotalPending,
-			TotalFailed:              dbMetrics.Copy.TotalFailed,
-			Round:                    dbMetrics.Copy.Round,
 		}
 	}
 
@@ -997,13 +1071,13 @@ func (m *Manager) ListChildrenDiffs(ctx context.Context, req ListChildrenDiffsRe
 		}
 	}
 
-	// Check if DuckDB is available (status is Awaiting-Path-Review)
+	// Check if DuckDB is available (status is Awaiting-Path-Review or Awaiting-Copy-Review)
 	useDuckDB := false
 	if meta.ConfigPath != "" {
 		yamlCfg, err := migration.LoadMigrationConfig(meta.ConfigPath)
 		if err == nil {
 			status := strings.TrimSpace(yamlCfg.State.Status)
-			if status == "Awaiting-Path-Review" {
+			if status == "Awaiting-Path-Review" || status == "Awaiting-Copy-Review" {
 				useDuckDB = true
 			} else if status == "Preparing-Path-Review" {
 				// Ensure ETL is running or completed
@@ -1013,8 +1087,11 @@ func (m *Manager) ListChildrenDiffs(ctx context.Context, req ListChildrenDiffsRe
 				}
 				// Re-check status after ETL
 				yamlCfg, err = migration.LoadMigrationConfig(meta.ConfigPath)
-				if err == nil && strings.TrimSpace(yamlCfg.State.Status) == "Awaiting-Path-Review" {
-					useDuckDB = true
+				if err == nil {
+					updatedStatus := strings.TrimSpace(yamlCfg.State.Status)
+					if updatedStatus == "Awaiting-Path-Review" || updatedStatus == "Awaiting-Copy-Review" {
+						useDuckDB = true
+					}
 				}
 			}
 		}
@@ -1050,7 +1127,19 @@ func (m *Manager) ListChildrenDiffs(ctx context.Context, req ListChildrenDiffsRe
 			}
 		}
 
-		dbItems, dbPagination, err = database.GetChildrenDiffsFromDuckDB(ctx, m.logger, duckdbConn, req.Path, req.Offset, req.Limit, req.FoldersOnly, sortField, sortDir)
+		// Determine review phase from YAML status
+		reviewPhase := "traversal" // default
+		if meta.ConfigPath != "" {
+			yamlCfg, err := migration.LoadMigrationConfig(meta.ConfigPath)
+			if err == nil {
+				status := strings.TrimSpace(yamlCfg.State.Status)
+				if status == "Awaiting-Copy-Review" {
+					reviewPhase = "copy"
+				}
+			}
+		}
+
+		dbItems, dbPagination, err = database.GetChildrenDiffsFromDuckDB(ctx, m.logger, duckdbConn, req.Path, req.Offset, req.Limit, req.FoldersOnly, sortField, sortDir, reviewPhase)
 		if err != nil {
 			return ListChildrenDiffsResponse{}, fmt.Errorf("failed to get children diffs from DuckDB: %w", err)
 		}
@@ -1129,13 +1218,13 @@ func (m *Manager) SearchPathReviewItems(ctx context.Context, migrationID string,
 		}
 	}
 
-	// Check if DuckDB is available (status is Awaiting-Path-Review)
+	// Check if DuckDB is available (status is Awaiting-Path-Review or Awaiting-Copy-Review)
 	useDuckDB := false
 	if meta.ConfigPath != "" {
 		yamlCfg, err := migration.LoadMigrationConfig(meta.ConfigPath)
 		if err == nil {
 			status := strings.TrimSpace(yamlCfg.State.Status)
-			if status == "Awaiting-Path-Review" {
+			if status == "Awaiting-Path-Review" || status == "Awaiting-Copy-Review" {
 				useDuckDB = true
 			}
 		}
@@ -1186,8 +1275,20 @@ func (m *Manager) SearchPathReviewItems(ctx context.Context, migrationID string,
 		statusSearchType = "both"
 	}
 
+	// Determine review phase from context
+	reviewPhase := "traversal" // default
+	if meta.ConfigPath != "" {
+		yamlCfg, err := migration.LoadMigrationConfig(meta.ConfigPath)
+		if err == nil {
+			status := strings.TrimSpace(yamlCfg.State.Status)
+			if status == "Awaiting-Copy-Review" {
+				reviewPhase = "copy"
+			}
+		}
+	}
+
 	// Call database search function
-	dbItems, dbPagination, err := database.SearchPathReviewItemsDuckDB(ctx, m.logger, duckdbConn, dbConditions, offset, limit, sortField, sortDir, statusSearchType)
+	dbItems, dbPagination, err := database.SearchPathReviewItemsDuckDB(ctx, m.logger, duckdbConn, dbConditions, offset, limit, sortField, sortDir, statusSearchType, reviewPhase)
 	if err != nil {
 		return ListChildrenDiffsResponse{}, fmt.Errorf("failed to search path review items: %w", err)
 	}
@@ -1259,8 +1360,28 @@ func (m *Manager) ExcludeNode(ctx context.Context, migrationID string, nodeID st
 
 // ExcludeNodes excludes nodes based on ExclusionRequest
 func (m *Manager) ExcludeNodes(ctx context.Context, migrationID string, req ExclusionRequest) (*ExclusionResponse, error) {
-	// Prepare path review context
+	// Prepare path review context first to check review phase
 	prc, err := m.preparePathReviewContext(ctx, migrationID)
+	if err != nil {
+		if err == ErrMigrationNotFound {
+			return &ExclusionResponse{
+				Success: false,
+				Error:   "migration not found",
+			}, err
+		}
+		return &ExclusionResponse{
+			Success: false,
+			Error:   err.Error(),
+		}, err
+	}
+
+	// Exclusion is only allowed in traversal phase, not copy phase
+	if prc.ReviewPhase == "copy" {
+		return &ExclusionResponse{
+			Success: false,
+			Error:   "exclusion operations are not available in copy phase (exclusion only applies to traversal)",
+		}, fmt.Errorf("exclusion operations are locked in copy phase")
+	}
 	if err != nil {
 		if err == ErrMigrationNotFound {
 			return &ExclusionResponse{
@@ -1387,8 +1508,28 @@ func (m *Manager) UnexcludeNode(ctx context.Context, migrationID string, nodeID 
 
 // UnexcludeNodes unexcludes nodes based on ExclusionRequest
 func (m *Manager) UnexcludeNodes(ctx context.Context, migrationID string, req ExclusionRequest) (*ExclusionResponse, error) {
-	// Prepare path review context
+	// Prepare path review context first to check review phase
 	prc, err := m.preparePathReviewContext(ctx, migrationID)
+	if err != nil {
+		if err == ErrMigrationNotFound {
+			return &ExclusionResponse{
+				Success: false,
+				Error:   "migration not found",
+			}, err
+		}
+		return &ExclusionResponse{
+			Success: false,
+			Error:   err.Error(),
+		}, err
+	}
+
+	// Unexclusion is only allowed in traversal phase, not copy phase
+	if prc.ReviewPhase == "copy" {
+		return &ExclusionResponse{
+			Success: false,
+			Error:   "exclusion operations are not available in copy phase (exclusion only applies to traversal)",
+		}, fmt.Errorf("exclusion operations are locked in copy phase")
+	}
 	if err != nil {
 		if err == ErrMigrationNotFound {
 			return &ExclusionResponse{
@@ -1483,6 +1624,14 @@ func (m *Manager) UnexcludeNodes(ctx context.Context, migrationID string, req Ex
 // TriggerRetrySweep triggers a retry sweep for a migration
 // It first runs ETL from DuckDB to BoltDB to sync path review changes, then starts the retry sweep
 func (m *Manager) TriggerRetrySweep(ctx context.Context, migrationID string, config SweepConfigRequest) (SweepResponse, error) {
+	// Check phase lock - retry sweep is only allowed in traversal phase
+	if err := m.checkPhaseLock(migrationID, "retrySweep"); err != nil {
+		return SweepResponse{
+			Success: false,
+			Error:   err.Error(),
+		}, err
+	}
+
 	// Check for running background tasks (prevent overlapping operations)
 	runningTasks := m.bgTaskMgr.GetRunningTasks(migrationID)
 	if len(runningTasks) > 0 {
@@ -1676,25 +1825,44 @@ func (m *Manager) TriggerRetrySweep(ctx context.Context, migrationID string, con
 				"stage": "running_sweep",
 			})
 
-			// Acquire adapters for sweep execution
-			srcAdapter, err := m.acquireAdapterFromYAMLConfigForSweep(yamlCfg.Services.Source, spectraConfigPath)
+			// Try to acquire shared adapters if both use same Spectra config
+			srcAdapter, dstAdapter, shared, err := m.acquireSharedSpectraAdaptersForSweep(yamlCfg.Services.Source, yamlCfg.Services.Destination, spectraConfigPath)
 			if err != nil {
 				m.logger.Error().
 					Err(err).
 					Str("migration_id", migrationID).
-					Msg("failed to acquire source adapter for retry sweep")
-				m.bgTaskMgr.FailTask(migrationID, taskID, fmt.Errorf("failed to acquire source adapter: %w", err))
+					Msg("failed to acquire shared adapters for retry sweep")
+				m.bgTaskMgr.FailTask(migrationID, taskID, fmt.Errorf("failed to acquire shared adapters: %w", err))
 				return
 			}
 
-			dstAdapter, err := m.acquireAdapterFromYAMLConfigForSweep(yamlCfg.Services.Destination, spectraConfigPath)
-			if err != nil {
-				m.logger.Error().
-					Err(err).
-					Str("migration_id", migrationID).
-					Msg("failed to acquire destination adapter for retry sweep")
-				m.bgTaskMgr.FailTask(migrationID, taskID, fmt.Errorf("failed to acquire destination adapter: %w", err))
-				return
+			// If not shared (different configs or not both Spectra), acquire separately
+			if !shared {
+				srcAdapter, err = m.acquireAdapterFromYAMLConfigForSweep(yamlCfg.Services.Source, spectraConfigPath)
+				if err != nil {
+					m.logger.Error().
+						Err(err).
+						Str("migration_id", migrationID).
+						Msg("failed to acquire source adapter for retry sweep")
+					m.bgTaskMgr.FailTask(migrationID, taskID, fmt.Errorf("failed to acquire source adapter: %w", err))
+					return
+				}
+
+				dstAdapter, err = m.acquireAdapterFromYAMLConfigForSweep(yamlCfg.Services.Destination, spectraConfigPath)
+				if err != nil {
+					// Close source adapter if we got it
+					if srcAdapter != nil {
+						if closer, ok := srcAdapter.(interface{ Close() error }); ok {
+							_ = closer.Close()
+						}
+					}
+					m.logger.Error().
+						Err(err).
+						Str("migration_id", migrationID).
+						Msg("failed to acquire destination adapter for retry sweep")
+					m.bgTaskMgr.FailTask(migrationID, taskID, fmt.Errorf("failed to acquire destination adapter: %w", err))
+					return
+				}
 			}
 
 			// Load full config with adapters for sweep execution
@@ -1892,6 +2060,120 @@ func (m *Manager) selectMaxRetriesForSweep(value int) int {
 	return 3
 }
 
+// acquireSharedSpectraAdaptersForSweep checks if both services use the same Spectra config and shares a session if they do
+// Returns (srcAdapter, dstAdapter, sharedSession, error)
+// If not shareable (different configs or not both Spectra), returns (nil, nil, false, nil)
+func (m *Manager) acquireSharedSpectraAdaptersForSweep(srcCfg, dstCfg migration.ServiceConfigYAML, spectraConfigOverridePath string) (fstypes.FSAdapter, fstypes.FSAdapter, bool, error) {
+	// Check if both are Spectra
+	if strings.ToLower(srcCfg.Type) != "spectra" || strings.ToLower(dstCfg.Type) != "spectra" {
+		return nil, nil, false, nil
+	}
+
+	// Helper to get config path for a service
+	getConfigPath := func(serviceCfg migration.ServiceConfigYAML) (string, error) {
+		if spectraConfigOverridePath != "" {
+			return spectraConfigOverridePath, nil
+		}
+
+		// Try to get from service definition
+		def, err := m.serviceMgr.GetServiceDefinition(serviceCfg.Name)
+		if err == nil && def.Spectra != nil {
+			return def.Spectra.ConfigPath, nil
+		}
+
+		// Try to find by world
+		world := "primary"
+		if strings.Contains(strings.ToLower(serviceCfg.Name), "s1") {
+			world = "s1"
+		}
+		def, err = m.serviceMgr.GetServiceDefinitionByWorld(world)
+		if err == nil && def.Spectra != nil {
+			return def.Spectra.ConfigPath, nil
+		}
+
+		return "", fmt.Errorf("spectra config path not found for service %s", serviceCfg.Name)
+	}
+
+	// Get config paths for both services
+	srcConfigPath, err := getConfigPath(srcCfg)
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("failed to get source config path: %w", err)
+	}
+
+	dstConfigPath, err := getConfigPath(dstCfg)
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("failed to get destination config path: %w", err)
+	}
+
+	// If config paths are different, can't share
+	if srcConfigPath != dstConfigPath {
+		return nil, nil, false, nil
+	}
+
+	m.logger.Info().
+		Str("config_path", srcConfigPath).
+		Msg("source and destination use same Spectra config, sharing SDK session for sweep")
+
+	// Same config path - create ONE shared SDK session
+	spectraFS, err := sdk.New(srcConfigPath)
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("failed to create shared SpectraFS session: %w", err)
+	}
+
+	// Create source adapter
+	srcRootID := srcCfg.RootID
+	if srcRootID == "" {
+		srcRootID = "root"
+	}
+
+	srcWorld := "primary"
+	if strings.Contains(strings.ToLower(srcCfg.Name), "s1") {
+		srcWorld = "s1"
+	} else {
+		def, err := m.serviceMgr.GetServiceDefinition(srcCfg.Name)
+		if err == nil && def.Spectra != nil {
+			srcWorld = def.Spectra.World
+		}
+	}
+
+	srcAdapter, err := fslib.NewSpectraFS(spectraFS, srcRootID, srcWorld)
+	if err != nil {
+		_ = spectraFS.Close()
+		return nil, nil, false, fmt.Errorf("failed to create source adapter: %w", err)
+	}
+
+	// Create destination adapter from SAME SDK session
+	dstRootID := dstCfg.RootID
+	if dstRootID == "" {
+		dstRootID = "root"
+	}
+
+	dstWorld := "primary"
+	if strings.Contains(strings.ToLower(dstCfg.Name), "s1") {
+		dstWorld = "s1"
+	} else {
+		def, err := m.serviceMgr.GetServiceDefinition(dstCfg.Name)
+		if err == nil && def.Spectra != nil {
+			dstWorld = def.Spectra.World
+		}
+	}
+
+	dstAdapter, err := fslib.NewSpectraFS(spectraFS, dstRootID, dstWorld)
+	if err != nil {
+		_ = spectraFS.Close()
+		return nil, nil, false, fmt.Errorf("failed to create destination adapter: %w", err)
+	}
+
+	m.logger.Info().
+		Str("src_root", srcRootID).
+		Str("src_world", srcWorld).
+		Str("dst_root", dstRootID).
+		Str("dst_world", dstWorld).
+		Msg("created shared Spectra adapters for sweep")
+
+	return srcAdapter, dstAdapter, true, nil
+}
+
 // acquireAdapterFromYAMLConfigForSweep acquires an adapter based on YAML service configuration for sweep operations
 func (m *Manager) acquireAdapterFromYAMLConfigForSweep(serviceCfg migration.ServiceConfigYAML, spectraConfigOverridePath string) (fstypes.FSAdapter, error) {
 	serviceType := strings.ToLower(serviceCfg.Type)
@@ -2036,6 +2318,7 @@ func (m *Manager) CheckPendingWork(ctx context.Context, migrationID string) (Pen
 }
 
 // MarkNodesForRetry marks nodes for retry based on MarkRetryRequest
+// This works for both traversal and copy phase retries - the phase is determined by the review context
 func (m *Manager) MarkNodesForRetry(ctx context.Context, migrationID string, req MarkRetryRequest) (*MarkRetryResponse, error) {
 	// Prepare path review context
 	prc, err := m.preparePathReviewContext(ctx, migrationID)
@@ -2236,6 +2519,200 @@ func (m *Manager) UnmarkNodeForRetry(ctx context.Context, migrationID string, no
 	}, nil
 }
 
+// MarkNodesForRetryDiscovery marks nodes for discovery/traversal phase retry
+// Updates traversal_status from 'failed' to 'pending'
+func (m *Manager) MarkNodesForRetryDiscovery(ctx context.Context, migrationID string, req MarkRetryRequest) (*MarkRetryResponse, error) {
+	// Prepare path review context
+	prc, err := m.preparePathReviewContext(ctx, migrationID)
+	if err != nil {
+		if err == ErrMigrationNotFound {
+			return &MarkRetryResponse{
+				Success: false,
+				Error:   "migration not found",
+			}, err
+		}
+		return &MarkRetryResponse{
+			Success: false,
+			Error:   err.Error(),
+		}, err
+	}
+
+	// Process each node ID
+	for _, nodeID := range req.NodeIDs {
+		// Find node path from ULID
+		nodePath, err := m.findNodePathFromID(ctx, prc, nodeID)
+		if err != nil {
+			m.logger.Warn().
+				Err(err).
+				Str("node_id", nodeID).
+				Msg("failed to find node path, skipping")
+			continue
+		}
+
+		// Mark node for discovery retry in DuckDB (updates traversal_status)
+		err = database.MarkNodeForRetryDuckDB(ctx, m.logger, prc.DuckDBConn, nodePath)
+		if err != nil {
+			m.logger.Warn().
+				Err(err).
+				Str("node_path", nodePath).
+				Msg("failed to mark node for discovery retry, skipping")
+			continue
+		}
+	}
+
+	// Mark that user made changes during path review
+	if err := m.markPathReviewChanges(migrationID, true); err != nil {
+		m.logger.Warn().Err(err).Str("migration_id", migrationID).Msg("failed to mark path review changes")
+	}
+
+	return &MarkRetryResponse{
+		Success: true,
+	}, nil
+}
+
+// MarkNodesForRetryCopy marks nodes for copy phase retry
+// Updates copy_status from 'failed' to 'pending' (only src nodes have copy_status)
+func (m *Manager) MarkNodesForRetryCopy(ctx context.Context, migrationID string, req MarkRetryRequest) (*MarkRetryResponse, error) {
+	// Prepare path review context
+	prc, err := m.preparePathReviewContext(ctx, migrationID)
+	if err != nil {
+		if err == ErrMigrationNotFound {
+			return &MarkRetryResponse{
+				Success: false,
+				Error:   "migration not found",
+			}, err
+		}
+		return &MarkRetryResponse{
+			Success: false,
+			Error:   err.Error(),
+		}, err
+	}
+
+	// Process each node ID
+	for _, nodeID := range req.NodeIDs {
+		// Find node path from ULID
+		nodePath, err := m.findNodePathFromID(ctx, prc, nodeID)
+		if err != nil {
+			m.logger.Warn().
+				Err(err).
+				Str("node_id", nodeID).
+				Msg("failed to find node path, skipping")
+			continue
+		}
+
+		// Mark node for copy retry in DuckDB (updates copy_status, src nodes only)
+		err = database.MarkNodeForRetryCopyDuckDB(ctx, m.logger, prc.DuckDBConn, nodePath)
+		if err != nil {
+			m.logger.Warn().
+				Err(err).
+				Str("node_path", nodePath).
+				Msg("failed to mark node for copy retry, skipping")
+			continue
+		}
+	}
+
+	// Mark that user made changes during path review
+	if err := m.markPathReviewChanges(migrationID, true); err != nil {
+		m.logger.Warn().Err(err).Str("migration_id", migrationID).Msg("failed to mark path review changes")
+	}
+
+	return &MarkRetryResponse{
+		Success: true,
+	}, nil
+}
+
+// UnmarkNodeForRetryDiscovery unmarks a node for discovery/traversal phase retry
+// Updates traversal_status from 'pending' back to 'failed'
+func (m *Manager) UnmarkNodeForRetryDiscovery(ctx context.Context, migrationID string, nodeID string) (*MarkRetryResponse, error) {
+	// Prepare path review context
+	prc, err := m.preparePathReviewContext(ctx, migrationID)
+	if err != nil {
+		if err == ErrMigrationNotFound {
+			return &MarkRetryResponse{
+				Success: false,
+				Error:   "migration not found",
+			}, err
+		}
+		return &MarkRetryResponse{
+			Success: false,
+			Error:   err.Error(),
+		}, err
+	}
+
+	// Find node path from ULID
+	nodePath, err := m.findNodePathFromID(ctx, prc, nodeID)
+	if err != nil {
+		return &MarkRetryResponse{
+			Success: false,
+			Error:   fmt.Sprintf("node not found: %v", err),
+		}, err
+	}
+
+	// Unmark node for discovery retry in DuckDB (updates traversal_status)
+	err = database.UnmarkNodeForRetryDuckDB(ctx, m.logger, prc.DuckDBConn, nodePath)
+	if err != nil {
+		return &MarkRetryResponse{
+			Success: false,
+			Error:   err.Error(),
+		}, err
+	}
+
+	// Mark that user made changes during path review
+	if err := m.markPathReviewChanges(migrationID, true); err != nil {
+		m.logger.Warn().Err(err).Str("migration_id", migrationID).Msg("failed to mark path review changes")
+	}
+
+	return &MarkRetryResponse{
+		Success: true,
+	}, nil
+}
+
+// UnmarkNodeForRetryCopy unmarks a node for copy phase retry
+// Updates copy_status from 'pending' back to 'failed' (only src nodes have copy_status)
+func (m *Manager) UnmarkNodeForRetryCopy(ctx context.Context, migrationID string, nodeID string) (*MarkRetryResponse, error) {
+	// Prepare path review context
+	prc, err := m.preparePathReviewContext(ctx, migrationID)
+	if err != nil {
+		if err == ErrMigrationNotFound {
+			return &MarkRetryResponse{
+				Success: false,
+				Error:   "migration not found",
+			}, err
+		}
+		return &MarkRetryResponse{
+			Success: false,
+			Error:   err.Error(),
+		}, err
+	}
+
+	// Find node path from ULID
+	nodePath, err := m.findNodePathFromID(ctx, prc, nodeID)
+	if err != nil {
+		return &MarkRetryResponse{
+			Success: false,
+			Error:   fmt.Sprintf("node not found: %v", err),
+		}, err
+	}
+
+	// Unmark node for copy retry in DuckDB (updates copy_status, src nodes only)
+	err = database.UnmarkNodeForRetryCopyDuckDB(ctx, m.logger, prc.DuckDBConn, nodePath)
+	if err != nil {
+		return &MarkRetryResponse{
+			Success: false,
+			Error:   err.Error(),
+		}, err
+	}
+
+	// Mark that user made changes during path review
+	if err := m.markPathReviewChanges(migrationID, true); err != nil {
+		m.logger.Warn().Err(err).Str("migration_id", migrationID).Msg("failed to mark path review changes")
+	}
+
+	return &MarkRetryResponse{
+		Success: true,
+	}, nil
+}
+
 // GetPathReviewStats returns statistics for path review
 func (m *Manager) GetPathReviewStats(ctx context.Context, migrationID string) (*PathReviewStats, error) {
 	// Prepare path review context
@@ -2254,14 +2731,12 @@ func (m *Manager) GetPathReviewStats(ctx context.Context, migrationID string) (*
 	}
 
 	return &PathReviewStats{
-		PendingCount:        stats.PendingCount,
-		FailedCount:         stats.FailedCount,
-		ExcludedCount:       stats.ExcludedCount,
-		PendingRetriesCount: stats.PendingRetriesCount,
-		FoldersCount:        stats.FoldersCount,
-		FilesCount:          stats.FilesCount,
-		FoldersRatio:        stats.FoldersRatio,
-		FilesRatio:          stats.FilesRatio,
+		TraversalStatusCounts: stats.TraversalStatusCounts,
+		CopyStatusCounts:      stats.CopyStatusCounts,
+		FoldersCount:          stats.FoldersCount,
+		FilesCount:            stats.FilesCount,
+		FoldersRatio:          stats.FoldersRatio,
+		FilesRatio:            stats.FilesRatio,
 		TotalFileSize: FileSizeStats{
 			Src: stats.TotalFileSize.Src,
 			Dst: stats.TotalFileSize.Dst,
@@ -2292,4 +2767,70 @@ func convertMetadata(meta metadata.MigrationMetadata) MigrationMetadata {
 		ConfigPath: meta.ConfigPath,
 		CreatedAt:  meta.CreatedAt,
 	}
+}
+
+// getMigrationPhase determines the current phase of a migration based on YAML status
+// Returns: "roots", "traversal", "copy", or "unknown"
+// If metadata doesn't exist, returns "roots" (fresh migration, roots phase)
+func (m *Manager) getMigrationPhase(migrationID string) (string, error) {
+	metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
+	meta, err := metaMgr.GetMigrationMetadata(migrationID)
+	if err != nil {
+		// If metadata doesn't exist, this is a fresh migration in roots phase
+		// This is expected when setting roots for the first time
+		return "roots", nil
+	}
+
+	if meta.ConfigPath == "" {
+		return "roots", nil // No config yet, must be in roots phase
+	}
+
+	yamlCfg, err := migration.LoadMigrationConfig(meta.ConfigPath)
+	if err != nil {
+		return "unknown", err
+	}
+
+	status := strings.TrimSpace(yamlCfg.State.Status)
+
+	// Determine phase from status
+	switch {
+	case status == "" || status == "Roots-Set":
+		return "roots", nil
+	case strings.Contains(status, "Traversal") || status == "Preparing-Path-Review" || status == "Awaiting-Path-Review" || status == "Preparing-For-Retry" || status == "Filters-Set" || status == "ETL-Bolt-To-Duck-In-Progress" || status == "ETL-Duck-To-Bolt-In-Progress":
+		return "traversal", nil
+	case strings.Contains(status, "Copy") || status == "Awaiting-Copy-Review" || status == "Preparing-For-Copy":
+		return "copy", nil
+	default:
+		return "unknown", nil
+	}
+}
+
+// checkPhaseLock checks if an operation is allowed in the current migration phase
+// Returns error if operation is locked, nil if allowed
+func (m *Manager) checkPhaseLock(migrationID string, operation string) error {
+	phase, err := m.getMigrationPhase(migrationID)
+	if err != nil {
+		return fmt.Errorf("failed to determine migration phase: %w", err)
+	}
+
+	switch operation {
+	case "setRoot":
+		// Root selection locked when traversal starts
+		if phase == "traversal" || phase == "copy" {
+			return fmt.Errorf("root selection is locked: migration is in %s phase", phase)
+		}
+	case "startTraversal", "retrySweep", "exclude", "unexclude", "markRetry":
+		// Traversal operations locked when copy starts
+		// Note: markRetry is allowed in both phases (for traversal retries and copy retries)
+		// but exclusion is only for traversal phase
+		if operation == "exclude" || operation == "unexclude" {
+			if phase == "copy" {
+				return fmt.Errorf("exclusion operations are locked: migration is in copy phase (exclusion only applies to traversal)")
+			}
+		} else if phase == "copy" {
+			return fmt.Errorf("traversal operations are locked: migration is in copy phase")
+		}
+	}
+
+	return nil
 }

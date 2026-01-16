@@ -41,8 +41,10 @@ func Register(router chi.Router, logger zerolog.Logger, core corebridge.Bridge, 
 	router.Post("/migrations/{migrationID}/node/{nodeID}/exclude", middleware.NoBody(mw, h.excludeNode)) // Backward compatibility
 	router.Post("/migrations/{migrationID}/unexclude", middleware.JSON(mw, h.unexcludeNodes))
 	router.Post("/migrations/{migrationID}/node/{nodeID}/unexclude", middleware.NoBody(mw, h.unexcludeNode)) // Backward compatibility
-	router.Post("/migrations/{migrationID}/node/{nodeID}/mark-retry", middleware.NoBody(mw, h.markNodeForRetry))
-	router.Post("/migrations/{migrationID}/node/{nodeID}/unmark-retry", middleware.NoBody(mw, h.unmarkNodeForRetry))
+	router.Post("/migrations/{migrationID}/node/{nodeID}/mark-retry-discovery", middleware.NoBody(mw, h.markNodeForRetryDiscovery))
+	router.Post("/migrations/{migrationID}/node/{nodeID}/mark-retry-copy", middleware.NoBody(mw, h.markNodeForRetryCopy))
+	router.Post("/migrations/{migrationID}/node/{nodeID}/unmark-retry-discovery", middleware.NoBody(mw, h.unmarkNodeForRetryDiscovery))
+	router.Post("/migrations/{migrationID}/node/{nodeID}/unmark-retry-copy", middleware.NoBody(mw, h.unmarkNodeForRetryCopy))
 	router.Get("/migrations/{migrationID}/pending-work", middleware.NoBody(mw, h.checkPendingWork))
 	router.Get("/migrations/{migrationID}/bgTasks", middleware.NoBody(mw, h.bgTasks))
 	router.Get("/migrations/{migrationID}/bgTasks/running", middleware.NoBody(mw, h.bgTasksRunning))

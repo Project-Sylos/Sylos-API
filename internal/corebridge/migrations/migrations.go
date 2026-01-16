@@ -287,14 +287,29 @@ func (m *Manager) LoadMigrationFromConfigPath(ctx context.Context, migrationID, 
 	}
 
 	// Acquire adapters based on YAML service configuration
-	srcAdapter, err := m.acquireAdapterFromYAMLConfig(yamlCfg.Services.Source, spectraConfigPath)
+	// Try to acquire shared adapters if both use same Spectra config
+	srcAdapter, dstAdapter, shared, err := m.acquireSharedSpectraAdapters(yamlCfg.Services.Source, yamlCfg.Services.Destination, spectraConfigPath)
 	if err != nil {
-		return Migration{}, fmt.Errorf("failed to acquire source adapter: %w", err)
+		return Migration{}, fmt.Errorf("failed to acquire shared adapters: %w", err)
 	}
 
-	dstAdapter, err := m.acquireAdapterFromYAMLConfig(yamlCfg.Services.Destination, spectraConfigPath)
-	if err != nil {
-		return Migration{}, fmt.Errorf("failed to acquire destination adapter: %w", err)
+	// If not shared (different configs or not both Spectra), acquire separately
+	if !shared {
+		srcAdapter, err = m.acquireAdapterFromYAMLConfig(yamlCfg.Services.Source, spectraConfigPath)
+		if err != nil {
+			return Migration{}, fmt.Errorf("failed to acquire source adapter: %w", err)
+		}
+
+		dstAdapter, err = m.acquireAdapterFromYAMLConfig(yamlCfg.Services.Destination, spectraConfigPath)
+		if err != nil {
+			// Close source adapter if we got it
+			if srcAdapter != nil {
+				if closer, ok := srcAdapter.(interface{ Close() error }); ok {
+					_ = closer.Close()
+				}
+			}
+			return Migration{}, fmt.Errorf("failed to acquire destination adapter: %w", err)
+		}
 	}
 
 	// Load migration config with provided adapters
@@ -474,15 +489,29 @@ func (m *Manager) startMigrationFromUploadedDB(ctx context.Context, migrationID 
 	if err == nil {
 		// Successfully loaded YAML - acquire adapters and reconstruct config
 
-		// Acquire adapters based on YAML service configuration
-		srcAdapter, err := m.acquireAdapterFromYAMLConfig(yamlCfg.Services.Source, spectraConfigPath)
+		// Try to acquire shared adapters if both use same Spectra config
+		srcAdapter, dstAdapter, shared, err := m.acquireSharedSpectraAdapters(yamlCfg.Services.Source, yamlCfg.Services.Destination, spectraConfigPath)
 		if err != nil {
-			return Migration{}, fmt.Errorf("failed to acquire source adapter: %w", err)
+			return Migration{}, fmt.Errorf("failed to acquire shared adapters: %w", err)
 		}
 
-		dstAdapter, err := m.acquireAdapterFromYAMLConfig(yamlCfg.Services.Destination, spectraConfigPath)
-		if err != nil {
-			return Migration{}, fmt.Errorf("failed to acquire destination adapter: %w", err)
+		// If not shared (different configs or not both Spectra), acquire separately
+		if !shared {
+			srcAdapter, err = m.acquireAdapterFromYAMLConfig(yamlCfg.Services.Source, spectraConfigPath)
+			if err != nil {
+				return Migration{}, fmt.Errorf("failed to acquire source adapter: %w", err)
+			}
+
+			dstAdapter, err = m.acquireAdapterFromYAMLConfig(yamlCfg.Services.Destination, spectraConfigPath)
+			if err != nil {
+				// Close source adapter if we got it
+				if srcAdapter != nil {
+					if closer, ok := srcAdapter.(interface{ Close() error }); ok {
+						_ = closer.Close()
+					}
+				}
+				return Migration{}, fmt.Errorf("failed to acquire destination adapter: %w", err)
+			}
 		}
 
 		// Load migration config with provided adapters
@@ -1050,6 +1079,131 @@ func (m *Manager) updateMetadataForMigration(migrationID, name, configPath strin
 	return m.metadataMgr.UpdateMigrationMetadata(meta)
 }
 
+// acquireSharedSpectraAdapters checks if both services use the same Spectra config and shares a session if they do
+// Returns (srcAdapter, dstAdapter, sharedSession, error)
+// If not shareable (different configs or not both Spectra), returns (nil, nil, false, nil)
+func (m *Manager) acquireSharedSpectraAdapters(srcCfg, dstCfg migration.ServiceConfigYAML, spectraConfigOverridePath string) (fstypes.FSAdapter, fstypes.FSAdapter, bool, error) {
+	// Check if both are Spectra
+	if strings.ToLower(srcCfg.Type) != "spectra" || strings.ToLower(dstCfg.Type) != "spectra" {
+		return nil, nil, false, nil
+	}
+
+	// Helper to get config path for a service
+	getConfigPath := func(serviceCfg migration.ServiceConfigYAML) (string, error) {
+		if spectraConfigOverridePath != "" {
+			return spectraConfigOverridePath, nil
+		}
+
+		// Try to get from service definition
+		def, err := m.serviceMgr.GetServiceDefinition(serviceCfg.Name)
+		if err == nil && def.Spectra != nil {
+			return def.Spectra.ConfigPath, nil
+		}
+
+		// Try to find by world
+		world := "primary"
+		if strings.Contains(strings.ToLower(serviceCfg.Name), "s1") {
+			world = "s1"
+		}
+		def, err = m.serviceMgr.GetServiceDefinitionByWorld(world)
+		if err == nil && def.Spectra != nil {
+			return def.Spectra.ConfigPath, nil
+		}
+
+		return "", fmt.Errorf("spectra config path not found for service %s", serviceCfg.Name)
+	}
+
+	// Get config paths for both services
+	srcConfigPath, err := getConfigPath(srcCfg)
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("failed to get source config path: %w", err)
+	}
+
+	dstConfigPath, err := getConfigPath(dstCfg)
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("failed to get destination config path: %w", err)
+	}
+
+	// If config paths are different, can't share
+	if srcConfigPath != dstConfigPath {
+		return nil, nil, false, nil
+	}
+
+	m.logger.Info().
+		Str("config_path", srcConfigPath).
+		Msg("source and destination use same Spectra config, sharing SDK session")
+
+	// Same config path - create ONE shared SDK session
+	spectraFS, err := sdk.New(srcConfigPath)
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("failed to create shared SpectraFS session: %w", err)
+	}
+
+	// Create source adapter
+	srcRootID := srcCfg.RootID
+	if srcRootID == "" {
+		srcRootID = "root"
+	}
+
+	srcWorld := "primary"
+	if strings.Contains(strings.ToLower(srcCfg.Name), "s1") {
+		srcWorld = "s1"
+	} else {
+		def, err := m.serviceMgr.GetServiceDefinition(srcCfg.Name)
+		if err == nil && def.Spectra != nil {
+			srcWorld = def.Spectra.World
+		}
+	}
+
+	srcAdapter, err := fslib.NewSpectraFS(spectraFS, srcRootID, srcWorld)
+	if err != nil {
+		_ = spectraFS.Close()
+		return nil, nil, false, fmt.Errorf("failed to create source adapter: %w", err)
+	}
+
+	// Create destination adapter from SAME SDK session
+	dstRootID := dstCfg.RootID
+	if dstRootID == "" {
+		dstRootID = "root"
+	}
+
+	dstWorld := "primary"
+	if strings.Contains(strings.ToLower(dstCfg.Name), "s1") {
+		dstWorld = "s1"
+	} else {
+		def, err := m.serviceMgr.GetServiceDefinition(dstCfg.Name)
+		if err == nil && def.Spectra != nil {
+			dstWorld = def.Spectra.World
+		}
+	}
+
+	dstAdapter, err := fslib.NewSpectraFS(spectraFS, dstRootID, dstWorld)
+	if err != nil {
+		_ = spectraFS.Close()
+		return nil, nil, false, fmt.Errorf("failed to create destination adapter: %w", err)
+	}
+
+	m.logger.Info().
+		Str("src_root", srcRootID).
+		Str("src_world", srcWorld).
+		Str("dst_root", dstRootID).
+		Str("dst_world", dstWorld).
+		Str("config_path", srcConfigPath).
+		Msg("created shared Spectra adapters")
+
+	// Log adapter details for debugging
+	m.logger.Debug().
+		Str("src_name", srcCfg.Name).
+		Str("src_type", srcCfg.Type).
+		Str("src_root_id", srcCfg.RootID).
+		Str("dst_name", dstCfg.Name).
+		Str("dst_type", dstCfg.Type).
+		Str("dst_root_id", dstCfg.RootID).
+		Msg("adapter configuration details")
+
+	return srcAdapter, dstAdapter, true, nil
+}
+
 // acquireAdapterFromYAMLConfig acquires an adapter based on YAML service configuration
 func (m *Manager) acquireAdapterFromYAMLConfig(serviceCfg migration.ServiceConfigYAML, spectraConfigOverridePath string) (fstypes.FSAdapter, error) {
 	serviceType := strings.ToLower(serviceCfg.Type)
@@ -1480,6 +1634,169 @@ func (m *Manager) closeAdapters(srcAdapter, dstAdapter fstypes.FSAdapter, migrat
 			}
 		}
 	}
+}
+
+// RunCopyPhase executes the copy phase for a migration
+// It acquires adapters, builds CopyPhaseConfig, runs the copy phase, and triggers ETL
+func (m *Manager) RunCopyPhase(record *MigrationRecord, dbPath, configPath string, opts MigrationOptions, spectraConfigPath string) error {
+	m.logger.Info().
+		Str("migration_id", record.ID).
+		Msg("starting copy phase")
+
+	// Load YAML config to get service configuration
+	yamlCfg, err := migration.LoadMigrationConfig(configPath)
+	if err != nil {
+		return fmt.Errorf("failed to load YAML config: %w", err)
+	}
+
+	// Update status to Copy-In-Progress
+	yamlCfg.State.Status = "Copy-In-Progress"
+	if err := migration.SaveMigrationConfig(configPath, yamlCfg); err != nil {
+		m.logger.Warn().
+			Err(err).
+			Str("migration_id", record.ID).
+			Msg("failed to update status to Copy-In-Progress")
+	} else {
+		m.logger.Info().
+			Str("migration_id", record.ID).
+			Msg("updated status to Copy-In-Progress")
+	}
+
+	// Try to acquire shared adapters if both use same Spectra config
+	srcAdapter, dstAdapter, shared, err := m.acquireSharedSpectraAdapters(yamlCfg.Services.Source, yamlCfg.Services.Destination, spectraConfigPath)
+	if err != nil {
+		return fmt.Errorf("failed to acquire shared adapters: %w", err)
+	}
+
+	// If not shared (different configs or not both Spectra), acquire separately
+	if !shared {
+		srcAdapter, err = m.acquireAdapterFromYAMLConfig(yamlCfg.Services.Source, spectraConfigPath)
+		if err != nil {
+			return fmt.Errorf("failed to acquire source adapter: %w", err)
+		}
+
+		dstAdapter, err = m.acquireAdapterFromYAMLConfig(yamlCfg.Services.Destination, spectraConfigPath)
+		if err != nil {
+			// Close source adapter if we got it
+			if srcAdapter != nil {
+				if closer, ok := srcAdapter.(interface{ Close() error }); ok {
+					_ = closer.Close()
+				}
+			}
+			return fmt.Errorf("failed to acquire destination adapter: %w", err)
+		}
+
+		m.logger.Info().
+			Str("migration_id", record.ID).
+			Msg("acquired separate adapters for source and destination")
+	}
+
+	// Open BoltDB instance (ETL should have created it)
+	dbInstance, err := db.Open(db.Options{Path: dbPath})
+	if err != nil {
+		// Close adapters
+		m.closeAdapters(srcAdapter, dstAdapter, record.ID)
+		return fmt.Errorf("failed to open BoltDB: %w", err)
+	}
+
+	// Store DB instance in record for metrics/logs access
+	m.mu.Lock()
+	record.DB = dbInstance
+	m.mu.Unlock()
+
+	// Build CopyPhaseConfig
+	copyCfg := migration.CopyPhaseConfig{
+		BoltDB:       dbInstance,
+		SrcAdapter:   srcAdapter,
+		DstAdapter:   dstAdapter,
+		WorkerCount:  m.selectWorkerCount(opts.WorkerCount),
+		MaxRetries:   m.selectMaxRetries(opts.MaxRetries),
+		LogAddress:   m.selectLogAddress(opts.LogAddress),
+		LogLevel:     m.selectLogLevel(opts.LogLevel),
+		SkipListener: m.selectSkipListener(opts),
+	}
+
+	// Set defaults for timing
+	if opts.StartupDelaySec > 0 {
+		copyCfg.StartupDelay = time.Duration(opts.StartupDelaySec) * time.Second
+	} else {
+		copyCfg.StartupDelay = 500 * time.Millisecond
+	}
+
+	if opts.ProgressTickMillis > 0 {
+		copyCfg.ProgressTick = time.Duration(opts.ProgressTickMillis) * time.Millisecond
+	} else {
+		copyCfg.ProgressTick = 2 * time.Second
+	}
+
+	// Use background context for shutdown (can be enhanced later with cancellation)
+	copyCfg.ShutdownContext = context.Background()
+
+	// Run copy phase (blocking call)
+	m.logger.Info().
+		Str("migration_id", record.ID).
+		Int("worker_count", copyCfg.WorkerCount).
+		Int("max_retries", copyCfg.MaxRetries).
+		Msg("running copy phase")
+
+	stats, err := migration.RunCopyPhase(copyCfg)
+	if err != nil {
+		m.logger.Error().
+			Err(err).
+			Str("migration_id", record.ID).
+			Msg("copy phase failed")
+
+		// Update status to failed
+		yamlCfg.State.Status = "Copy-Failed"
+		if saveErr := migration.SaveMigrationConfig(configPath, yamlCfg); saveErr != nil {
+			m.logger.Warn().
+				Err(saveErr).
+				Str("migration_id", record.ID).
+				Msg("failed to update status to Copy-Failed")
+		}
+
+		// Close adapters
+		m.closeAdapters(srcAdapter, dstAdapter, record.ID)
+
+		return fmt.Errorf("copy phase failed: %w", err)
+	}
+
+	m.logger.Info().
+		Str("migration_id", record.ID).
+		Int("round", stats.Round).
+		Int("pending", stats.Pending).
+		Int("in_progress", stats.InProgress).
+		Int("total_tracked", stats.TotalTracked).
+		Int("workers", stats.Workers).
+		Msg("copy phase completed successfully")
+
+	// Update status to Copy-Complete
+	yamlCfg.State.Status = "Copy-Complete"
+	if err := migration.SaveMigrationConfig(configPath, yamlCfg); err != nil {
+		m.logger.Warn().
+			Err(err).
+			Str("migration_id", record.ID).
+			Msg("failed to update status to Copy-Complete")
+	} else {
+		m.logger.Info().
+			Str("migration_id", record.ID).
+			Msg("updated status to Copy-Complete")
+	}
+
+	// Close adapters (copy phase is done)
+	m.closeAdapters(srcAdapter, dstAdapter, record.ID)
+
+	// Trigger ETL from BoltDB to DuckDB for copy review
+	// This creates a new DuckDB instance for reviewing copy results
+	m.logger.Info().
+		Str("migration_id", record.ID).
+		Msg("copy phase completed, running ETL from BoltDB to DuckDB for review")
+
+	// Run ETL from BoltDB to DuckDB
+	// This will update status to ETL-Bolt-To-Duck-In-Progress, then Awaiting-Copy-Review
+	m.runETL(record, dbPath, configPath, dbInstance)
+
+	return nil
 }
 
 func (m *Manager) recordToStatus(r *MigrationRecord) Status {

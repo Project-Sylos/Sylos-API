@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 
@@ -49,6 +50,15 @@ func (h handler) search(ctx *middleware.Context, payload corebridge.SearchReques
 		payload.Sort = &corebridge.SortOption{
 			Field:     sortField,
 			Direction: sortDir,
+		}
+	}
+
+	// Lowercase search values defensively for path and name fields (case-insensitive search)
+	for i := range payload.Conditions {
+		if payload.Conditions[i].Field == "path" || payload.Conditions[i].Field == "name" {
+			if valueStr, ok := payload.Conditions[i].Value.(string); ok {
+				payload.Conditions[i].Value = strings.ToLower(valueStr)
+			}
 		}
 	}
 

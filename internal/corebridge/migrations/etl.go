@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/Project-Sylos/Migration-Engine/pkg/db"
 	"github.com/Project-Sylos/Migration-Engine/pkg/db/etl"
@@ -85,11 +86,14 @@ func (m *Manager) runETL(record *MigrationRecord, dbPath, configPath string, bol
 		Msg("starting ETL process")
 
 	// Update status to ETL-Bolt-To-Duck-In-Progress before starting ETL
+	// Track the previous status to determine the target status after ETL
+	var previousStatus string
 	yamlCfg, err := migration.LoadMigrationConfig(configPath)
 	if err == nil {
 		currentStatus := strings.TrimSpace(yamlCfg.State.Status)
-		// Only update if we're in Preparing-Path-Review (normal traversal) or Filters-Set (after retry)
-		if currentStatus == "Preparing-Path-Review" || currentStatus == "Filters-Set" {
+		previousStatus = currentStatus
+		// Update if we're in Preparing-Path-Review (normal traversal), Filters-Set (after retry), or Copy-Complete (after copy phase)
+		if currentStatus == "Preparing-Path-Review" || currentStatus == "Filters-Set" || currentStatus == "Copy-Complete" {
 			yamlCfg.State.Status = "ETL-Bolt-To-Duck-In-Progress"
 			if err := migration.SaveMigrationConfig(configPath, yamlCfg); err != nil {
 				m.logger.Warn().
@@ -194,26 +198,47 @@ func (m *Manager) runETL(record *MigrationRecord, dbPath, configPath string, bol
 	}
 
 	currentStatus := strings.TrimSpace(yamlCfg.State.Status)
-	// Only update if we're in ETL-Bolt-To-Duck-In-Progress
+	// Update status based on what phase we're in
 	if currentStatus == "ETL-Bolt-To-Duck-In-Progress" {
-		yamlCfg.State.Status = "Awaiting-Path-Review"
-		if err := migration.SaveMigrationConfig(configPath, yamlCfg); err != nil {
-			m.logger.Error().
-				Err(err).
+		// Determine the target status based on previous status before ETL started
+		// For copy phase, the previous status was "Copy-Complete"
+		// For traversal, it was "Preparing-Path-Review" or "Filters-Set"
+		if previousStatus == "Copy-Complete" {
+			// This is copy phase ETL - update to Awaiting-Copy-Review
+			yamlCfg.State.Status = "Awaiting-Copy-Review"
+			if err := migration.SaveMigrationConfig(configPath, yamlCfg); err != nil {
+				m.logger.Error().
+					Err(err).
+					Str("migration_id", record.ID).
+					Msg("failed to update status to Awaiting-Copy-Review after ETL")
+				return
+			}
+			m.logger.Info().
 				Str("migration_id", record.ID).
-				Msg("failed to update status to Awaiting-Path-Review after ETL")
-			return
+				Str("old_status", currentStatus).
+				Str("new_status", "Awaiting-Copy-Review").
+				Msg("updated status to Awaiting-Copy-Review after ETL completion")
+		} else {
+			// This is traversal phase ETL - update to Awaiting-Path-Review
+			yamlCfg.State.Status = "Awaiting-Path-Review"
+			if err := migration.SaveMigrationConfig(configPath, yamlCfg); err != nil {
+				m.logger.Error().
+					Err(err).
+					Str("migration_id", record.ID).
+					Msg("failed to update status to Awaiting-Path-Review after ETL")
+				return
+			}
+			m.logger.Info().
+				Str("migration_id", record.ID).
+				Str("old_status", currentStatus).
+				Str("new_status", "Awaiting-Path-Review").
+				Msg("updated status to Awaiting-Path-Review after ETL completion")
 		}
-		m.logger.Info().
-			Str("migration_id", record.ID).
-			Str("old_status", currentStatus).
-			Str("new_status", "Awaiting-Path-Review").
-			Msg("updated status to Awaiting-Path-Review after ETL completion")
 	} else {
 		m.logger.Warn().
 			Str("migration_id", record.ID).
 			Str("current_status", currentStatus).
-			Msg("skipping status update to Awaiting-Path-Review (unexpected status)")
+			Msg("skipping status update after ETL (unexpected status)")
 	}
 
 	// Store DuckDB path in record
@@ -415,15 +440,55 @@ func (m *Manager) RunETLFromDuckToBolt(record *MigrationRecord, dbPath, configPa
 				Msg("failed to close BoltDB instance from pool (may not be open)")
 		}
 
-		// Remove the file
-		if err := os.Remove(dbPath); err != nil {
+		// Remove the file with retry logic (Windows file handles can take a moment to release)
+		// Retry up to 5 times with exponential backoff: 50ms, 100ms, 200ms, 400ms, 800ms
+		var deleteErr error
+		maxRetries := 5
+		baseDelay := 50 * time.Millisecond
+		for attempt := 0; attempt < maxRetries; attempt++ {
+			if attempt > 0 {
+				// Wait before retry (exponential backoff)
+				delay := baseDelay * time.Duration(1<<uint(attempt-1))
+				m.logger.Debug().
+					Str("migration_id", record.ID).
+					Int("attempt", attempt+1).
+					Dur("delay", delay).
+					Msg("retrying BoltDB file deletion after delay")
+				time.Sleep(delay)
+			}
+
+			deleteErr = os.Remove(dbPath)
+			if deleteErr == nil {
+				// Successfully deleted
+				if attempt > 0 {
+					m.logger.Info().
+						Str("migration_id", record.ID).
+						Int("attempt", attempt+1).
+						Msg("successfully deleted BoltDB file after retry")
+				}
+				break
+			}
+
+			// Check if error is due to file being locked/in use
+			// On Windows, this is typically "The process cannot access the file because it is being used by another process"
+			if attempt < maxRetries-1 {
+				m.logger.Debug().
+					Err(deleteErr).
+					Str("migration_id", record.ID).
+					Int("attempt", attempt+1).
+					Msg("BoltDB file still locked, will retry")
+			}
+		}
+
+		if deleteErr != nil {
 			m.logger.Error().
-				Err(err).
+				Err(deleteErr).
 				Str("migration_id", record.ID).
 				Str("bolt_db_path", dbPath).
-				Msg("failed to delete existing BoltDB file")
+				Int("attempts", maxRetries).
+				Msg("failed to delete existing BoltDB file after all retries")
 			if failTaskFunc != nil && taskID != "" {
-				failTaskFunc(record.ID, taskID, err)
+				failTaskFunc(record.ID, taskID, deleteErr)
 			}
 			return
 		}

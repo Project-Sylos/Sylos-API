@@ -13,8 +13,9 @@ import (
 // Uses direct path-based joins instead of path hashing
 // sortField: field to sort by ("name", "path", "depth", "size", "type", "traversalStatus", etc.)
 // sortDir: sort direction ("asc" or "desc", defaults to "asc")
+// reviewPhase: "traversal" or "copy" - determines how status is computed
 // Returns items, pagination info, and stats (stats can be nil if calculation fails)
-func GetChildrenDiffsFromDuckDB(ctx context.Context, logger zerolog.Logger, duckdbConn *sql.DB, parentPath string, offset, limit int, foldersOnly bool, sortField, sortDir string) (map[string]PathNodes, PaginationInfo, error) {
+func GetChildrenDiffsFromDuckDB(ctx context.Context, logger zerolog.Logger, duckdbConn *sql.DB, parentPath string, offset, limit int, foldersOnly bool, sortField, sortDir string, reviewPhase string) (map[string]PathNodes, PaginationInfo, error) {
 	// Check for context cancellation
 	if ctx.Err() != nil {
 		return map[string]PathNodes{}, PaginationInfo{}, ctx.Err()
@@ -410,6 +411,88 @@ func MarkNodeForRetryDuckDB(ctx context.Context, logger zerolog.Logger, duckdbCo
 			Bool("is_src", false).
 			Msg("marked dst node for retry in DuckDB")
 	}
+
+	return nil
+}
+
+// MarkNodeForRetryCopyDuckDB marks a node for copy phase retry
+// Only src nodes have copy_status field, so this only updates src_nodes
+// Sets copy_status from 'failed' to 'pending' for copy phase retry
+func MarkNodeForRetryCopyDuckDB(ctx context.Context, logger zerolog.Logger, duckdbConn *sql.DB, nodePath string) error {
+	// Check if node exists in src_nodes (only src nodes have copy_status)
+	checkSrcQuery := `SELECT id FROM src_nodes WHERE path = ? LIMIT 1`
+	var srcID sql.NullString
+	err := duckdbConn.QueryRowContext(ctx, checkSrcQuery, nodePath).Scan(&srcID)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("node with path %s not found in src_nodes (copy retry only applies to src nodes)", nodePath)
+		}
+		return fmt.Errorf("failed to check src_nodes: %w", err)
+	}
+
+	// Update src node copy_status from "failed" to "pending"
+	updateSrcQuery := `
+	UPDATE src_nodes 
+	SET copy_status = 'pending'
+	WHERE path = ? AND copy_status = 'failed'
+	`
+	result, err := duckdbConn.ExecContext(ctx, updateSrcQuery, nodePath)
+	if err != nil {
+		return fmt.Errorf("failed to mark src node for copy retry: %w", err)
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		logger.Warn().
+			Str("node_path", nodePath).
+			Msg("src node not found or copy_status not in 'failed' status")
+		return fmt.Errorf("node is not in failed copy status, cannot mark for copy retry")
+	}
+
+	logger.Info().
+		Str("node_path", nodePath).
+		Msg("marked src node for copy retry in DuckDB")
+
+	return nil
+}
+
+// UnmarkNodeForRetryCopyDuckDB unmarks a node for copy phase retry
+// Only src nodes have copy_status field, so this only updates src_nodes
+// Sets copy_status from 'pending' back to 'failed'
+func UnmarkNodeForRetryCopyDuckDB(ctx context.Context, logger zerolog.Logger, duckdbConn *sql.DB, nodePath string) error {
+	// Check if node exists in src_nodes (only src nodes have copy_status)
+	checkSrcQuery := `SELECT id FROM src_nodes WHERE path = ? LIMIT 1`
+	var srcID sql.NullString
+	err := duckdbConn.QueryRowContext(ctx, checkSrcQuery, nodePath).Scan(&srcID)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return fmt.Errorf("node with path %s not found in src_nodes (copy retry only applies to src nodes)", nodePath)
+		}
+		return fmt.Errorf("failed to check src_nodes: %w", err)
+	}
+
+	// Update src node copy_status from "pending" back to "failed"
+	updateSrcQuery := `
+	UPDATE src_nodes 
+	SET copy_status = 'failed'
+	WHERE path = ? AND copy_status = 'pending'
+	`
+	result, err := duckdbConn.ExecContext(ctx, updateSrcQuery, nodePath)
+	if err != nil {
+		return fmt.Errorf("failed to unmark src node for copy retry: %w", err)
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		logger.Warn().
+			Str("node_path", nodePath).
+			Msg("src node not found or copy_status not in 'pending' status")
+		return fmt.Errorf("node is not in pending copy status, cannot unmark for copy retry")
+	}
+
+	logger.Info().
+		Str("node_path", nodePath).
+		Msg("unmarked src node for copy retry in DuckDB")
 
 	return nil
 }
@@ -827,7 +910,8 @@ type SearchCondition struct {
 // For path and name fields, uses LIKE '%value%' for substring matching
 // Uses two-phase approach: first paginate paths (entities), then join data
 // statusSearchType specifies which status type(s) to search by when using status conditions: "traversal", "copy", or "both" (default: "both")
-func SearchPathReviewItemsDuckDB(ctx context.Context, logger zerolog.Logger, duckdbConn *sql.DB, conditions []SearchCondition, offset, limit int, sortField, sortDir string, statusSearchType string) (map[string]PathNodes, PaginationInfo, error) {
+// reviewPhase: "traversal" or "copy" - determines how status filtering works (in copy phase, "status" field maps to copy_status)
+func SearchPathReviewItemsDuckDB(ctx context.Context, logger zerolog.Logger, duckdbConn *sql.DB, conditions []SearchCondition, offset, limit int, sortField, sortDir string, statusSearchType string, reviewPhase string) (map[string]PathNodes, PaginationInfo, error) {
 	// Check for context cancellation
 	if ctx.Err() != nil {
 		return map[string]PathNodes{}, PaginationInfo{}, ctx.Err()
@@ -836,8 +920,13 @@ func SearchPathReviewItemsDuckDB(ctx context.Context, logger zerolog.Logger, duc
 	// Normalize statusSearchType: default to "both" if empty or invalid
 	normalizedStatusType := normalizeStatusSearchType(statusSearchType)
 
+	// In copy phase, if statusSearchType is not explicitly set, default to "copy"
+	if reviewPhase == "copy" && normalizedStatusType == "both" {
+		normalizedStatusType = "copy"
+	}
+
 	// Build WHERE clause filters for path selection phase (using EXISTS)
-	pathFilterClause, pathFilterArgs := buildPathFilterClause(conditions, normalizedStatusType)
+	pathFilterClause, pathFilterArgs := buildPathFilterClause(conditions, normalizedStatusType, reviewPhase)
 
 	// For path selection (Phase A), we can only sort by path itself
 	// For other sort fields, we'll sort after the join in Phase B
@@ -1119,7 +1208,8 @@ func normalizeStatusSearchType(statusType string) string {
 // Returns SQL clause and arguments for filtering paths before pagination
 // Uses EXISTS to check conditions against src_nodes and/or dst_nodes
 // statusSearchType specifies which status type(s) to check: "traversal", "copy", or "both"
-func buildPathFilterClause(conditions []SearchCondition, statusSearchType string) (string, []any) {
+// reviewPhase: "traversal" or "copy" - determines how "status" field is interpreted
+func buildPathFilterClause(conditions []SearchCondition, statusSearchType string, reviewPhase string) (string, []any) {
 	if len(conditions) == 0 {
 		return "", nil
 	}
@@ -1128,7 +1218,7 @@ func buildPathFilterClause(conditions []SearchCondition, statusSearchType string
 	var args []any
 
 	for _, cond := range conditions {
-		clause, clauseArgs := buildPathFilterCondition(cond, statusSearchType)
+		clause, clauseArgs := buildPathFilterCondition(cond, statusSearchType, reviewPhase)
 		if clause != "" {
 			clauses = append(clauses, clause)
 			args = append(args, clauseArgs...)
@@ -1146,11 +1236,18 @@ func buildPathFilterClause(conditions []SearchCondition, statusSearchType string
 // buildPathFilterCondition builds an EXISTS-based condition for path filtering
 // Returns SQL that checks if a path exists in src_nodes OR dst_nodes matching the condition
 // statusSearchType specifies which status type(s) to check: "traversal", "copy", or "both"
+// reviewPhase: "traversal" or "copy" - determines how "status" field is interpreted
 // If statusSearchType is "traversal", only traversalStatus conditions are processed
 // If statusSearchType is "copy", only copyStatus conditions are processed
 // If statusSearchType is "both", both traversalStatus and copyStatus conditions are processed
-func buildPathFilterCondition(cond SearchCondition, statusSearchType string) (string, []any) {
+// In copy phase, "status" field maps to copy_status; "successful" also includes dst-only nodes
+func buildPathFilterCondition(cond SearchCondition, statusSearchType string, reviewPhase string) (string, []any) {
 	valueStr := fmt.Sprintf("%v", cond.Value)
+
+	// In copy phase, map "status" field to "copyStatus"
+	if reviewPhase == "copy" && cond.Field == "status" {
+		cond.Field = "copyStatus"
+	}
 
 	// Filter status conditions based on statusSearchType
 	if cond.Field == "traversalStatus" && statusSearchType == "copy" {
@@ -1164,18 +1261,18 @@ func buildPathFilterCondition(cond SearchCondition, statusSearchType string) (st
 
 	switch cond.Field {
 	case "path":
-		// Path filter: check if path matches pattern in either table
+		// Path filter: case-insensitive check if path matches pattern in either table
 		return `(
-			EXISTS (SELECT 1 FROM src_nodes s WHERE s.path = all_paths.path AND s.path LIKE ?)
-			OR EXISTS (SELECT 1 FROM dst_nodes d WHERE d.path = all_paths.path AND d.path LIKE ?)
-		)`, []any{"%" + valueStr + "%", "%" + valueStr + "%"}
+			EXISTS (SELECT 1 FROM src_nodes s WHERE s.path = all_paths.path AND lower(s.path) LIKE '%' || lower(?) || '%')
+			OR EXISTS (SELECT 1 FROM dst_nodes d WHERE d.path = all_paths.path AND lower(d.path) LIKE '%' || lower(?) || '%')
+		)`, []any{valueStr, valueStr}
 
 	case "name":
-		// Name filter: check if name matches pattern in either table
+		// Name filter: case-insensitive check if name matches pattern in either table
 		return `(
-			EXISTS (SELECT 1 FROM src_nodes s WHERE s.path = all_paths.path AND s.name LIKE ?)
-			OR EXISTS (SELECT 1 FROM dst_nodes d WHERE d.path = all_paths.path AND d.name LIKE ?)
-		)`, []any{"%" + valueStr + "%", "%" + valueStr + "%"}
+			EXISTS (SELECT 1 FROM src_nodes s WHERE s.path = all_paths.path AND lower(s.name) LIKE '%' || lower(?) || '%')
+			OR EXISTS (SELECT 1 FROM dst_nodes d WHERE d.path = all_paths.path AND lower(d.name) LIKE '%' || lower(?) || '%')
+		)`, []any{valueStr, valueStr}
 
 	case "type":
 		// Type filter: case-insensitive exact match
@@ -1192,7 +1289,8 @@ func buildPathFilterCondition(cond SearchCondition, statusSearchType string) (st
 	case "copyStatus":
 		// Copy status filter: case-insensitive exact match
 		// Special handling: "excluded" matches both "exclusion_explicit" and "exclusion_inherited"
-		return buildCopyStatusFilter(valueStr)
+		// In copy phase, "successful" also includes dst-only nodes
+		return buildCopyStatusFilter(valueStr, reviewPhase)
 
 	case "depth":
 		// Depth filter: numeric comparison (only available in src_nodes/dst_nodes, use OR logic)
@@ -1278,7 +1376,14 @@ func buildTraversalStatusFilter(valueStr string) (string, []any) {
 			OR EXISTS (SELECT 1 FROM dst_nodes d WHERE d.path = all_paths.path AND UPPER(d.traversal_status) IN ('EXCLUSION_EXPLICIT', 'EXCLUSION_INHERITED'))
 		)`, []any{}
 	}
-	// Regular exact match for other statuses
+
+	// Special handling for "not_on_src" - this status should not appear in traversal_status,
+	if valueUpper == "NOT_ON_SRC" {
+		// Items with "not_on_src" only exist in dst_nodes, not src_nodes
+		return `EXISTS (SELECT 1 FROM dst_nodes d WHERE d.path = all_paths.path AND UPPER(d.traversal_status) = 'NOT_ON_SRC')`, []any{}
+	}
+
+	// Regular exact match for other statuses (can exist in either table)
 	return `(
 		EXISTS (SELECT 1 FROM src_nodes s WHERE s.path = all_paths.path AND UPPER(s.traversal_status) = UPPER(?))
 		OR EXISTS (SELECT 1 FROM dst_nodes d WHERE d.path = all_paths.path AND UPPER(d.traversal_status) = UPPER(?))
@@ -1286,15 +1391,32 @@ func buildTraversalStatusFilter(valueStr string) (string, []any) {
 }
 
 // buildCopyStatusFilter builds a filter for copy status
-func buildCopyStatusFilter(valueStr string) (string, []any) {
+// reviewPhase: "traversal" or "copy" - in copy phase, "successful" includes dst-only nodes
+func buildCopyStatusFilter(valueStr string, reviewPhase string) (string, []any) {
 	valueUpper := strings.ToUpper(valueStr)
 	if valueUpper == "EXCLUDED" {
-		// Match both exclusion types
+		// Match both exclusion types (but exclusion shouldn't be used in copy phase)
 		return `(
 			EXISTS (SELECT 1 FROM src_nodes s WHERE s.path = all_paths.path AND UPPER(s.copy_status) IN ('EXCLUSION_EXPLICIT', 'EXCLUSION_INHERITED'))
 			OR EXISTS (SELECT 1 FROM dst_nodes d WHERE d.path = all_paths.path AND UPPER(d.copy_status) IN ('EXCLUSION_EXPLICIT', 'EXCLUSION_INHERITED'))
 		)`, []any{}
 	}
+
+	// In copy phase, "successful" includes dst-only nodes (nodes that exist in dst but not in src)
+	if reviewPhase == "copy" && valueUpper == "SUCCESSFUL" {
+		return `(
+			EXISTS (SELECT 1 FROM src_nodes s WHERE s.path = all_paths.path AND UPPER(s.copy_status) = 'SUCCESSFUL')
+			OR EXISTS (SELECT 1 FROM dst_nodes d WHERE d.path = all_paths.path AND NOT EXISTS (SELECT 1 FROM src_nodes s WHERE s.path = d.path))
+		)`, []any{}
+	}
+
+	// Special handling for "not_on_src" - this status should not appear in copy_status,
+	// but handle them correctly if they do (legacy data or edge cases)
+	if valueUpper == "NOT_ON_SRC" {
+		// Items with "not_on_src" only exist in dst_nodes
+		return `EXISTS (SELECT 1 FROM dst_nodes d WHERE d.path = all_paths.path AND UPPER(d.copy_status) = 'NOT_ON_SRC')`, []any{}
+	}
+
 	// Regular exact match for other statuses
 	return `(
 		EXISTS (SELECT 1 FROM src_nodes s WHERE s.path = all_paths.path AND UPPER(s.copy_status) = UPPER(?))

@@ -364,22 +364,36 @@ func InspectMigrationStatusFromDB(ctx context.Context, logger zerolog.Logger, db
 }
 
 // ExternalQueueMetrics contains user-facing metrics published to BoltDB for API access.
+// This struct supports both traversal metrics and copy phase metrics.
+// Fields will be populated based on which phase is active.
+// The JSON from BoltDB will have different fields depending on the phase.
 type ExternalQueueMetrics struct {
-	// Monotonic counters
-	FilesDiscoveredTotal   int64 `json:"files_discovered_total"`
-	FoldersDiscoveredTotal int64 `json:"folders_discovered_total"`
+	// Traversal phase metrics
+	FilesDiscoveredTotal     int64   `json:"files_discovered_total,omitempty"`
+	FoldersDiscoveredTotal   int64   `json:"folders_discovered_total,omitempty"`
+	DiscoveryRateItemsPerSec float64 `json:"discovery_rate_items_per_sec,omitempty"`
+	TotalDiscovered          int64   `json:"total_discovered,omitempty"` // files + folders
 
-	// EMA-smoothed rates (2-5 second window)
-	DiscoveryRateItemsPerSec float64 `json:"discovery_rate_items_per_sec"`
+	// Copy phase metrics (new format from engine - published every ~200ms)
+	Folders        int64   `json:"folders,omitempty"`          // Total folders created
+	Files          int64   `json:"files,omitempty"`            // Total files created
+	Total          int64   `json:"total,omitempty"`            // Total items (folders + files)
+	Bytes          int64   `json:"bytes,omitempty"`            // Total bytes transferred
+	ItemsPerSecond float64 `json:"items_per_second,omitempty"` // Combined items/sec (EMA-smoothed, ~5 second window)
+	BytesPerSecond float64 `json:"bytes_per_second,omitempty"` // Bytes/sec transfer rate (EMA-smoothed, ~5 second window)
 
-	// Verification counts (for O(1) stats bucket lookups)
-	TotalDiscovered int64 `json:"total_discovered"` // files + folders
-	TotalPending    int   `json:"-"`                // pending across all rounds (from DB) - internal use only, not displayed
-	TotalFailed     int   `json:"-"`                // failed across all rounds - internal use only, not displayed
+	// Common state fields (used by both phases)
+	// Note: JSON field names match engine output (snake_case for copy, camelCase for traversal)
+	Round        int    `json:"round"`
+	Pending      int    `json:"pending"`     // Also available as "pending" in copy phase JSON
+	InProgress   int    `json:"in_progress"` // Copy phase uses "in_progress", traversal may use "inProgress"
+	Workers      int    `json:"workers"`
+	TotalPending int    `json:"total_pending,omitempty"` // Total pending from DB (copy phase only)
+	TotalFailed  int    `json:"total_failed,omitempty"`  // Total failed from DB (copy phase only)
+	Name         string `json:"name,omitempty"`          // Queue name ("copy", "src-traversal", "dst-traversal")
 
-	// Current state (for API)
-	QueueStats
-	Round int `json:"round"`
+	// Legacy fields for backward compatibility with traversal phase
+	TotalTracked int `json:"totalTracked,omitempty"` // For traversal phase compatibility
 }
 
 // QueueStats represents basic queue statistics
