@@ -56,6 +56,7 @@ func main() {
 		CoreBridge:  coreBridge,
 		AuthManager: authManager,
 		Middleware:  apiMiddleware,
+		DataDir:     cfg.Runtime.DataDir,
 	})
 
 	httpServer := server.New(server.Config{

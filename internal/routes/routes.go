@@ -15,6 +15,7 @@ import (
 	healthroutes "github.com/Project-Sylos/Sylos-API/internal/routes/health"
 	middlewarepkg "github.com/Project-Sylos/Sylos-API/internal/routes/middleware"
 	migrationroutes "github.com/Project-Sylos/Sylos-API/internal/routes/migrations"
+	preferencesroutes "github.com/Project-Sylos/Sylos-API/internal/routes/preferences"
 	serviceroutes "github.com/Project-Sylos/Sylos-API/internal/routes/services"
 )
 
@@ -23,6 +24,7 @@ type Dependencies struct {
 	CoreBridge  corebridge.Bridge
 	AuthManager *auth.Manager
 	Middleware  *middlewarepkg.Middleware
+	DataDir     string
 }
 
 func New(deps Dependencies) chi.Router {
@@ -54,6 +56,7 @@ func New(deps Dependencies) chi.Router {
 	healthroutes.RegisterProtected(apiRouter)
 	serviceroutes.Register(apiRouter, deps.Logger, deps.CoreBridge, mw)
 	migrationroutes.Register(apiRouter, deps.Logger, deps.CoreBridge, mw)
+	preferencesroutes.Register(apiRouter, deps.Logger, deps.DataDir, mw)
 
 	router.Mount("/api", apiRouter)
 

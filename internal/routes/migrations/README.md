@@ -698,7 +698,6 @@ All endpoints may return the following error responses:
 - All timestamps are in ISO 8601 format (UTC)
 - All endpoints require authentication (JWT token in Authorization header)
 - Base URL is typically `/api` in production
-- Legacy endpoints are maintained for backward compatibility
 - Database operations are read-only for monitoring endpoints
 - Missing buckets/queues return empty/null values gracefully
 

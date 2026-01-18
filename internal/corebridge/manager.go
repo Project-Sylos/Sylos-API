@@ -905,7 +905,6 @@ func (m *Manager) GetQueueMetrics(ctx context.Context, migrationID string) (*Que
 			Name:         dbMetrics.SrcTraversal.Name,
 			TotalPending: dbMetrics.SrcTraversal.TotalPending,
 			TotalFailed:  dbMetrics.SrcTraversal.TotalFailed,
-			TotalTracked: dbMetrics.SrcTraversal.TotalTracked,
 		}
 	}
 	if dbMetrics.DstTraversal != nil {
@@ -924,7 +923,6 @@ func (m *Manager) GetQueueMetrics(ctx context.Context, migrationID string) (*Que
 			Name:         dbMetrics.DstTraversal.Name,
 			TotalPending: dbMetrics.DstTraversal.TotalPending,
 			TotalFailed:  dbMetrics.DstTraversal.TotalFailed,
-			TotalTracked: dbMetrics.DstTraversal.TotalTracked,
 		}
 	}
 	if dbMetrics.Copy != nil {
@@ -945,9 +943,6 @@ func (m *Manager) GetQueueMetrics(ctx context.Context, migrationID string) (*Que
 			TotalPending: dbMetrics.Copy.TotalPending,
 			TotalFailed:  dbMetrics.Copy.TotalFailed,
 			Name:         dbMetrics.Copy.Name,
-
-			// Legacy fields for backward compatibility
-			TotalTracked: dbMetrics.Copy.TotalTracked,
 
 			// Traversal phase fields (may be empty for copy phase)
 			FilesDiscoveredTotal:     dbMetrics.Copy.FilesDiscoveredTotal,
@@ -1348,16 +1343,6 @@ func (m *Manager) SearchPathReviewItems(ctx context.Context, migrationID string,
 	}, nil
 }
 
-// ExcludeNode excludes nodes and queues their children for exclusion propagation
-// Accepts either a single nodeID (for backward compatibility) or an ExclusionRequest
-func (m *Manager) ExcludeNode(ctx context.Context, migrationID string, nodeID string) (*ExclusionResponse, error) {
-	// For backward compatibility, treat single nodeID as a request with one node
-	req := ExclusionRequest{
-		NodeIDs: []string{nodeID},
-	}
-	return m.ExcludeNodes(ctx, migrationID, req)
-}
-
 // ExcludeNodes excludes nodes based on ExclusionRequest
 func (m *Manager) ExcludeNodes(ctx context.Context, migrationID string, req ExclusionRequest) (*ExclusionResponse, error) {
 	// Prepare path review context first to check review phase
@@ -1494,16 +1479,6 @@ func (m *Manager) ExcludeNodes(ctx context.Context, migrationID string, req Excl
 	return &ExclusionResponse{
 		Success: true,
 	}, nil
-}
-
-// UnexcludeNode unexcludes a node and queues its children for unexclusion propagation
-// Accepts either a single nodeID (for backward compatibility) or an ExclusionRequest
-func (m *Manager) UnexcludeNode(ctx context.Context, migrationID string, nodeID string) (*ExclusionResponse, error) {
-	// For backward compatibility, treat single nodeID as a request with one node
-	req := ExclusionRequest{
-		NodeIDs: []string{nodeID},
-	}
-	return m.UnexcludeNodes(ctx, migrationID, req)
 }
 
 // UnexcludeNodes unexcludes nodes based on ExclusionRequest
@@ -2808,21 +2783,32 @@ func (m *Manager) getMigrationPhase(migrationID string) (string, error) {
 // checkPhaseLock checks if an operation is allowed in the current migration phase
 // Returns error if operation is locked, nil if allowed
 func (m *Manager) checkPhaseLock(migrationID string, operation string) error {
-	phase, err := m.getMigrationPhase(migrationID)
-	if err != nil {
-		return fmt.Errorf("failed to determine migration phase: %w", err)
-	}
-
 	switch operation {
 	case "setRoot":
-		// Root selection locked when traversal starts
-		if phase == "traversal" || phase == "copy" {
-			return fmt.Errorf("root selection is locked: migration is in %s phase", phase)
+		// For setRoot, check if both roots are already set
+		// If both roots are NOT set, allow root setting regardless of phase (new migration)
+		// If both roots ARE set, then check phase to prevent changing roots of active migration
+		plan := m.rootsMgr.GetPlan(migrationID)
+		if plan != nil && plan.HasSource && plan.HasDestination {
+			// Both roots are set - check phase to prevent changing roots of active migration
+			phase, err := m.getMigrationPhase(migrationID)
+			if err != nil {
+				return fmt.Errorf("failed to determine migration phase: %w", err)
+			}
+			if phase == "traversal" || phase == "copy" {
+				return fmt.Errorf("root selection is locked: migration is in %s phase", phase)
+			}
 		}
+		// If both roots are not set, allow root setting (new migration scenario)
+		return nil
 	case "startTraversal", "retrySweep", "exclude", "unexclude", "markRetry":
 		// Traversal operations locked when copy starts
 		// Note: markRetry is allowed in both phases (for traversal retries and copy retries)
 		// but exclusion is only for traversal phase
+		phase, err := m.getMigrationPhase(migrationID)
+		if err != nil {
+			return fmt.Errorf("failed to determine migration phase: %w", err)
+		}
 		if operation == "exclude" || operation == "unexclude" {
 			if phase == "copy" {
 				return fmt.Errorf("exclusion operations are locked: migration is in copy phase (exclusion only applies to traversal)")

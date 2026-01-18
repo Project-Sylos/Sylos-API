@@ -228,9 +228,6 @@ type ExternalQueueMetrics struct {
 	TotalPending int    `json:"total_pending,omitempty"` // Total pending from DB (copy phase)
 	TotalFailed  int    `json:"total_failed,omitempty"`  // Total failed from DB (copy phase)
 	Name         string `json:"name,omitempty"`          // Queue name ("copy", "src-traversal", etc.)
-
-	// Legacy fields for backward compatibility
-	TotalTracked int `json:"totalTracked,omitempty"` // For traversal phase compatibility
 }
 
 // QueueMetricsResponse represents all queue metrics for a migration
@@ -466,16 +463,12 @@ type Bridge interface {
 	GetQueueMetrics(ctx context.Context, migrationID string) (*QueueMetricsResponse, error)
 	GetLogs(ctx context.Context, migrationID string, req GetLogsRequest) (*GetLogsResponse, error)
 	ListChildrenDiffs(ctx context.Context, req ListChildrenDiffsRequest) (ListChildrenDiffsResponse, error)
-	ExcludeNode(ctx context.Context, migrationID string, nodeID string) (*ExclusionResponse, error)
 	ExcludeNodes(ctx context.Context, migrationID string, req ExclusionRequest) (*ExclusionResponse, error)
-	UnexcludeNode(ctx context.Context, migrationID string, nodeID string) (*ExclusionResponse, error)
 	UnexcludeNodes(ctx context.Context, migrationID string, req ExclusionRequest) (*ExclusionResponse, error)
 	CheckPendingWork(ctx context.Context, migrationID string) (PendingWorkResponse, error)
 	ChangePhase(ctx context.Context, migrationID string, phase string, req StartMigrationRequest) (Migration, error)
-	MarkNodesForRetry(ctx context.Context, migrationID string, req MarkRetryRequest) (*MarkRetryResponse, error)
 	MarkNodesForRetryDiscovery(ctx context.Context, migrationID string, req MarkRetryRequest) (*MarkRetryResponse, error)
 	MarkNodesForRetryCopy(ctx context.Context, migrationID string, req MarkRetryRequest) (*MarkRetryResponse, error)
-	UnmarkNodeForRetry(ctx context.Context, migrationID string, nodeID string) (*MarkRetryResponse, error)
 	UnmarkNodeForRetryDiscovery(ctx context.Context, migrationID string, nodeID string) (*MarkRetryResponse, error)
 	UnmarkNodeForRetryCopy(ctx context.Context, migrationID string, nodeID string) (*MarkRetryResponse, error)
 	GetBackgroundTasks(ctx context.Context, migrationID string) ([]BackgroundTask, error)

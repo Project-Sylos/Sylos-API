@@ -391,9 +391,6 @@ type ExternalQueueMetrics struct {
 	TotalPending int    `json:"total_pending,omitempty"` // Total pending from DB (copy phase only)
 	TotalFailed  int    `json:"total_failed,omitempty"`  // Total failed from DB (copy phase only)
 	Name         string `json:"name,omitempty"`          // Queue name ("copy", "src-traversal", "dst-traversal")
-
-	// Legacy fields for backward compatibility with traversal phase
-	TotalTracked int `json:"totalTracked,omitempty"` // For traversal phase compatibility
 }
 
 // QueueStats represents basic queue statistics

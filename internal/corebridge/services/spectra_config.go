@@ -8,15 +8,27 @@ import (
 )
 
 // SpectraConfig represents the structure of a Spectra config file
+// Supports both old format (min_folders/min_files) and new format (weighted distribution)
 type SpectraConfig struct {
 	Seed struct {
-		MaxDepth   int    `json:"max_depth"`
-		MinFolders int    `json:"min_folders"`
-		MaxFolders int    `json:"max_folders"`
-		MinFiles   int    `json:"min_files"`
-		MaxFiles   int    `json:"max_files"`
-		Seed       int    `json:"seed"`
-		DBPath     string `json:"db_path"`
+		MaxDepth int    `json:"max_depth"`
+		DBPath   string `json:"db_path"`
+		Seed     int    `json:"seed,omitempty"`
+
+		// Old format (deprecated, kept for backwards compatibility)
+		MinFolders *int `json:"min_folders,omitempty"`
+		MinFiles   *int `json:"min_files,omitempty"`
+
+		// New format - weighted distribution (required)
+		MaxFolders             int     `json:"max_folders"`
+		FolderBackoffFactor    float64 `json:"folder_backoff_factor,omitempty"`
+		FolderDepthDecayFactor float64 `json:"folder_depth_decay_factor,omitempty"`
+		MaxFiles               int     `json:"max_files"`
+		FileBackoffFactor      float64 `json:"file_backoff_factor,omitempty"`
+		FileDepthDecayFactor   float64 `json:"file_depth_decay_factor,omitempty"`
+
+		// Cache configuration (optional, defaults to false)
+		EnableCache bool `json:"enable_cache,omitempty"`
 	} `json:"seed"`
 	API struct {
 		Host string `json:"host"`

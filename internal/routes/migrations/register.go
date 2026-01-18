@@ -38,9 +38,7 @@ func Register(router chi.Router, logger zerolog.Logger, core corebridge.Bridge, 
 	router.Post("/migrations/{migrationID}/logs", middleware.JSON(mw, h.getLogs))
 	router.Get("/migrations/{migrationID}/diffs", middleware.NoBody(mw, h.listDiffs))
 	router.Post("/migrations/{migrationID}/exclude", middleware.JSON(mw, h.excludeNodes))
-	router.Post("/migrations/{migrationID}/node/{nodeID}/exclude", middleware.NoBody(mw, h.excludeNode)) // Backward compatibility
 	router.Post("/migrations/{migrationID}/unexclude", middleware.JSON(mw, h.unexcludeNodes))
-	router.Post("/migrations/{migrationID}/node/{nodeID}/unexclude", middleware.NoBody(mw, h.unexcludeNode)) // Backward compatibility
 	router.Post("/migrations/{migrationID}/node/{nodeID}/mark-retry-discovery", middleware.NoBody(mw, h.markNodeForRetryDiscovery))
 	router.Post("/migrations/{migrationID}/node/{nodeID}/mark-retry-copy", middleware.NoBody(mw, h.markNodeForRetryCopy))
 	router.Post("/migrations/{migrationID}/node/{nodeID}/unmark-retry-discovery", middleware.NoBody(mw, h.unmarkNodeForRetryDiscovery))
