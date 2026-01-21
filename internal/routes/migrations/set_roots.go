@@ -5,8 +5,8 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/Project-Sylos/Sylos-API/internal/corebridge"
-	"github.com/Project-Sylos/Sylos-API/internal/routes/middleware"
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
+	"codeberg.org/Sylos/Sylos-API/internal/routes/middleware"
 )
 
 func (h handler) setRoot(ctx *middleware.Context, payload corebridge.SetRootRequest) {

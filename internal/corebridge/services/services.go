@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"path/filepath"
 
-	"github.com/Project-Sylos/Sylos-API/pkg/config"
-	fslib "github.com/Project-Sylos/Sylos-FS/pkg/fs"
-	fstypes "github.com/Project-Sylos/Sylos-FS/pkg/types"
+	"codeberg.org/Sylos/Sylos-API/pkg/config"
+	fslib "codeberg.org/Sylos/Sylos-FS/pkg/fs"
+	fstypes "codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
 // ServiceType represents the type of service
@@ -285,7 +285,6 @@ func (m *ServiceManager) AcquireAdapter(def ServiceDefinition, rootID, sessionID
 	default:
 		return nil, nil, fmt.Errorf("unsupported service type: %s", def.Type)
 	}
-
 
 	// Acquire adapter from Sylos-FS
 	// For Spectra: sessionID must match a registered session

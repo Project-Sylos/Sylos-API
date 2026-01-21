@@ -4,7 +4,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/rs/zerolog"
 
-	"github.com/Project-Sylos/Sylos-API/internal/routes/middleware"
+	"codeberg.org/Sylos/Sylos-API/internal/routes/middleware"
 )
 
 type handler struct {

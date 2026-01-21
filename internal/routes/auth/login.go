@@ -3,7 +3,7 @@ package auth
 import (
 	"net/http"
 
-	"github.com/Project-Sylos/Sylos-API/internal/routes/middleware"
+	"codeberg.org/Sylos/Sylos-API/internal/routes/middleware"
 )
 
 type loginRequest struct {

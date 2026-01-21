@@ -5,8 +5,8 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
-	"github.com/Project-Sylos/Sylos-API/internal/corebridge"
-	"github.com/Project-Sylos/Sylos-API/internal/routes/middleware"
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
+	"codeberg.org/Sylos/Sylos-API/internal/routes/middleware"
 )
 
 // retrySweep handles POST /api/migrations/{migrationID}/retry-sweep
@@ -29,12 +29,12 @@ func (h handler) retrySweep(ctx *middleware.Context, payload corebridge.SweepCon
 				statusCode = http.StatusBadRequest
 			}
 		}
-		
+
 		h.logger.Error().
 			Err(err).
 			Str("migration_id", migrationID).
 			Msg("failed to trigger retry sweep")
-		
+
 		ctx.Response(statusCode, response)
 		return
 	}

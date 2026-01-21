@@ -9,8 +9,8 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
-	"github.com/Project-Sylos/Sylos-API/internal/corebridge"
-	"github.com/Project-Sylos/Sylos-API/internal/routes/httputil"
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
+	"codeberg.org/Sylos/Sylos-API/internal/routes/httputil"
 )
 
 func (h handler) handleStream(w http.ResponseWriter, r *http.Request) {

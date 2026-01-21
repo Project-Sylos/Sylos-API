@@ -9,14 +9,14 @@ import (
 	"github.com/go-chi/cors"
 	"github.com/rs/zerolog"
 
-	"github.com/Project-Sylos/Sylos-API/internal/auth"
-	"github.com/Project-Sylos/Sylos-API/internal/corebridge"
-	authroutes "github.com/Project-Sylos/Sylos-API/internal/routes/auth"
-	healthroutes "github.com/Project-Sylos/Sylos-API/internal/routes/health"
-	middlewarepkg "github.com/Project-Sylos/Sylos-API/internal/routes/middleware"
-	migrationroutes "github.com/Project-Sylos/Sylos-API/internal/routes/migrations"
-	preferencesroutes "github.com/Project-Sylos/Sylos-API/internal/routes/preferences"
-	serviceroutes "github.com/Project-Sylos/Sylos-API/internal/routes/services"
+	"codeberg.org/Sylos/Sylos-API/internal/auth"
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
+	authroutes "codeberg.org/Sylos/Sylos-API/internal/routes/auth"
+	healthroutes "codeberg.org/Sylos/Sylos-API/internal/routes/health"
+	middlewarepkg "codeberg.org/Sylos/Sylos-API/internal/routes/middleware"
+	migrationroutes "codeberg.org/Sylos/Sylos-API/internal/routes/migrations"
+	preferencesroutes "codeberg.org/Sylos/Sylos-API/internal/routes/preferences"
+	serviceroutes "codeberg.org/Sylos/Sylos-API/internal/routes/services"
 )
 
 type Dependencies struct {

@@ -1,11 +1,11 @@
-module github.com/Project-Sylos/Sylos-API
+module codeberg.org/Sylos/Sylos-API
 
-go 1.24.2
+go 1.25.6
 
 require (
-	github.com/Project-Sylos/Migration-Engine v0.1.31
-	github.com/Project-Sylos/Spectra v0.2.56
-	github.com/Project-Sylos/Sylos-FS v0.1.3
+	codeberg.org/Sylos/Migration-Engine v0.1.31
+	codeberg.org/Sylos/Spectra v0.2.56
+	codeberg.org/Sylos/Sylos-FS v0.1.3
 	github.com/go-chi/chi/v5 v5.2.3
 	github.com/go-chi/cors v1.2.1
 	github.com/golang-jwt/jwt/v5 v5.3.0
@@ -49,8 +49,8 @@ require (
 	gonum.org/v1/gonum v0.15.1 // indirect
 )
 
-replace github.com/Project-Sylos/Migration-Engine => ../Migration-Engine
+replace codeberg.org/Sylos/Migration-Engine => ../Migration-Engine
 
-replace github.com/Project-Sylos/Sylos-FS => ../Sylos-FS
+replace codeberg.org/Sylos/Sylos-FS => ../Sylos-FS
 
-replace github.com/Project-Sylos/Spectra => ../Spectra
+replace codeberg.org/Sylos/Spectra => ../Spectra

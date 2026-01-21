@@ -4,8 +4,8 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/Project-Sylos/Sylos-API/internal/corebridge"
-	"github.com/Project-Sylos/Sylos-API/internal/routes/middleware"
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
+	"codeberg.org/Sylos/Sylos-API/internal/routes/middleware"
 )
 
 func (h handler) list(ctx *middleware.Context) {

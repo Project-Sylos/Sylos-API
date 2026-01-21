@@ -4,9 +4,9 @@ import (
 	"os"
 	"strings"
 
-	"github.com/Project-Sylos/Migration-Engine/pkg/migration"
-	corebridgeDB "github.com/Project-Sylos/Sylos-API/internal/corebridge/database"
-	"github.com/Project-Sylos/Sylos-API/internal/corebridge/metadata"
+	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
+	corebridgeDB "codeberg.org/Sylos/Sylos-API/internal/corebridge/database"
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge/metadata"
 )
 
 // RecoverInterruptedETL scans all migrations and resumes ETL for any that were interrupted

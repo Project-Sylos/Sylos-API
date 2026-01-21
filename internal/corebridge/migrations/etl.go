@@ -7,10 +7,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Project-Sylos/Migration-Engine/pkg/db"
-	"github.com/Project-Sylos/Migration-Engine/pkg/db/etl"
-	"github.com/Project-Sylos/Migration-Engine/pkg/migration"
-	corebridgeDB "github.com/Project-Sylos/Sylos-API/internal/corebridge/database"
+	"codeberg.org/Sylos/Migration-Engine/pkg/db"
+	"codeberg.org/Sylos/Migration-Engine/pkg/db/etl"
+	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
+	corebridgeDB "codeberg.org/Sylos/Sylos-API/internal/corebridge/database"
 )
 
 // runETL runs the ETL process to migrate data from BoltDB to DuckDB

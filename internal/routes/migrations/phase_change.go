@@ -7,8 +7,8 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
-	"github.com/Project-Sylos/Sylos-API/internal/corebridge"
-	"github.com/Project-Sylos/Sylos-API/internal/routes/middleware"
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
+	"codeberg.org/Sylos/Sylos-API/internal/routes/middleware"
 )
 
 type PhaseChangeRequest struct {
@@ -54,16 +54,16 @@ func (h handler) changePhase(ctx *middleware.Context, payload PhaseChangeRequest
 			Str("migration_id", migrationID).
 			Str("phase", payload.Phase).
 			Msg("failed to change phase")
-		
+
 		// Determine appropriate HTTP status code
 		statusCode := http.StatusInternalServerError
-		if strings.Contains(err.Error(), "invalid phase") || 
-		   strings.Contains(err.Error(), "pending retries") ||
-		   strings.Contains(err.Error(), "running background tasks") ||
-		   strings.Contains(err.Error(), "DuckDB file not found") {
+		if strings.Contains(err.Error(), "invalid phase") ||
+			strings.Contains(err.Error(), "pending retries") ||
+			strings.Contains(err.Error(), "running background tasks") ||
+			strings.Contains(err.Error(), "DuckDB file not found") {
 			statusCode = http.StatusBadRequest
 		}
-		
+
 		ctx.Response(statusCode, corebridge.Migration{
 			ID:      migrationID,
 			Status:  "error",

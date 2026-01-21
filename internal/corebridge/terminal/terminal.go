@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"sync"
 
-	"github.com/Project-Sylos/Sylos-API/pkg/config"
+	"codeberg.org/Sylos/Sylos-API/pkg/config"
 	"github.com/rs/zerolog"
 )
 

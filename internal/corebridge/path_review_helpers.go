@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/Project-Sylos/Migration-Engine/pkg/migration"
-	"github.com/Project-Sylos/Sylos-API/internal/corebridge/database"
-	"github.com/Project-Sylos/Sylos-API/internal/corebridge/metadata"
+	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge/database"
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge/metadata"
 )
 
 // PathReviewContext holds the context needed for path review operations

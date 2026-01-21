@@ -1,6 +1,6 @@
 # Sylos API
 
-Public REST layer for Sylos that sits between the Wails desktop UI and the Migration Engine SDK. It authenticates UI requests, exposes filesystem browsing helpers, and orchestrates migrations by delegating directly to `github.com/Project-Sylos/Migration-Engine`.
+Public REST layer for Sylos that sits between the Wails desktop UI and the Migration Engine SDK. It authenticates UI requests, exposes filesystem browsing helpers, and orchestrates migrations by delegating directly to `codeberg.org/Sylos/Migration-Engine`.
 
 ---
 

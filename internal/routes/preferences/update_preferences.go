@@ -6,7 +6,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/Project-Sylos/Sylos-API/internal/routes/middleware"
+	"codeberg.org/Sylos/Sylos-API/internal/routes/middleware"
 )
 
 func (h handler) updatePreferences(ctx *middleware.Context, prefs Preferences) {

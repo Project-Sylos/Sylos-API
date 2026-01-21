@@ -6,13 +6,13 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/Project-Sylos/Migration-Engine/pkg/db"
-	"github.com/Project-Sylos/Migration-Engine/pkg/logservice"
-	"github.com/Project-Sylos/Migration-Engine/pkg/migration"
-	"github.com/Project-Sylos/Migration-Engine/pkg/queue"
-	corebridgeDB "github.com/Project-Sylos/Sylos-API/internal/corebridge/database"
-	"github.com/Project-Sylos/Sylos-API/internal/corebridge/services"
-	fstypes "github.com/Project-Sylos/Sylos-FS/pkg/types"
+	"codeberg.org/Sylos/Migration-Engine/pkg/db"
+	"codeberg.org/Sylos/Migration-Engine/pkg/logservice"
+	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
+	"codeberg.org/Sylos/Migration-Engine/pkg/queue"
+	corebridgeDB "codeberg.org/Sylos/Sylos-API/internal/corebridge/database"
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge/services"
+	fstypes "codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
 func (m *Manager) ExecuteMigration(migrationID string, srcDef, dstDef services.ServiceDefinition, srcFolder, dstFolder fstypes.Folder, opts MigrationOptions, resolveDBPath func(path, migrationID string) (string, error), acquireAdapter func(services.ServiceDefinition, string, string) (fstypes.FSAdapter, func(), error)) (*migration.Result, error) {

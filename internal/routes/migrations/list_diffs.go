@@ -7,8 +7,8 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
-	"github.com/Project-Sylos/Sylos-API/internal/corebridge"
-	"github.com/Project-Sylos/Sylos-API/internal/routes/middleware"
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
+	"codeberg.org/Sylos/Sylos-API/internal/routes/middleware"
 )
 
 func (h handler) listDiffs(ctx *middleware.Context) {
@@ -71,4 +71,3 @@ func (h handler) listDiffs(ctx *middleware.Context) {
 
 	ctx.Response(http.StatusOK, diffs)
 }
-

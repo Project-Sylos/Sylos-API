@@ -4,8 +4,8 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/rs/zerolog"
 
-	appauth "github.com/Project-Sylos/Sylos-API/internal/auth"
-	"github.com/Project-Sylos/Sylos-API/internal/routes/middleware"
+	appauth "codeberg.org/Sylos/Sylos-API/internal/auth"
+	"codeberg.org/Sylos/Sylos-API/internal/routes/middleware"
 )
 
 type handler struct {

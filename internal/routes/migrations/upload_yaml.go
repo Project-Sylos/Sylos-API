@@ -5,7 +5,7 @@ import (
 	"io"
 	"net/http"
 
-	"github.com/Project-Sylos/Sylos-API/internal/routes/middleware"
+	"codeberg.org/Sylos/Sylos-API/internal/routes/middleware"
 	"github.com/go-chi/chi/v5"
 )
 
@@ -58,4 +58,3 @@ func (h handler) uploadYAML(ctx *middleware.Context) {
 
 	ctx.Response(http.StatusOK, response)
 }
-

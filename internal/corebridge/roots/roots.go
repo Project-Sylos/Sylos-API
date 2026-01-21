@@ -10,10 +10,10 @@ import (
 	"math/rand"
 	"time"
 
-	"github.com/Project-Sylos/Migration-Engine/pkg/db"
-	"github.com/Project-Sylos/Migration-Engine/pkg/migration"
-	"github.com/Project-Sylos/Sylos-API/internal/corebridge/services"
-	fstypes "github.com/Project-Sylos/Sylos-FS/pkg/types"
+	"codeberg.org/Sylos/Migration-Engine/pkg/db"
+	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge/services"
+	fstypes "codeberg.org/Sylos/Sylos-FS/pkg/types"
 	"github.com/oklog/ulid/v2"
 	"github.com/rs/zerolog"
 )
@@ -281,7 +281,6 @@ func (m *Manager) SetRoot(ctx context.Context, req SetRootRequest) (SetRootRespo
 		// For non-Spectra services, use connectionID as-is
 		sessionID = connectionID
 	}
-
 
 	// Acquire adapter for the root being set (blocking I/O - do NOT hold lock)
 	// For Spectra: session must be registered first using RegisterSpectraSession()

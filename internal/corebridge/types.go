@@ -5,8 +5,8 @@ import (
 	"errors"
 	"time"
 
-	"github.com/Project-Sylos/Migration-Engine/pkg/migration"
-	fstypes "github.com/Project-Sylos/Sylos-FS/pkg/types"
+	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
+	fstypes "codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
 var (

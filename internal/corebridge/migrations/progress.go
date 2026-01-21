@@ -7,11 +7,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Project-Sylos/Migration-Engine/pkg/migration"
-	"github.com/Project-Sylos/Migration-Engine/pkg/queue"
-	corebridgeDB "github.com/Project-Sylos/Sylos-API/internal/corebridge/database"
-	"github.com/Project-Sylos/Sylos-API/internal/corebridge/services"
-	fstypes "github.com/Project-Sylos/Sylos-FS/pkg/types"
+	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
+	"codeberg.org/Sylos/Migration-Engine/pkg/queue"
+	corebridgeDB "codeberg.org/Sylos/Sylos-API/internal/corebridge/database"
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge/services"
+	fstypes "codeberg.org/Sylos/Sylos-FS/pkg/types"
 	"github.com/oklog/ulid/v2"
 )
 
