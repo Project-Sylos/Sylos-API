@@ -1072,9 +1072,10 @@ func (m *Manager) ListChildrenDiffs(ctx context.Context, req ListChildrenDiffsRe
 		yamlCfg, err := migration.LoadMigrationConfig(meta.ConfigPath)
 		if err == nil {
 			status := strings.TrimSpace(yamlCfg.State.Status)
-			if status == "Awaiting-Path-Review" || status == "Awaiting-Copy-Review" {
+			switch status {
+			case "Awaiting-Path-Review", "Awaiting-Copy-Review":
 				useDuckDB = true
-			} else if status == "Preparing-Path-Review" {
+			case "Preparing-Path-Review":
 				// Ensure ETL is running or completed
 				err := m.migrationsMgr.EnsureETLCompleted(req.MigrationID, meta.ConfigPath, dbPath)
 				if err != nil {
@@ -1084,7 +1085,8 @@ func (m *Manager) ListChildrenDiffs(ctx context.Context, req ListChildrenDiffsRe
 				yamlCfg, err = migration.LoadMigrationConfig(meta.ConfigPath)
 				if err == nil {
 					updatedStatus := strings.TrimSpace(yamlCfg.State.Status)
-					if updatedStatus == "Awaiting-Path-Review" || updatedStatus == "Awaiting-Copy-Review" {
+					switch updatedStatus {
+					case "Awaiting-Path-Review", "Awaiting-Copy-Review":
 						useDuckDB = true
 					}
 				}
@@ -1367,18 +1369,6 @@ func (m *Manager) ExcludeNodes(ctx context.Context, migrationID string, req Excl
 			Error:   "exclusion operations are not available in copy phase (exclusion only applies to traversal)",
 		}, fmt.Errorf("exclusion operations are locked in copy phase")
 	}
-	if err != nil {
-		if err == ErrMigrationNotFound {
-			return &ExclusionResponse{
-				Success: false,
-				Error:   "migration not found",
-			}, err
-		}
-		return &ExclusionResponse{
-			Success: false,
-			Error:   err.Error(),
-		}, err
-	}
 
 	// Handle 'all' option
 	if req.All {
@@ -1504,18 +1494,6 @@ func (m *Manager) UnexcludeNodes(ctx context.Context, migrationID string, req Ex
 			Success: false,
 			Error:   "exclusion operations are not available in copy phase (exclusion only applies to traversal)",
 		}, fmt.Errorf("exclusion operations are locked in copy phase")
-	}
-	if err != nil {
-		if err == ErrMigrationNotFound {
-			return &ExclusionResponse{
-				Success: false,
-				Error:   "migration not found",
-			}, err
-		}
-		return &ExclusionResponse{
-			Success: false,
-			Error:   err.Error(),
-		}, err
 	}
 
 	// Handle 'all' option
@@ -2111,7 +2089,14 @@ func (m *Manager) acquireSharedSpectraAdaptersForSweep(srcCfg, dstCfg migration.
 		}
 	}
 
-	srcAdapter, err := fslib.NewSpectraFS(spectraFS, srcRootID, srcWorld)
+	// Detect ephemeral mode from config
+	isEphemeral, err := services.IsEphemeralMode(srcConfigPath)
+	if err != nil {
+		m.logger.Warn().Err(err).Str("config_path", srcConfigPath).Msg("failed to detect ephemeral mode, defaulting to persistent")
+		isEphemeral = false
+	}
+
+	srcAdapter, err := fslib.NewSpectraFS(spectraFS, srcRootID, srcWorld, isEphemeral)
 	if err != nil {
 		_ = spectraFS.Close()
 		return nil, nil, false, fmt.Errorf("failed to create source adapter: %w", err)
@@ -2133,7 +2118,8 @@ func (m *Manager) acquireSharedSpectraAdaptersForSweep(srcCfg, dstCfg migration.
 		}
 	}
 
-	dstAdapter, err := fslib.NewSpectraFS(spectraFS, dstRootID, dstWorld)
+	// Use same ephemeral mode detection as source (they share the same config)
+	dstAdapter, err := fslib.NewSpectraFS(spectraFS, dstRootID, dstWorld, isEphemeral)
 	if err != nil {
 		_ = spectraFS.Close()
 		return nil, nil, false, fmt.Errorf("failed to create destination adapter: %w", err)
@@ -2204,7 +2190,14 @@ func (m *Manager) acquireAdapterFromYAMLConfigForSweep(serviceCfg migration.Serv
 			}
 		}
 
-		adapter, err := fslib.NewSpectraFS(spectraFS, rootID, world)
+		// Detect ephemeral mode from config
+		isEphemeral, err := services.IsEphemeralMode(configPath)
+		if err != nil {
+			m.logger.Warn().Err(err).Str("config_path", configPath).Msg("failed to detect ephemeral mode, defaulting to persistent")
+			isEphemeral = false
+		}
+
+		adapter, err := fslib.NewSpectraFS(spectraFS, rootID, world, isEphemeral)
 		if err != nil {
 			_ = spectraFS.Close()
 			return nil, fmt.Errorf("failed to create SpectraFS adapter: %w", err)
@@ -2292,81 +2285,6 @@ func (m *Manager) CheckPendingWork(ctx context.Context, migrationID string) (Pen
 	}, nil
 }
 
-// MarkNodesForRetry marks nodes for retry based on MarkRetryRequest
-// This works for both traversal and copy phase retries - the phase is determined by the review context
-func (m *Manager) MarkNodesForRetry(ctx context.Context, migrationID string, req MarkRetryRequest) (*MarkRetryResponse, error) {
-	// Prepare path review context
-	prc, err := m.preparePathReviewContext(ctx, migrationID)
-	if err != nil {
-		if err == ErrMigrationNotFound {
-			return &MarkRetryResponse{
-				Success: false,
-				Error:   "migration not found",
-			}, err
-		}
-		return &MarkRetryResponse{
-			Success: false,
-			Error:   err.Error(),
-		}, err
-	}
-
-	// Handle 'all' option
-	if req.All {
-		// Retry all failed items
-		taskID := m.bgTaskMgr.StartTask(prc.MigrationID, BackgroundTaskTypeRetryAll)
-		go func() {
-			defer m.bgTaskMgr.CompleteTask(prc.MigrationID, taskID)
-			if err := database.RetryAllFailedDuckDB(context.Background(), m.logger, prc.DuckDBConn); err != nil {
-				m.logger.Error().
-					Err(err).
-					Str("migration_id", prc.MigrationID).
-					Msg("failed to retry all failed items")
-				m.bgTaskMgr.FailTask(prc.MigrationID, taskID, err)
-				return
-			}
-			if err := m.markPathReviewChanges(migrationID, true); err != nil {
-				m.logger.Warn().Err(err).Str("migration_id", migrationID).Msg("failed to mark path review changes")
-			}
-		}()
-		return &MarkRetryResponse{
-			Success: true,
-			TaskID:  taskID,
-		}, nil
-	}
-
-	// Process each node ID
-	for _, nodeID := range req.NodeIDs {
-		// Find node path from ULID
-		nodePath, err := m.findNodePathFromID(ctx, prc, nodeID)
-		if err != nil {
-			m.logger.Warn().
-				Err(err).
-				Str("node_id", nodeID).
-				Msg("failed to find node path, skipping")
-			continue
-		}
-
-		// Mark node for retry in DuckDB
-		err = database.MarkNodeForRetryDuckDB(ctx, m.logger, prc.DuckDBConn, nodePath)
-		if err != nil {
-			m.logger.Warn().
-				Err(err).
-				Str("node_path", nodePath).
-				Msg("failed to mark node for retry, skipping")
-			continue
-		}
-	}
-
-	// Mark that user made changes during path review
-	if err := m.markPathReviewChanges(migrationID, true); err != nil {
-		m.logger.Warn().Err(err).Str("migration_id", migrationID).Msg("failed to mark path review changes")
-	}
-
-	return &MarkRetryResponse{
-		Success: true,
-	}, nil
-}
-
 // RetryAllFailed marks all failed items for retry in a background task
 func (m *Manager) RetryAllFailed(ctx context.Context, migrationID string) (*MarkRetryResponse, error) {
 	// Prepare path review context
@@ -2445,51 +2363,6 @@ func (m *Manager) MarkAllFailedAsExcluded(ctx context.Context, migrationID strin
 	}()
 
 	return &ExclusionResponse{
-		Success: true,
-	}, nil
-}
-
-// UnmarkNodeForRetry unmarks a pending node for retry (changes status back to failed)
-func (m *Manager) UnmarkNodeForRetry(ctx context.Context, migrationID string, nodeID string) (*MarkRetryResponse, error) {
-	// Prepare path review context
-	prc, err := m.preparePathReviewContext(ctx, migrationID)
-	if err != nil {
-		if err == ErrMigrationNotFound {
-			return &MarkRetryResponse{
-				Success: false,
-				Error:   "migration not found",
-			}, err
-		}
-		return &MarkRetryResponse{
-			Success: false,
-			Error:   err.Error(),
-		}, err
-	}
-
-	// Find node path from ULID
-	nodePath, err := m.findNodePathFromID(ctx, prc, nodeID)
-	if err != nil {
-		return &MarkRetryResponse{
-			Success: false,
-			Error:   fmt.Sprintf("node not found: %v", err),
-		}, err
-	}
-
-	// Unmark node for retry in DuckDB
-	err = database.UnmarkNodeForRetryDuckDB(ctx, m.logger, prc.DuckDBConn, nodePath)
-	if err != nil {
-		return &MarkRetryResponse{
-			Success: false,
-			Error:   err.Error(),
-		}, err
-	}
-
-	// Mark that user made changes during path review
-	if err := m.markPathReviewChanges(migrationID, true); err != nil {
-		m.logger.Warn().Err(err).Str("migration_id", migrationID).Msg("failed to mark path review changes")
-	}
-
-	return &MarkRetryResponse{
 		Success: true,
 	}, nil
 }

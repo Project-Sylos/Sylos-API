@@ -256,6 +256,22 @@ func (p *DuckDBPool) EnsureOpen(migrationID, duckdbPath string) (*sql.DB, error)
 			return
 		}
 
+		// Run ANALYZE to stabilize indexes after bulk Appender load
+		// This is a workaround for DuckDB ART index issues with UPDATE operations
+		// See: https://github.com/duckdb/duckdb/issues/3249
+		if _, err := conn.Exec("ANALYZE src_nodes"); err != nil {
+			p.logger.Debug().
+				Err(err).
+				Str("migration_id", migrationID).
+				Msg("failed to analyze src_nodes (table may not exist yet)")
+		}
+		if _, err := conn.Exec("ANALYZE dst_nodes"); err != nil {
+			p.logger.Debug().
+				Err(err).
+				Str("migration_id", migrationID).
+				Msg("failed to analyze dst_nodes (table may not exist yet)")
+		}
+
 		// Store in pool
 		p.mu.Lock()
 		p.connections[migrationID] = conn

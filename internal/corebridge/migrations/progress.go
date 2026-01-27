@@ -312,6 +312,9 @@ func (m *Manager) RunMigration(record *MigrationRecord, srcDef, dstDef services.
 			currentStatus := strings.TrimSpace(yamlCfg.State.Status)
 
 			// Only trigger ETL if not already in Awaiting-Path-Review
+			// Note: SkipAutoETLAfterTraversal is not currently supported in the Migration Engine Config.
+			// ETL is triggered manually here after traversal completes. If SkipAutoETLAfterTraversal
+			// becomes available in the future, it should be checked here to conditionally skip ETL.
 			if currentStatus != "Awaiting-Path-Review" {
 				// Update status to Preparing-Path-Review
 				yamlCfg.State.Status = "Preparing-Path-Review"

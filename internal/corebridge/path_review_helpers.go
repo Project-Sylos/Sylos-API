@@ -23,7 +23,7 @@ type PathReviewContext struct {
 // preparePathReviewContext prepares the context for path review operations
 // It gets migration metadata, derives database paths, checks DuckDB availability,
 // and opens the DuckDB connection if needed.
-func (m *Manager) preparePathReviewContext(ctx context.Context, migrationID string) (*PathReviewContext, error) {
+func (m *Manager) preparePathReviewContext(_ context.Context, migrationID string) (*PathReviewContext, error) {
 	// Get migration metadata
 	metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
 	meta, err := metaMgr.GetMigrationMetadata(migrationID)
@@ -47,13 +47,14 @@ func (m *Manager) preparePathReviewContext(ctx context.Context, migrationID stri
 		yamlCfg, err := migration.LoadMigrationConfig(meta.ConfigPath)
 		if err == nil {
 			status := strings.TrimSpace(yamlCfg.State.Status)
-			if status == "Awaiting-Path-Review" {
+			switch status {
+			case "Awaiting-Path-Review":
 				useDuckDB = true
 				reviewPhase = "traversal"
-			} else if status == "Awaiting-Copy-Review" {
+			case "Awaiting-Copy-Review":
 				useDuckDB = true
 				reviewPhase = "copy"
-			} else if status == "Preparing-Path-Review" {
+			case "Preparing-Path-Review":
 				// Ensure ETL is running or completed
 				err := m.migrationsMgr.EnsureETLCompleted(migrationID, meta.ConfigPath, dbPath)
 				if err != nil {
@@ -63,10 +64,11 @@ func (m *Manager) preparePathReviewContext(ctx context.Context, migrationID stri
 				yamlCfg, err = migration.LoadMigrationConfig(meta.ConfigPath)
 				if err == nil {
 					updatedStatus := strings.TrimSpace(yamlCfg.State.Status)
-					if updatedStatus == "Awaiting-Path-Review" {
+					switch updatedStatus {
+					case "Awaiting-Path-Review":
 						useDuckDB = true
 						reviewPhase = "traversal"
-					} else if updatedStatus == "Awaiting-Copy-Review" {
+					case "Awaiting-Copy-Review":
 						useDuckDB = true
 						reviewPhase = "copy"
 					}

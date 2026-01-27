@@ -685,11 +685,6 @@ type PaginationInfo struct {
 	HasMore      bool `json:"hasMore"`      // Whether there are more items beyond the current page
 }
 
-// formatLevel formats a level number as an 8-digit zero-padded string
-func formatLevel(level int) string {
-	return fmt.Sprintf("%08d", level)
-}
-
 // PathNodes represents the src and dst nodes for a given path
 type PathNodes struct {
 	Src *PathNodeItem `json:"src,omitempty"` // SRC node if exists

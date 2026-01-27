@@ -440,7 +440,7 @@ func (m *Manager) StartMigration(ctx context.Context, req StartMigrationRequest)
 	return m.startMigrationFromRootsPlan(ctx, migrationID, opts)
 }
 
-func (m *Manager) startMigrationFromUploadedDB(ctx context.Context, migrationID string, opts MigrationOptions) (Migration, error) {
+func (m *Manager) startMigrationFromUploadedDB(_ context.Context, migrationID string, opts MigrationOptions) (Migration, error) {
 	// Validate that the DB file exists
 	if _, err := os.Stat(opts.DatabasePath); os.IsNotExist(err) {
 		return Migration{}, fmt.Errorf("database file not found: %s", opts.DatabasePath)
@@ -608,7 +608,7 @@ func (m *Manager) startMigrationFromUploadedDB(ctx context.Context, migrationID 
 	}, nil
 }
 
-func (m *Manager) startMigrationFromRootsPlan(ctx context.Context, migrationID string, opts MigrationOptions) (Migration, error) {
+func (m *Manager) startMigrationFromRootsPlan(_ context.Context, migrationID string, opts MigrationOptions) (Migration, error) {
 	// Require roots to be set
 	plan := m.rootsMgr.GetPlan(migrationID)
 	if plan == nil {
@@ -668,11 +668,24 @@ func (m *Manager) startMigrationFromRootsPlan(ctx context.Context, migrationID s
 			spectraDef = plan.DestinationDefinition
 		}
 
-		overridePath, err := services.SaveSpectraConfigOverride(m.cfg.Runtime.DataDir, migrationID, spectraDef.Spectra.ConfigPath)
+		// Check if override config already exists (e.g., saved from roots request with custom config)
+		// Only create a new override if one doesn't exist yet
+		existingOverride, exists, err := services.LoadSpectraConfigOverride(m.cfg.Runtime.DataDir, migrationID)
 		if err != nil {
-			return Migration{}, fmt.Errorf("failed to create Spectra config override: %w", err)
+			return Migration{}, fmt.Errorf("failed to check for existing Spectra config override: %w", err)
 		}
-		spectraConfigPath = overridePath
+
+		if exists {
+			// Use existing override (preserves config from roots request)
+			spectraConfigPath = existingOverride
+		} else {
+			// No existing override - create one from service definition
+			overridePath, err := services.SaveSpectraConfigOverride(m.cfg.Runtime.DataDir, migrationID, spectraDef.Spectra.ConfigPath)
+			if err != nil {
+				return Migration{}, fmt.Errorf("failed to create Spectra config override: %w", err)
+			}
+			spectraConfigPath = overridePath
+		}
 
 		// If both source and destination are Spectra, they must share the same connection ID
 		// to use the same underlying SpectraFS instance (prevents BoltDB lock conflicts)
@@ -1155,7 +1168,14 @@ func (m *Manager) acquireSharedSpectraAdapters(srcCfg, dstCfg migration.ServiceC
 		}
 	}
 
-	srcAdapter, err := fslib.NewSpectraFS(spectraFS, srcRootID, srcWorld)
+	// Detect ephemeral mode from config
+	isEphemeral, err := services.IsEphemeralMode(srcConfigPath)
+	if err != nil {
+		m.logger.Warn().Err(err).Str("config_path", srcConfigPath).Msg("failed to detect ephemeral mode, defaulting to persistent")
+		isEphemeral = false
+	}
+
+	srcAdapter, err := fslib.NewSpectraFS(spectraFS, srcRootID, srcWorld, isEphemeral)
 	if err != nil {
 		_ = spectraFS.Close()
 		return nil, nil, false, fmt.Errorf("failed to create source adapter: %w", err)
@@ -1177,7 +1197,8 @@ func (m *Manager) acquireSharedSpectraAdapters(srcCfg, dstCfg migration.ServiceC
 		}
 	}
 
-	dstAdapter, err := fslib.NewSpectraFS(spectraFS, dstRootID, dstWorld)
+	// Use same ephemeral mode detection as source (they share the same config)
+	dstAdapter, err := fslib.NewSpectraFS(spectraFS, dstRootID, dstWorld, isEphemeral)
 	if err != nil {
 		_ = spectraFS.Close()
 		return nil, nil, false, fmt.Errorf("failed to create destination adapter: %w", err)
@@ -1259,7 +1280,14 @@ func (m *Manager) acquireAdapterFromYAMLConfig(serviceCfg migration.ServiceConfi
 			}
 		}
 
-		adapter, err := fslib.NewSpectraFS(spectraFS, rootID, world)
+		// Detect ephemeral mode from config
+		isEphemeral, err := services.IsEphemeralMode(configPath)
+		if err != nil {
+			m.logger.Warn().Err(err).Str("config_path", configPath).Msg("failed to detect ephemeral mode, defaulting to persistent")
+			isEphemeral = false
+		}
+
+		adapter, err := fslib.NewSpectraFS(spectraFS, rootID, world, isEphemeral)
 		if err != nil {
 			_ = spectraFS.Close()
 			return nil, fmt.Errorf("failed to create SpectraFS adapter: %w", err)

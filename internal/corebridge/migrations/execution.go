@@ -299,12 +299,14 @@ func (m *Manager) selectSkipListener(opts MigrationOptions) bool {
 // selectVerificationOptions sets default verification options
 // Defaults: AllowPending=false (not allowed), AllowNotOnSrc=true (allowed)
 // These defaults apply to all migrations unless explicitly overridden
+// Note: AllowNotOnSrc=true is required for ephemeral mode (divergent trees are expected)
 func (m *Manager) selectVerificationOptions(opts VerificationOptions) migration.VerifyOptions {
 	// Start with defaults
 	verifyOpts := migration.VerifyOptions{
 		// Default: AllowPending is false (pending nodes should not be allowed)
 		AllowPending: false,
 		// Default: AllowNotOnSrc is true (nodes on dst but not on src are allowed)
+		// This is required for ephemeral mode where trees may diverge between calls
 		AllowNotOnSrc: true,
 	}
 

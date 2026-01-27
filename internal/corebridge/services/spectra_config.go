@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // SpectraConfig represents the structure of a Spectra config file
 // Supports both old format (min_folders/min_files) and new format (weighted distribution)
 type SpectraConfig struct {
+	Mode string `json:"mode,omitempty"` // "ephemeral" for ephemeral mode, empty or anything else for persistent mode
 	Seed struct {
 		MaxDepth int    `json:"max_depth"`
 		DBPath   string `json:"db_path"`
@@ -38,6 +40,7 @@ type SpectraConfig struct {
 }
 
 // SaveSpectraConfigOverride creates a Spectra config override file with a custom db_path
+// Preserves the original JSON structure to avoid introducing zero values for missing fields
 func SaveSpectraConfigOverride(dataDir, migrationID, originalConfigPath string) (string, error) {
 	// Read original config
 	data, err := os.ReadFile(originalConfigPath)
@@ -45,8 +48,9 @@ func SaveSpectraConfigOverride(dataDir, migrationID, originalConfigPath string) 
 		return "", fmt.Errorf("failed to read original Spectra config: %w", err)
 	}
 
-	var config SpectraConfig
-	if err := json.Unmarshal(data, &config); err != nil {
+	// Parse into a map to preserve all fields and structure
+	var configMap map[string]any
+	if err := json.Unmarshal(data, &configMap); err != nil {
 		return "", fmt.Errorf("failed to parse original Spectra config: %w", err)
 	}
 
@@ -56,7 +60,13 @@ func SaveSpectraConfigOverride(dataDir, migrationID, originalConfigPath string) 
 	if err != nil {
 		return "", fmt.Errorf("failed to resolve absolute path for Spectra DB: %w", err)
 	}
-	config.Seed.DBPath = absSpectraDBPath
+
+	// Navigate to seed.db_path and update it
+	if seed, ok := configMap["seed"].(map[string]any); ok {
+		seed["db_path"] = absSpectraDBPath
+	} else {
+		return "", fmt.Errorf("invalid config structure: 'seed' field is missing or not an object")
+	}
 
 	// Create override config file in migration-specific folder (same as migration DB/YAML)
 	migrationDir := filepath.Join(dataDir, migrationID)
@@ -67,8 +77,8 @@ func SaveSpectraConfigOverride(dataDir, migrationID, originalConfigPath string) 
 		return "", fmt.Errorf("failed to create directory for override config: %w", err)
 	}
 
-	// Write override config
-	overrideData, err := json.MarshalIndent(config, "", "  ")
+	// Write override config, preserving original formatting as much as possible
+	overrideData, err := json.MarshalIndent(configMap, "", "  ")
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal override config: %w", err)
 	}
@@ -106,17 +116,13 @@ func LoadSpectraConfigOverride(dataDir, migrationID string) (string, bool, error
 
 // SaveSpectraConfigFromData saves a Spectra config from JSON data (map[string]any)
 // to the override config path with an absolute db_path
+// Preserves the original JSON structure to avoid losing fields not defined in SpectraConfig struct
 func SaveSpectraConfigFromData(dataDir, migrationID string, configData map[string]any) (string, error) {
-	// Marshal the config data to JSON
-	configJSON, err := json.Marshal(configData)
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal config data: %w", err)
-	}
-
-	// Parse into SpectraConfig struct to validate and override db_path
-	var config SpectraConfig
-	if err := json.Unmarshal(configJSON, &config); err != nil {
-		return "", fmt.Errorf("failed to parse config data: %w", err)
+	// Work directly with the map to preserve all fields
+	// Deep copy the map to avoid modifying the original
+	configMap := make(map[string]any)
+	for k, v := range configData {
+		configMap[k] = v
 	}
 
 	// Override db_path - put Spectra DB in migration-specific folder
@@ -125,7 +131,13 @@ func SaveSpectraConfigFromData(dataDir, migrationID string, configData map[strin
 	if err != nil {
 		return "", fmt.Errorf("failed to resolve absolute path for Spectra DB: %w", err)
 	}
-	config.Seed.DBPath = absSpectraDBPath
+
+	// Navigate to seed.db_path and update it
+	if seed, ok := configMap["seed"].(map[string]any); ok {
+		seed["db_path"] = absSpectraDBPath
+	} else {
+		return "", fmt.Errorf("invalid config structure: 'seed' field is missing or not an object")
+	}
 
 	// Create override config file in migration-specific folder
 	migrationDir := filepath.Join(dataDir, migrationID)
@@ -136,8 +148,8 @@ func SaveSpectraConfigFromData(dataDir, migrationID string, configData map[strin
 		return "", fmt.Errorf("failed to create directory for override config: %w", err)
 	}
 
-	// Write override config
-	overrideData, err := json.MarshalIndent(config, "", "  ")
+	// Write override config, preserving all original fields
+	overrideData, err := json.MarshalIndent(configMap, "", "  ")
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal override config: %w", err)
 	}
@@ -147,4 +159,28 @@ func SaveSpectraConfigFromData(dataDir, migrationID string, configData map[strin
 	}
 
 	return overrideConfigPath, nil
+}
+
+// IsEphemeralMode checks if a Spectra config file is configured for ephemeral mode
+// Returns true if mode is "ephemeral", false otherwise (including when mode is missing/empty)
+// On file read or parse errors, returns false and logs a warning (defaults to persistent mode for safety)
+func IsEphemeralMode(configPath string) (bool, error) {
+	if configPath == "" {
+		return false, fmt.Errorf("config path is empty")
+	}
+
+	// Read the config file
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return false, fmt.Errorf("failed to read Spectra config file: %w", err)
+	}
+
+	// Parse the config
+	var config SpectraConfig
+	if err := json.Unmarshal(data, &config); err != nil {
+		return false, fmt.Errorf("failed to parse Spectra config file: %w", err)
+	}
+
+	// Check if mode is "ephemeral" (case-insensitive)
+	return strings.ToLower(strings.TrimSpace(config.Mode)) == "ephemeral", nil
 }
