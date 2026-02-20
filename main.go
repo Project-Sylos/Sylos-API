@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"codeberg.org/Sylos/Sylos-API/internal/auth"
-	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge/manager"
 	"codeberg.org/Sylos/Sylos-API/internal/routes"
 	"codeberg.org/Sylos/Sylos-API/internal/routes/middleware"
 	"codeberg.org/Sylos/Sylos-API/internal/server"
@@ -32,7 +32,7 @@ func main() {
 		log.Warn().Msg("jwt.secret not configured; generated ephemeral secret for this runtime")
 	}
 
-	coreBridge, err := corebridge.NewManager(log, cfg)
+	coreBridge, err := manager.NewManager(log, cfg)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to initialize core bridge")
 	}

@@ -3,14 +3,13 @@ package roots
 import (
 	"context"
 	"fmt"
-	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
 	"math/rand"
 	"time"
 
-	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/services"
 	fstypes "codeberg.org/Sylos/Sylos-FS/pkg/types"
@@ -164,7 +163,7 @@ func (m *Manager) SetRoot(ctx context.Context, req SetRootRequest) (SetRootRespo
 
 	migrationID := req.MigrationID
 	if migrationID == "" {
-		// Generate ULID for migration ID (lexicographically sortable, time-ordered)
+		// Generate ULID for migration run ID (lexicographically sortable); node IDs use engine's DeterministicNodeID
 		entropy := rand.New(rand.NewSource(time.Now().UnixNano()))
 		migrationID = ulid.MustNew(ulid.Timestamp(time.Now()), entropy).String()
 	}
@@ -400,93 +399,18 @@ func (m *Manager) SeedPlanIfReady(migrationID string) (bool, migration.RootSeedS
 		}
 	}
 
-	// Check if database file already exists
-	if _, err := os.Stat(dbPath); err == nil {
-		// Database exists - validate schema to see if we should skip seeding
-		options := db.Options{
-			Path: dbPath,
-		}
-		database, err := db.Open(options)
-		if err == nil {
-			// Validate schema - if valid, skip seeding and let LetsMigrate handle resume
-			if err := database.ValidateCoreSchema(); err == nil {
-				// Valid schema exists - check if it has roots already
-				// If it does, we can skip seeding and let LetsMigrate resume
-				status, inspectErr := migration.InspectMigrationStatus(database)
-				closeErr := database.Close()
-				if closeErr != nil {
-					m.logger.Warn().Err(closeErr).Msg("failed to close database after inspection")
-				}
-				if inspectErr == nil && !status.IsEmpty() {
-					// Database has valid schema and is not empty - skip seeding
-					// LetsMigrate will handle resume automatically
-					m.logger.Info().
-						Str("migration_id", migrationID).
-						Str("db_path", dbPath).
-						Msg("database exists with valid schema, skipping seeding (will resume)")
+	// Engine owns DB lifecycle: creates dir, opens, seeds (or skips if roots exist), closes.
+	// API never opens the DB for root seeding.
+	sourceRoot.LocationPath = "/"
+	destRoot.LocationPath = "/"
 
-					// Create a summary from the existing database state
-					summary := migration.RootSeedSummary{
-						SrcRoots: status.SrcTotal,
-						DstRoots: status.DstTotal,
-					}
-
-					m.mu.Lock()
-					plan, ok = m.plans[migrationID]
-					if !ok {
-						m.mu.Unlock()
-						return false, migration.RootSeedSummary{}, "", fmt.Errorf("migration %s plan removed during seeding", migrationID)
-					}
-
-					plan.Seeding = false
-					if !plan.HasSource ||
-						plan.SourceDefinition.ID != sourceDef.ID ||
-						plan.SourceRoot.ID() != sourceRoot.ID() ||
-						!plan.HasDestination ||
-						plan.DestinationDefinition.ID != destDef.ID ||
-						plan.DestinationRoot.ID() != destRoot.ID() {
-						plan.Seeded = false
-						plan.DatabasePath = ""
-						plan.RootSummary = migration.RootSeedSummary{}
-						m.mu.Unlock()
-						return false, migration.RootSeedSummary{}, "", nil
-					}
-
-					plan.Seeded = true
-					plan.DatabasePath = dbPath
-					plan.RootSummary = summary
-					plan.SourceConnectionID = sourceConn
-					plan.DestinationConnectionID = destConn
-					m.mu.Unlock()
-
-					return true, summary, dbPath, nil
-				}
-				// If inspection failed or DB is empty, fall through to seeding
-			}
-			// If schema validation failed, fall through to create fresh DB
-		}
-		// If opening DB failed, fall through to create fresh DB
-	}
-
-	// Database doesn't exist or has invalid schema - create fresh and seed roots
-	database, wasFresh, err := migration.SetupDatabase(migration.DatabaseConfig{
-		Path:           dbPath,
-		RemoveExisting: false, // Always false - anti-pattern to remove existing DB
+	configPath := filepath.Join(filepath.Dir(dbPath), strings.TrimSuffix(filepath.Base(dbPath), ".db")+".yaml")
+	summary, seedErr := migration.SeedRootsIntoDatabase(migration.SeedRootsOptions{
+		DBPath:     dbPath,
+		SrcRoot:    sourceRoot,
+		DstRoot:    destRoot,
+		ConfigPath: configPath,
 	})
-	if err != nil {
-		m.mu.Lock()
-		if plan, ok := m.plans[migrationID]; ok {
-			plan.Seeding = false
-		}
-		m.mu.Unlock()
-		return wasFresh, migration.RootSeedSummary{}, "", err
-	}
-
-	summary, seedErr := migration.SeedRootTasks(sourceRoot, destRoot, database)
-	closeErr := database.Close()
-	if closeErr != nil {
-		m.logger.Warn().Err(closeErr).Msg("failed to close database after seeding roots")
-	}
 	if seedErr != nil {
 		m.mu.Lock()
 		if plan, ok := m.plans[migrationID]; ok {

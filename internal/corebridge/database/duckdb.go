@@ -235,9 +235,9 @@ func (p *DuckDBPool) EnsureOpen(migrationID, duckdbPath string) (*sql.DB, error)
 			p.mu.Unlock()
 		}
 
-		// Check if DuckDB file exists
+		// Check if migration DB file exists
 		if _, err := os.Stat(duckdbPath); os.IsNotExist(err) {
-			openErr = fmt.Errorf("DuckDB file does not exist: %s (ETL may not have completed)", duckdbPath)
+			openErr = fmt.Errorf("migration DB file does not exist: %s (migration may not be ready for path review)", duckdbPath)
 			return
 		}
 
@@ -256,20 +256,18 @@ func (p *DuckDBPool) EnsureOpen(migrationID, duckdbPath string) (*sql.DB, error)
 			return
 		}
 
-		// Run ANALYZE to stabilize indexes after bulk Appender load
-		// This is a workaround for DuckDB ART index issues with UPDATE operations
-		// See: https://github.com/duckdb/duckdb/issues/3249
-		if _, err := conn.Exec("ANALYZE src_nodes"); err != nil {
-			p.logger.Debug().
-				Err(err).
-				Str("migration_id", migrationID).
-				Msg("failed to analyze src_nodes (table may not exist yet)")
+		// Run ANALYZE on node tables (engine schema: src_nodes, dst_nodes)
+		tables := []string{
+			"src_nodes", "dst_nodes",
 		}
-		if _, err := conn.Exec("ANALYZE dst_nodes"); err != nil {
-			p.logger.Debug().
-				Err(err).
-				Str("migration_id", migrationID).
-				Msg("failed to analyze dst_nodes (table may not exist yet)")
+		for _, table := range tables {
+			if _, err := conn.Exec("ANALYZE " + table); err != nil {
+				p.logger.Debug().
+					Err(err).
+					Str("migration_id", migrationID).
+					Str("table", table).
+					Msg("failed to analyze table (may not exist yet)")
+			}
 		}
 
 		// Store in pool
@@ -337,10 +335,9 @@ func (p *DuckDBPool) CloseAll() error {
 	return firstErr
 }
 
-// CheckDuckDBExists checks if the DuckDB file exists for a migration
-func CheckDuckDBExists(boltDBPath string) (bool, error) {
-	duckdbPath := GetDuckDBPath(boltDBPath)
-	_, err := os.Stat(duckdbPath)
+// CheckMigrationDBExists checks if the migration DB file exists (duck-only: main .db is DuckDB)
+func CheckMigrationDBExists(dbPath string) (bool, error) {
+	_, err := os.Stat(dbPath)
 	if err == nil {
 		return true, nil
 	}
@@ -350,23 +347,23 @@ func CheckDuckDBExists(boltDBPath string) (bool, error) {
 	return false, err
 }
 
-// DeleteDuckDB deletes the DuckDB file if it exists
-func DeleteDuckDB(boltDBPath string) error {
-	duckdbPath := GetDuckDBPath(boltDBPath)
-	if _, err := os.Stat(duckdbPath); os.IsNotExist(err) {
-		return nil // File doesn't exist, nothing to delete
-	}
+// CheckDuckDBExists is an alias for CheckMigrationDBExists (duck-only: main db is DuckDB)
+func CheckDuckDBExists(dbPath string) (bool, error) {
+	return CheckMigrationDBExists(dbPath)
+}
 
-	if err := os.Remove(duckdbPath); err != nil {
-		return fmt.Errorf("failed to delete DuckDB file: %w", err)
+// DeleteDuckDB deletes the migration DB file if it exists (duck-only: main .db is DuckDB)
+func DeleteDuckDB(dbPath string) error {
+	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+		return nil
 	}
-
+	if err := os.Remove(dbPath); err != nil {
+		return fmt.Errorf("failed to delete migration DB file: %w", err)
+	}
 	return nil
 }
 
-// GetDuckDBPathFromConfigPath derives DuckDB path from YAML config path
+// GetDuckDBPathFromConfigPath derives migration DB path from YAML config (duck-only: main .db is DuckDB)
 func GetDuckDBPathFromConfigPath(configPath string) string {
-	// Config is {migrationID}.yaml, DB is {migrationID}.db, DuckDB is {migrationID}.db.duckdb
-	dbPath := DatabasePathFromConfigPath(configPath)
-	return GetDuckDBPath(dbPath)
+	return DatabasePathFromConfigPath(configPath)
 }

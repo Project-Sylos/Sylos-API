@@ -24,6 +24,8 @@ func (h handler) listDiffs(ctx *middleware.Context) {
 		path = "/"
 	}
 
+	afterPath := ctx.Request().URL.Query().Get("afterPath") // Keyset cursor for next page
+
 	offset := 0
 	if offsetStr := ctx.Request().URL.Query().Get("offset"); offsetStr != "" {
 		if parsed, err := strconv.Atoi(offsetStr); err == nil && parsed >= 0 {
@@ -53,6 +55,7 @@ func (h handler) listDiffs(ctx *middleware.Context) {
 		Path:        path,
 		Offset:      offset,
 		Limit:       limit,
+		AfterPath:   afterPath,
 		FoldersOnly: foldersOnly,
 	})
 	if err != nil {
@@ -70,4 +73,41 @@ func (h handler) listDiffs(ctx *middleware.Context) {
 	}
 
 	ctx.Response(http.StatusOK, diffs)
+}
+
+// diffsStats returns total and folder/file counts for children of path (separate endpoint; UI can cancel on nav).
+func (h handler) diffsStats(ctx *middleware.Context) {
+	migrationID := chi.URLParam(ctx.Request(), "migrationID")
+	if migrationID == "" {
+		ctx.Error(http.StatusBadRequest, "migration id is required", nil)
+		return
+	}
+
+	path := ctx.Request().URL.Query().Get("path")
+	if path == "" {
+		path = "/"
+	}
+
+	foldersOnly := false
+	if foldersOnlyStr := ctx.Request().URL.Query().Get("foldersOnly"); foldersOnlyStr != "" {
+		if parsed, err := strconv.ParseBool(foldersOnlyStr); err == nil {
+			foldersOnly = parsed
+		}
+	}
+
+	stats, err := h.core.GetChildrenDiffsStats(ctx.Request().Context(), migrationID, path, foldersOnly)
+	if err != nil {
+		if errors.Is(err, corebridge.ErrMigrationNotFound) {
+			ctx.Error(http.StatusNotFound, "migration not found", err)
+			return
+		}
+		if errors.Is(err, corebridge.ErrDatabaseNotAvailable) {
+			ctx.Error(http.StatusServiceUnavailable, "database not available", err)
+			return
+		}
+		ctx.Error(http.StatusInternalServerError, "failed to get diffs stats", err)
+		return
+	}
+
+	ctx.Response(http.StatusOK, stats)
 }

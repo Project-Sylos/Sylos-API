@@ -4,28 +4,40 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strings"
 
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge/database"
 	"codeberg.org/Sylos/Sylos-API/internal/routes/middleware"
 	"github.com/go-chi/chi/v5"
 )
 
-func (h handler) uploadYAML(ctx *middleware.Context) {
+func (h handler) uploadUnified(ctx *middleware.Context) {
 	migrationID := chi.URLParam(ctx.Request(), "migrationID")
 	if migrationID == "" {
 		ctx.Error(http.StatusBadRequest, "migration id is required", nil)
 		return
 	}
 
-	// Parse multipart form
-	if err := ctx.Request().ParseMultipartForm(100 << 20); err != nil { // 100MB max
+	uploadType := strings.TrimSpace(strings.ToLower(ctx.Request().URL.Query().Get("type")))
+	if uploadType == "" {
+		uploadType = database.UploadTypeZip
+	}
+	if uploadType != database.UploadTypeZip && uploadType != database.UploadTypeDB && uploadType != database.UploadTypeYAML {
+		ctx.Error(http.StatusBadRequest, "type must be zip, db, or yaml", nil)
+		return
+	}
+
+	maxSize := int64(100 << 20) // 100MB for db/yaml
+	if uploadType == database.UploadTypeZip {
+		maxSize = 500 << 20 // 500MB for zip
+	}
+	if err := ctx.Request().ParseMultipartForm(maxSize); err != nil {
 		ctx.Error(http.StatusBadRequest, "failed to parse multipart form", err)
 		return
 	}
 
-	// Get overwrite flag
 	overwrite := ctx.Request().FormValue("overwrite") == "true"
 
-	// Get file from form
 	file, _, err := ctx.Request().FormFile("file")
 	if err != nil {
 		if errors.Is(err, http.ErrMissingFile) {
@@ -37,17 +49,15 @@ func (h handler) uploadYAML(ctx *middleware.Context) {
 	}
 	defer file.Close()
 
-	// Read file data
 	data, err := io.ReadAll(file)
 	if err != nil {
 		ctx.Error(http.StatusInternalServerError, "failed to read file data", err)
 		return
 	}
 
-	// Upload to core bridge
-	response, err := h.core.UploadMigrationYAML(ctx.Request().Context(), migrationID, data, overwrite)
+	response, err := h.core.UploadByType(ctx.Request().Context(), migrationID, uploadType, data, overwrite)
 	if err != nil {
-		ctx.Error(http.StatusInternalServerError, "failed to upload migration YAML", err)
+		ctx.Error(http.StatusInternalServerError, "failed to upload migration data", err)
 		return
 	}
 

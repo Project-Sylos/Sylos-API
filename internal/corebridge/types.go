@@ -52,12 +52,13 @@ type ListChildrenResponse struct {
 
 // PaginationInfo provides pagination metadata
 type PaginationInfo struct {
-	Offset       int  `json:"offset"`       // Current offset
-	Limit        int  `json:"limit"`        // Current limit
-	Total        int  `json:"total"`        // Total number of items (folders + files, or just folders if foldersOnly=true)
-	TotalFolders int  `json:"totalFolders"` // Total number of folders
-	TotalFiles   int  `json:"totalFiles"`   // Total number of files
-	HasMore      bool `json:"hasMore"`      // Whether there are more items beyond the current page
+	Offset       int    `json:"offset"`               // Current offset
+	Limit        int    `json:"limit"`                // Current limit
+	Total        int    `json:"total"`                // Total number of items (folders + files, or just folders if foldersOnly=true)
+	TotalFolders int    `json:"totalFolders"`         // Total number of folders
+	TotalFiles   int    `json:"totalFiles"`           // Total number of files
+	HasMore      bool   `json:"hasMore"`              // Whether there are more items beyond the current page
+	NextCursor   string `json:"nextCursor,omitempty"` // Keyset cursor for next page (path of last item; use as afterPath)
 }
 
 // DriveInfo represents information about a drive/volume
@@ -300,10 +301,11 @@ type MigrationMetadata struct {
 type ListChildrenDiffsRequest struct {
 	MigrationID string
 	Path        string      // Optional, defaults to "/"
-	Offset      int         // Pagination offset (default: 0)
+	Offset      int         // Pagination offset (default: 0); ignored when using keyset (AfterPath set)
 	Limit       int         // Pagination limit (default: 100, max: 1000)
+	AfterPath   string      // Keyset cursor: return children with path > AfterPath (empty = first page)
 	FoldersOnly bool        // If true, only return folders and apply limit to folders only
-	Sort        *SortOption `json:"sort,omitempty"` // Sort options (field and direction)
+	Sort        *SortOption `json:"sort,omitempty"` // Sort options (field and direction); keyset uses path order
 }
 
 // PathNodeItem represents a single node (from either SRC or DST) with its metadata
@@ -335,8 +337,9 @@ type FileSizeStats struct {
 
 // PathReviewStats represents statistics for path review
 type PathReviewStats struct {
-	TraversalStatusCounts map[string]int `json:"traversalStatusCounts"` // Counts by traversal_status (pending, failed, successful, exclusion_explicit, exclusion_inherited, not_on_src, not_on_dst)
-	CopyStatusCounts      map[string]int `json:"copyStatusCounts"`      // Counts by copy_status (pending, failed, successful, exclusion_explicit, exclusion_inherited)
+	TraversalStatusCounts map[string]int `json:"traversalStatusCounts"` // Counts by traversal_status (pending, successful, failed, not_on_src)
+	CopyStatusCounts      map[string]int `json:"copyStatusCounts"`      // Counts by copy_status (pending, in_progress, successful, failed, skipped)
+	ExcludedCount         int            `json:"excludedCount"`         // Count where excluded = true (engine schema)
 	FoldersCount          int            `json:"foldersCount"`
 	FilesCount            int            `json:"filesCount"`
 	FoldersRatio          float64        `json:"foldersRatio"` // Rounded to 2 decimal places
@@ -348,6 +351,13 @@ type PathReviewStats struct {
 type ListChildrenDiffsResponse struct {
 	Items      map[string]PathNodes `json:"items"` // path -> {src?: {...}, dst?: {...}}
 	Pagination PaginationInfo       `json:"pagination"`
+}
+
+// DiffsStatsResponse is returned by the separate diffs stats endpoint (total and folder/file counts for a path).
+type DiffsStatsResponse struct {
+	Total        int `json:"total"`
+	TotalFolders int `json:"totalFolders"`
+	TotalFiles   int `json:"totalFiles"`
 }
 
 // ExclusionRequest represents a request to exclude/unexclude nodes
@@ -454,6 +464,7 @@ type Bridge interface {
 	UploadMigrationDB(ctx context.Context, migrationID string, data []byte, overwrite bool) (UploadMigrationDBResponse, error)
 	UploadMigrationYAML(ctx context.Context, migrationID string, data []byte, overwrite bool) (UploadMigrationDBResponse, error)
 	UploadMigrationData(ctx context.Context, migrationID string, zipData []byte, overwrite bool) (UploadMigrationDBResponse, error)
+	UploadByType(ctx context.Context, migrationID, uploadType string, data []byte, overwrite bool) (UploadMigrationDBResponse, error)
 	ListMigrationDBs(ctx context.Context) ([]MigrationDBInfo, error)
 	SubscribeProgress(ctx context.Context, id string) (<-chan ProgressEvent, func(), error)
 	ToggleLogTerminal(ctx context.Context, enable bool, logAddress string) error
@@ -463,6 +474,7 @@ type Bridge interface {
 	GetQueueMetrics(ctx context.Context, migrationID string) (*QueueMetricsResponse, error)
 	GetLogs(ctx context.Context, migrationID string, req GetLogsRequest) (*GetLogsResponse, error)
 	ListChildrenDiffs(ctx context.Context, req ListChildrenDiffsRequest) (ListChildrenDiffsResponse, error)
+	GetChildrenDiffsStats(ctx context.Context, migrationID, path string, foldersOnly bool) (DiffsStatsResponse, error)
 	ExcludeNodes(ctx context.Context, migrationID string, req ExclusionRequest) (*ExclusionResponse, error)
 	UnexcludeNodes(ctx context.Context, migrationID string, req ExclusionRequest) (*ExclusionResponse, error)
 	CheckPendingWork(ctx context.Context, migrationID string) (PendingWorkResponse, error)

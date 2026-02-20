@@ -410,36 +410,47 @@ eventSource.addEventListener('progress', (e) => {
 
 ## Database Management
 
-### Upload Migration Database
+### Upload Migration Data
 
-Upload a migration database file to the server.
+Upload migration data (ZIP, DB, or YAML) to the server.
 
-**Endpoint:** `POST /migrations/db/upload`
+**Endpoint:** `POST /migrations/{migrationID}/upload?type=zip|db|yaml`
+
+**Query Parameters:**
+- `type` (optional, default: `zip`): Upload type:
+  - `zip`: ZIP archive containing YAML + DB (and related files); extracts to `dataDir/{migrationID}/`
+  - `db`: Raw `.db` file only
+  - `yaml`: Raw `.yaml` config file only
 
 **Request:** Multipart form data
-- `file` (file, required): The database file (.db)
-- `filename` (string, required): Filename for the database
-- `overwrite` (string, optional): Set to `"true"` to overwrite existing file
+- `file` (file, required): The file to upload
+- `overwrite` (string, optional): Set to `"true"` to overwrite existing files
 
 **Response (200 OK):**
 ```json
 {
   "success": true,
-  "path": "/path/to/uploaded/file.db"
+  "path": "/path/to/uploaded/file"
 }
 ```
 
 **Error Responses:**
-- `400 Bad Request`: Missing file or filename, or file already exists (unless overwrite=true)
+- `400 Bad Request`: Missing file, invalid type, or file already exists (unless overwrite=true)
 - `500 Internal Server Error`: Upload failed
 
-**Example (curl):**
+**Examples (curl):**
 ```bash
-curl -X POST \
-  -F "file=@migration.db" \
-  -F "filename=migration.db" \
-  -F "overwrite=false" \
-  http://localhost:8080/api/migrations/db/upload
+# Upload ZIP (default)
+curl -X POST -F "file=@migration.zip" -F "overwrite=false" \
+  "http://localhost:8080/api/migrations/{migrationID}/upload?type=zip"
+
+# Upload DB only
+curl -X POST -F "file=@migration.db" -F "overwrite=false" \
+  "http://localhost:8080/api/migrations/{migrationID}/upload?type=db"
+
+# Upload YAML only
+curl -X POST -F "file=@migration.yaml" -F "overwrite=false" \
+  "http://localhost:8080/api/migrations/{migrationID}/upload?type=yaml"
 ```
 
 ---
@@ -470,7 +481,7 @@ List all available migration database files.
 
 ### Get Migration Logs
 
-Retrieve the latest logs from a migration database.
+Retrieve the latest logs from a migration. Logs are read from a separate log database file derived from the migration DB path (e.g. `migration.db` → `migration_logs.db`); the main migration DB no longer stores logs.
 
 **Endpoint:** `POST /migrations/{migrationID}/logs`
 

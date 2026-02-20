@@ -64,7 +64,7 @@ func (h handler) markNodeForRetryDiscovery(ctx *middleware.Context) {
 		return
 	}
 
-	// nodeID is a ULID - pass directly without hashing
+	// nodeID is the deterministic node ID from the engine - pass directly
 	result, err := h.core.MarkNodesForRetryDiscovery(ctx.Request().Context(), migrationID, corebridge.MarkRetryRequest{
 		NodeIDs: []string{unescapedNodeID},
 	})
@@ -116,7 +116,7 @@ func (h handler) markNodeForRetryCopy(ctx *middleware.Context) {
 		return
 	}
 
-	// nodeID is a ULID - pass directly without hashing
+	// nodeID is the deterministic node ID from the engine - pass directly
 	result, err := h.core.MarkNodesForRetryCopy(ctx.Request().Context(), migrationID, corebridge.MarkRetryRequest{
 		NodeIDs: []string{unescapedNodeID},
 	})
@@ -168,7 +168,7 @@ func (h handler) unmarkNodeForRetryDiscovery(ctx *middleware.Context) {
 		return
 	}
 
-	// nodeID is a ULID - pass directly without hashing
+	// nodeID is the deterministic node ID from the engine - pass directly
 	result, err := h.core.UnmarkNodeForRetryDiscovery(ctx.Request().Context(), migrationID, unescapedNodeID)
 	if err != nil {
 		if errors.Is(err, corebridge.ErrMigrationNotFound) {
@@ -218,7 +218,7 @@ func (h handler) unmarkNodeForRetryCopy(ctx *middleware.Context) {
 		return
 	}
 
-	// nodeID is a ULID - pass directly without hashing
+	// nodeID is the deterministic node ID from the engine - pass directly
 	result, err := h.core.UnmarkNodeForRetryCopy(ctx.Request().Context(), migrationID, unescapedNodeID)
 	if err != nil {
 		if errors.Is(err, corebridge.ErrMigrationNotFound) {
