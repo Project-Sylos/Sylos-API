@@ -3,7 +3,6 @@ package migrations
 import (
 	"context"
 	"os"
-	"strings"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
 	corebridgeDB "codeberg.org/Sylos/Sylos-API/internal/corebridge/database"
@@ -28,41 +27,36 @@ func (m *Manager) GetMigrationStatus(ctx context.Context, id string) (Status, er
 		return Status{}, ErrMigrationNotFound
 	}
 
-	if meta.ConfigPath == "" {
+	if meta.DatabasePath == "" {
 		m.logger.Debug().
 			Str("migration_id", id).
-			Msg("migration metadata has no config path")
+			Msg("migration metadata has no database path")
 		return Status{}, ErrMigrationNotFound
 	}
 
-	if _, err := os.Stat(meta.ConfigPath); os.IsNotExist(err) {
+	if _, err := os.Stat(meta.DatabasePath); os.IsNotExist(err) {
 		m.logger.Debug().
 			Str("migration_id", id).
-			Str("config_path", meta.ConfigPath).
-			Msg("YAML config file does not exist")
+			Str("database_path", meta.DatabasePath).
+			Msg("migration database file does not exist")
 		return Status{}, ErrMigrationNotFound
 	}
 
-	yamlCfg, err := migration.LoadMigrationConfig(meta.ConfigPath)
+	engineStatus, err := corebridgeDB.InspectMigrationStatusFromDB(ctx, m.logger, meta.DatabasePath)
 	if err != nil {
 		m.logger.Debug().
 			Err(err).
 			Str("migration_id", id).
-			Str("config_path", meta.ConfigPath).
-			Msg("failed to load YAML config file")
+			Str("database_path", meta.DatabasePath).
+			Msg("failed to inspect migration status from database")
 		return Status{}, ErrMigrationNotFound
-	}
-
-	statusStr := strings.TrimSpace(yamlCfg.State.Status)
-	if statusStr == "" {
-		statusStr = MigrationStatusCompleted
 	}
 
 	status := Status{
 		Migration: Migration{
 			ID:        id,
 			StartedAt: meta.CreatedAt,
-			Status:    statusStr,
+			Status:    statusFromInspection(engineStatus),
 		},
 	}
 
@@ -103,19 +97,20 @@ func (m *Manager) SetRecord(migrationID string, record *MigrationRecord) {
 }
 
 func (m *Manager) updateMetadataForMigration(migrationID, name, configPath string) error {
+	databasePath := configPath
 	meta, err := m.metadataMgr.GetMigrationMetadata(migrationID)
 	if err != nil {
 		meta = metadata.MigrationMetadata{
-			ID:         migrationID,
-			Name:       name,
-			ConfigPath: configPath,
+			ID:           migrationID,
+			Name:         name,
+			DatabasePath: databasePath,
 		}
 	} else {
 		if name != "" {
 			meta.Name = name
 		}
-		if configPath != "" {
-			meta.ConfigPath = configPath
+		if databasePath != "" {
+			meta.DatabasePath = databasePath
 		}
 	}
 
@@ -144,4 +139,17 @@ func (m *Manager) recordToStatus(r *MigrationRecord) Status {
 	}
 
 	return status
+}
+
+func statusFromInspection(s migration.MigrationStatus) string {
+	switch {
+	case s.IsComplete():
+		return "Complete"
+	case s.HasPending():
+		return "Traversal-In-Progress"
+	case s.HasFailures():
+		return "Suspended"
+	default:
+		return MigrationStatusRunning
+	}
 }

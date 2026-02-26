@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,7 +16,8 @@ import (
 type MigrationMetadata struct {
 	ID                   string    `yaml:"id"`
 	Name                 string    `yaml:"name"`
-	ConfigPath           string    `yaml:"configPath"` // Path to the Migration Engine's YAML config file
+	ConfigPath           string    `yaml:"configPath"`   // Legacy: old per-migration YAML path
+	DatabasePath         string    `yaml:"databasePath"` // Canonical DB path for DB-only migration state
 	CreatedAt            time.Time `yaml:"createdAt"`
 	IsNewMigration       bool      `yaml:"isNewMigration"`       // Flag to indicate this is a new migration (not a resume)
 	HasPathReviewChanges bool      `yaml:"hasPathReviewChanges"` // Flag to track if user made changes during path review (exclusions, retries)
@@ -70,6 +72,12 @@ func (m *Manager) LoadAllMetadata() (MigrationsMetadata, error) {
 
 	if meta.Migrations == nil {
 		meta.Migrations = make(map[string]MigrationMetadata)
+	}
+	for id, item := range meta.Migrations {
+		if item.DatabasePath == "" {
+			item.DatabasePath = inferDatabasePath(item.ConfigPath)
+			meta.Migrations[id] = item
+		}
 	}
 
 	return meta, nil
@@ -127,6 +135,9 @@ func (m *Manager) UpdateMigrationMetadata(meta MigrationMetadata) error {
 	if meta.Name == "" {
 		meta.Name = meta.ID
 	}
+	if meta.DatabasePath == "" {
+		meta.DatabasePath = inferDatabasePath(meta.ConfigPath)
+	}
 
 	all, err := m.LoadAllMetadata()
 	if err != nil {
@@ -183,18 +194,26 @@ func (m *Manager) ListAllMigrations() ([]MigrationMetadata, error) {
 	needsUpdate := false
 
 	for id, meta := range all.Migrations {
-		// Check if config file exists
-		if meta.ConfigPath != "" {
-			if _, err := os.Stat(meta.ConfigPath); err == nil {
-				// Config file exists - include in result
+		// DB-only mode: keep entries if DatabasePath exists, regardless of ConfigPath.
+		if meta.DatabasePath != "" {
+			if _, err := os.Stat(meta.DatabasePath); err == nil {
 				result = append(result, meta)
 				validMigrations[id] = meta
-			} else {
-				// Config file missing - skip and mark for removal
-				needsUpdate = true
+				continue
 			}
+			needsUpdate = true
+			continue
+		}
+		// Backwards compatibility for older records.
+		if meta.ConfigPath == "" {
+			result = append(result, meta)
+			validMigrations[id] = meta
+			continue
+		}
+		if _, err := os.Stat(meta.ConfigPath); err == nil {
+			result = append(result, meta)
+			validMigrations[id] = meta
 		} else {
-			// No config path - skip and mark for removal
 			needsUpdate = true
 		}
 	}
@@ -209,4 +228,14 @@ func (m *Manager) ListAllMigrations() ([]MigrationMetadata, error) {
 	}
 
 	return result, nil
+}
+
+func inferDatabasePath(configPath string) string {
+	if configPath == "" {
+		return ""
+	}
+	if strings.HasSuffix(configPath, ".yaml") {
+		return strings.TrimSuffix(configPath, ".yaml") + ".db"
+	}
+	return configPath
 }

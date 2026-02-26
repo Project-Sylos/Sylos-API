@@ -4,7 +4,6 @@ go 1.25.6
 
 require (
 	codeberg.org/Sylos/Migration-Engine v0.1.31
-	codeberg.org/Sylos/Spectra v0.2.56
 	codeberg.org/Sylos/Sylos-FS v0.1.3
 	github.com/go-chi/chi/v5 v5.2.3
 	github.com/go-chi/cors v1.2.1
@@ -17,6 +16,7 @@ require (
 )
 
 require (
+	codeberg.org/Sylos/Spectra v0.2.56 // indirect
 	github.com/apache/arrow/go/v14 v14.0.2 // indirect
 	github.com/fsnotify/fsnotify v1.9.0 // indirect
 	github.com/go-viper/mapstructure/v2 v2.4.0 // indirect

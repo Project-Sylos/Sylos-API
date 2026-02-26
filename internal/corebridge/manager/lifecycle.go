@@ -3,259 +3,291 @@ package manager
 import (
 	"context"
 	"fmt"
-	"os"
-	"strings"
 	"time"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
-	"codeberg.org/Sylos/Sylos-API/internal/corebridge/database"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/metadata"
-	"codeberg.org/Sylos/Sylos-API/internal/corebridge/migrations"
-	"codeberg.org/Sylos/Sylos-API/internal/corebridge/services"
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge/roots"
 )
 
 func (m *Manager) StartMigration(ctx context.Context, req corebridge.StartMigrationRequest) (corebridge.Migration, error) {
-	migReq := migrations.StartMigrationRequest{
-		MigrationID: req.MigrationID,
-		Options: migrations.MigrationOptions{
-			MigrationID:             req.Options.MigrationID,
-			DatabasePath:            req.Options.DatabasePath,
-			RemoveExistingDB:        req.Options.RemoveExistingDB,
-			UsePreseededDB:          req.Options.UsePreseededDB,
-			SourceConnectionID:      req.Options.SourceConnectionID,
-			DestinationConnectionID: req.Options.DestinationConnectionID,
-			WorkerCount:             req.Options.WorkerCount,
-			MaxRetries:              req.Options.MaxRetries,
-			CoordinatorLead:         req.Options.CoordinatorLead,
-			LogAddress:              req.Options.LogAddress,
-			LogLevel:                req.Options.LogLevel,
-			SkipListener:            req.Options.SkipListener,
-			StartupDelaySec:         req.Options.StartupDelaySec,
-			ProgressTickMillis:      req.Options.ProgressTickMillis,
-			Verification: migrations.VerificationOptions{
-				AllowPending:  req.Options.Verification.AllowPending,
-				AllowNotOnSrc: req.Options.Verification.AllowNotOnSrc,
-			},
-		},
-	}
-	mig, err := m.migrationsMgr.StartMigration(ctx, migReq)
+	mig, err := m.ensureMigration(ctx, req.MigrationID)
 	if err != nil {
 		return corebridge.Migration{}, err
 	}
+
+	plan := m.rootsMgr.GetPlan(mig.ID)
+	if plan == nil || !plan.HasSource || !plan.HasDestination {
+		return corebridge.Migration{}, fmt.Errorf("roots not fully configured for migration %s", mig.ID)
+	}
+
+	cfg := m.buildTraversalConfig(req.Options, plan)
+	if _, err := mig.AddRoots(plan.SourceRoot, plan.DestinationRoot); err != nil && mig.Phase() == migration.PhaseCreated {
+		return corebridge.Migration{}, fmt.Errorf("failed to add roots: %w", err)
+	}
+
+	now := time.Now().UTC()
+	m.mu.Lock()
+	m.runtimeByID[mig.ID] = &runtimeMigration{
+		Migration:     mig,
+		SourceID:      plan.SourceDefinition.ID,
+		DestinationID: plan.DestinationDefinition.ID,
+		StartedAt:     now,
+		Status:        corebridge.MigrationStatusRunning,
+	}
+	m.mu.Unlock()
+
+	go func() {
+		_, runErr := mig.StartTraversal(cfg)
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if rec := m.runtimeByID[mig.ID]; rec != nil {
+			doneAt := time.Now().UTC()
+			rec.CompletedAt = &doneAt
+			if runErr != nil {
+				rec.Status = corebridge.MigrationStatusFailed
+				rec.Error = runErr.Error()
+			} else {
+				rec.Status = migration.PhaseReview.String()
+			}
+		}
+	}()
+
+	if err := m.updateMetadataForMigrationID(mig.ID); err != nil {
+		m.logger.Warn().Err(err).Str("migration_id", mig.ID).Msg("failed to update metadata")
+	}
+
 	return corebridge.Migration{
 		ID:            mig.ID,
-		SourceID:      mig.SourceID,
-		DestinationID: mig.DestinationID,
-		StartedAt:     mig.StartedAt,
-		Status:        mig.Status,
+		SourceID:      plan.SourceDefinition.ID,
+		DestinationID: plan.DestinationDefinition.ID,
+		StartedAt:     now,
+		Status:        corebridge.MigrationStatusRunning,
 	}, nil
+}
+
+func (m *Manager) buildTraversalConfig(opts corebridge.MigrationOptions, plan *roots.RootPlan) migration.Config {
+	workerCount := opts.WorkerCount
+	if workerCount <= 0 {
+		workerCount = m.cfg.Runtime.DefaultWorkerCount
+	}
+	if workerCount <= 0 {
+		workerCount = 10
+	}
+
+	maxRetries := opts.MaxRetries
+	if maxRetries <= 0 {
+		maxRetries = m.cfg.Runtime.DefaultMaxRetries
+	}
+	if maxRetries <= 0 {
+		maxRetries = 3
+	}
+
+	coordinatorLead := opts.CoordinatorLead
+	if coordinatorLead <= 0 {
+		coordinatorLead = m.cfg.Runtime.DefaultCoordinatorLead
+	}
+	if coordinatorLead <= 0 {
+		coordinatorLead = 4
+	}
+
+	logAddress := opts.LogAddress
+	if logAddress == "" {
+		logAddress = m.cfg.Runtime.LogAddress
+	}
+	logLevel := opts.LogLevel
+	if logLevel == "" {
+		logLevel = m.cfg.Runtime.LogLevel
+	}
+	if logLevel == "" {
+		logLevel = "info"
+	}
+	skipListener := true
+	if opts.SkipListener != nil {
+		skipListener = *opts.SkipListener
+	}
+
+	return migration.Config{
+		Source: migration.Service{
+			Name:    plan.SourceDefinition.ID,
+			Adapter: plan.SourceAdapter,
+			Root:    plan.SourceRoot,
+		},
+		Destination: migration.Service{
+			Name:    plan.DestinationDefinition.ID,
+			Adapter: plan.DestinationAdapter,
+			Root:    plan.DestinationRoot,
+		},
+		WorkerCount:     workerCount,
+		MaxRetries:      maxRetries,
+		CoordinatorLead: coordinatorLead,
+		LogAddress:      logAddress,
+		LogLevel:        logLevel,
+		SkipListener:    skipListener,
+		StartupDelay:    time.Duration(opts.StartupDelaySec) * time.Second,
+		ProgressTick:    time.Duration(opts.ProgressTickMillis) * time.Millisecond,
+		Verification: migration.VerifyOptions{
+			AllowPending:  opts.Verification.AllowPending,
+			AllowNotOnSrc: opts.Verification.AllowNotOnSrc,
+		},
+	}
+}
+
+func (m *Manager) ensureMigration(_ context.Context, requestedID string) (*migration.Migration, error) {
+	if requestedID != "" {
+		existing, err := m.engineMgr.GetMigration(requestedID)
+		if err != nil {
+			return nil, err
+		}
+		if existing != nil {
+			return existing, nil
+		}
+	}
+	created, err := m.engineMgr.CreateMigration(migration.CreateMigrationConfig{
+		Name: "migration",
+	})
+	if err != nil {
+		return nil, err
+	}
+	return created, nil
+}
+
+func (m *Manager) updateMetadataForMigrationID(migrationID string) error {
+	metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
+	meta, err := metaMgr.GetMigrationMetadata(migrationID)
+	plan := m.rootsMgr.GetPlan(migrationID)
+	dbPath := ""
+	if plan != nil {
+		dbPath = plan.DatabasePath
+	}
+	if err != nil {
+		meta = metadata.MigrationMetadata{
+			ID:             migrationID,
+			Name:           migrationID,
+			DatabasePath:   dbPath,
+			IsNewMigration: false,
+		}
+	} else if meta.DatabasePath == "" && dbPath != "" {
+		meta.DatabasePath = dbPath
+	}
+	return metaMgr.UpdateMigrationMetadata(meta)
 }
 
 func (m *Manager) ChangePhase(ctx context.Context, migrationID string, phase string, req corebridge.StartMigrationRequest) (corebridge.Migration, error) {
 	if phase != "traversal" && phase != "copy" {
 		return corebridge.Migration{}, fmt.Errorf("invalid phase: %s (must be 'traversal' or 'copy')", phase)
 	}
-
-	pendingWork, err := m.CheckPendingWork(ctx, migrationID)
+	mig, err := m.engineMgr.GetMigration(migrationID)
 	if err != nil {
-		return corebridge.Migration{}, fmt.Errorf("failed to check pending work: %w", err)
+		return corebridge.Migration{}, err
 	}
-
-	if phase == "copy" && pendingWork.HasPendingRetries {
-		return corebridge.Migration{}, fmt.Errorf("cannot start copy phase: there are pending retries. Please run traversal phase first")
-	}
-
-	metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
-	meta, err := metaMgr.GetMigrationMetadata(migrationID)
-	if err != nil {
-		return corebridge.Migration{}, fmt.Errorf("failed to get migration metadata: %w", err)
-	}
-
-	dbPath := strings.TrimSuffix(meta.ConfigPath, ".yaml") + ".db"
-	if dbPath == ".db" {
-		dbPath, err = database.ResolveDatabasePath(m.cfg.Runtime.DataDir, "", migrationID)
-		if err != nil {
-			return corebridge.Migration{}, fmt.Errorf("failed to resolve database path: %w", err)
-		}
-	}
-
-	runningTasks := m.bgTaskMgr.GetRunningTasks(migrationID)
-	if len(runningTasks) > 0 {
-		return corebridge.Migration{}, fmt.Errorf("cannot change phase: there are %d running background tasks. Please wait for them to complete", len(runningTasks))
-	}
-
-	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
-		return corebridge.Migration{}, fmt.Errorf("migration DB file not found. Migration must be in 'Awaiting-Path-Review' status before changing phase")
-	}
-
-	if err := m.migrationsMgr.KillDuckDBConnection(migrationID); err != nil {
-		m.logger.Warn().Err(err).Str("migration_id", migrationID).Msg("failed to close DuckDB connection (may not be open), proceeding anyway")
-	}
-	if err := m.migrationsMgr.CloseDB(migrationID); err != nil {
-		m.logger.Warn().Err(err).Str("migration_id", migrationID).Msg("failed to close DB connection (may not be open), proceeding anyway")
-	}
-
-	record := m.migrationsMgr.GetRecord(migrationID)
-	if record == nil {
-		record = &migrations.MigrationRecord{ID: migrationID}
-	}
-
-	overridePath, exists, _ := services.LoadSpectraConfigOverride(m.cfg.Runtime.DataDir, migrationID)
-	var spectraConfigPath string
-	if exists {
-		spectraConfigPath = overridePath
-	}
-
-	yamlCfg, err := migration.LoadMigrationConfig(meta.ConfigPath)
-	if err != nil {
-		return corebridge.Migration{}, fmt.Errorf("failed to load migration config: %w", err)
-	}
-
-	if phase == "copy" {
-		yamlCfg.State.Status = "Preparing-For-Copy"
-		if err := migration.SaveMigrationConfig(meta.ConfigPath, yamlCfg); err != nil {
-			return corebridge.Migration{}, fmt.Errorf("failed to update status to Preparing-For-Copy: %w", err)
-		}
-		m.logger.Info().
-			Str("migration_id", migrationID).
-			Msg("updated status to Preparing-For-Copy")
-	}
-
-	migOpts := migrations.MigrationOptions{
-		MigrationID:             req.Options.MigrationID,
-		DatabasePath:            req.Options.DatabasePath,
-		RemoveExistingDB:        req.Options.RemoveExistingDB,
-		UsePreseededDB:          req.Options.UsePreseededDB,
-		SourceConnectionID:      req.Options.SourceConnectionID,
-		DestinationConnectionID: req.Options.DestinationConnectionID,
-		WorkerCount:             req.Options.WorkerCount,
-		MaxRetries:              req.Options.MaxRetries,
-		CoordinatorLead:         req.Options.CoordinatorLead,
-		LogAddress:              req.Options.LogAddress,
-		LogLevel:                req.Options.LogLevel,
-		SkipListener:            req.Options.SkipListener,
-		StartupDelaySec:         req.Options.StartupDelaySec,
-		ProgressTickMillis:      req.Options.ProgressTickMillis,
-		Verification: migrations.VerificationOptions{
-			AllowPending:  req.Options.Verification.AllowPending,
-			AllowNotOnSrc: req.Options.Verification.AllowNotOnSrc,
-		},
+	if mig == nil {
+		return corebridge.Migration{}, corebridge.ErrMigrationNotFound
 	}
 
 	go func() {
-		m.logger.Info().
-			Str("migration_id", migrationID).
-			Str("phase", phase).
-			Msg("starting migration phase")
-
 		if phase == "copy" {
-			err := m.migrationsMgr.RunCopyPhase(record, dbPath, meta.ConfigPath, migOpts, spectraConfigPath)
-			if err != nil {
-				m.logger.Error().
-					Err(err).
-					Str("migration_id", migrationID).
-					Str("phase", phase).
-					Msg("failed to start copy phase")
-			}
-		} else {
-			_, err := m.StartMigration(ctx, req)
-			if err != nil {
-				m.logger.Error().
-					Err(err).
-					Str("migration_id", migrationID).
-					Str("phase", phase).
-					Msg("failed to start migration phase")
-			}
+			_, _ = mig.StartCopy()
+			return
 		}
+		plan := m.rootsMgr.GetPlan(migrationID)
+		if plan == nil || !plan.HasSource || !plan.HasDestination {
+			return
+		}
+		cfg := m.buildTraversalConfig(req.Options, plan)
+		_, _ = mig.StartTraversal(cfg)
 	}()
 
 	return corebridge.Migration{
 		ID:      migrationID,
-		Status:  "preparing",
+		Status:  "running",
 		Success: true,
 	}, nil
 }
 
 func (m *Manager) GetMigrationStatus(ctx context.Context, id string) (corebridge.Status, error) {
-	migStatus, err := m.migrationsMgr.GetMigrationStatus(ctx, id)
+	mig, err := m.engineMgr.GetMigration(id)
 	if err != nil {
 		return corebridge.Status{}, err
 	}
-
-	var status string
-	metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
-	meta, err := metaMgr.GetMigrationMetadata(id)
-	if err == nil && meta.ConfigPath != "" {
-		yamlCfg, err := migration.LoadMigrationConfig(meta.ConfigPath)
-		if err == nil && yamlCfg.State.Status != "" {
-			status = yamlCfg.State.Status
-		}
+	if mig == nil {
+		return corebridge.Status{}, corebridge.ErrMigrationNotFound
 	}
 
-	if status == "" {
-		status = migStatus.Status
+	m.mu.RLock()
+	rec := m.runtimeByID[id]
+	m.mu.RUnlock()
+
+	sourceID := ""
+	destinationID := ""
+	startedAt := time.Time{}
+	status := mig.Phase().String()
+	errText := ""
+	var completedAt *time.Time
+	if rec != nil {
+		sourceID = rec.SourceID
+		destinationID = rec.DestinationID
+		startedAt = rec.StartedAt
+		if rec.Status != "" {
+			status = rec.Status
+		}
+		errText = rec.Error
+		completedAt = rec.CompletedAt
 	}
 
 	return corebridge.Status{
 		Migration: corebridge.Migration{
-			ID:            migStatus.ID,
-			SourceID:      migStatus.SourceID,
-			DestinationID: migStatus.DestinationID,
-			StartedAt:     migStatus.StartedAt,
+			ID:            id,
+			SourceID:      sourceID,
+			DestinationID: destinationID,
+			StartedAt:     startedAt,
 			Status:        status,
 		},
-		CompletedAt: migStatus.CompletedAt,
-		Error:       migStatus.Error,
-		Result:      convertResultView(migStatus.Result),
+		CompletedAt: completedAt,
+		Error:       errText,
 	}, nil
 }
 
 func (m *Manager) LoadMigration(ctx context.Context, migrationID string) (corebridge.Migration, error) {
-	metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
-	meta, err := metaMgr.GetMigrationMetadata(migrationID)
-	if err != nil {
-		return corebridge.Migration{}, fmt.Errorf("migration metadata not found: %w", err)
-	}
-
-	if meta.ConfigPath == "" {
-		return corebridge.Migration{}, fmt.Errorf("migration %s has no config path", migrationID)
-	}
-
-	mg, err := m.migrationsMgr.LoadMigrationFromConfigPath(ctx, migrationID, meta.ConfigPath)
+	mig, err := m.engineMgr.GetMigration(migrationID)
 	if err != nil {
 		return corebridge.Migration{}, err
 	}
-
+	if mig == nil {
+		return corebridge.Migration{}, corebridge.ErrMigrationNotFound
+	}
 	return corebridge.Migration{
-		ID:            mg.ID,
-		SourceID:      mg.SourceID,
-		DestinationID: mg.DestinationID,
-		StartedAt:     mg.StartedAt,
-		Status:        mg.Status,
+		ID:     migrationID,
+		Status: mig.Phase().String(),
 	}, nil
 }
 
 func (m *Manager) StopMigration(ctx context.Context, migrationID string) (corebridge.Status, error) {
-	result, err := m.migrationsMgr.StopMigration(ctx, migrationID)
+	mig, err := m.engineMgr.GetMigration(migrationID)
+	if err != nil {
+		return corebridge.Status{}, err
+	}
+	if mig == nil {
+		return corebridge.Status{}, corebridge.ErrMigrationNotFound
+	}
+
+	stopResult, err := mig.Stop()
 	if err != nil {
 		return corebridge.Status{}, err
 	}
 
-	status, err := m.GetMigrationStatus(ctx, migrationID)
-	if err != nil {
-		status = corebridge.Status{
+	st, statusErr := m.GetMigrationStatus(ctx, migrationID)
+	if statusErr != nil {
+		return corebridge.Status{
 			Migration: corebridge.Migration{
 				ID:     migrationID,
-				Status: corebridge.MigrationStatusSuspended,
+				Status: stopResult.Phase.String(),
 			},
-		}
-		if result != nil {
-			status.Result = convertResultToView(result)
-			finished := time.Now().UTC()
-			status.CompletedAt = &finished
-		}
+		}, nil
 	}
-
-	return status, nil
+	if stopResult.Stopped {
+		st.Status = corebridge.MigrationStatusSuspended
+	}
+	return st, nil
 }

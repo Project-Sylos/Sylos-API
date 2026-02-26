@@ -16,7 +16,13 @@ func (m *Manager) GetMigrationMetadata(ctx context.Context, migrationID string) 
 	if err != nil {
 		return corebridge.MigrationMetadata{}, err
 	}
-	return convertMetadata(meta), nil
+	return corebridge.MigrationMetadata{
+		ID:           meta.ID,
+		Name:         meta.Name,
+		ConfigPath:   meta.ConfigPath,
+		DatabasePath: meta.DatabasePath,
+		CreatedAt:    meta.CreatedAt,
+	}, nil
 }
 
 func (m *Manager) UpdateMigrationName(ctx context.Context, migrationID, name string) error {

@@ -9,56 +9,29 @@ import (
 )
 
 // RunCopyPhase executes the copy phase for a migration
-func (m *Manager) RunCopyPhase(record *MigrationRecord, dbPath, configPath string, opts MigrationOptions, spectraConfigPath string) error {
+func (m *Manager) RunCopyPhase(record *MigrationRecord, dbPath, _ string, opts MigrationOptions, _ string) error {
 	m.logger.Info().
 		Str("migration_id", record.ID).
 		Msg("starting copy phase")
 
-	yamlCfg, err := migration.LoadMigrationConfig(configPath)
+	plan := m.rootsMgr.GetPlan(record.ID)
+	if plan == nil {
+		return fmt.Errorf("root plan not found for migration %s", record.ID)
+	}
+	if plan.SourceAdapter == nil || plan.DestinationAdapter == nil {
+		return fmt.Errorf("root adapters are not available for migration %s", record.ID)
+	}
+	srcAdapter := plan.SourceAdapter
+	dstAdapter := plan.DestinationAdapter
+
+	dbInstance, err := m.EnsureDB(record.ID)
 	if err != nil {
-		return fmt.Errorf("failed to load YAML config: %w", err)
-	}
-
-	yamlCfg.State.Status = "Copy-In-Progress"
-	if err := migration.SaveMigrationConfig(configPath, yamlCfg); err != nil {
-		m.logger.Warn().
-			Err(err).
-			Str("migration_id", record.ID).
-			Msg("failed to update status to Copy-In-Progress")
-	} else {
-		m.logger.Info().
-			Str("migration_id", record.ID).
-			Msg("updated status to Copy-In-Progress")
-	}
-
-	srcAdapter, dstAdapter, shared, err := m.acquireSharedSpectraAdapters(yamlCfg.Services.Source, yamlCfg.Services.Destination, spectraConfigPath)
-	if err != nil {
-		return fmt.Errorf("failed to acquire shared adapters: %w", err)
-	}
-
-	if !shared {
-		srcAdapter, err = m.acquireAdapterFromYAMLConfig(yamlCfg.Services.Source, spectraConfigPath)
-		if err != nil {
-			return fmt.Errorf("failed to acquire source adapter: %w", err)
-		}
-
-		dstAdapter, err = m.acquireAdapterFromYAMLConfig(yamlCfg.Services.Destination, spectraConfigPath)
-		if err != nil {
-			if srcAdapter != nil {
-				if closer, ok := srcAdapter.(interface{ Close() error }); ok {
-					_ = closer.Close()
-				}
-			}
-			return fmt.Errorf("failed to acquire destination adapter: %w", err)
-		}
-
-		m.logger.Info().
-			Str("migration_id", record.ID).
-			Msg("acquired separate adapters for source and destination")
+		m.closeAdapters(srcAdapter, dstAdapter, record.ID)
+		return fmt.Errorf("failed to ensure database for copy phase: %w", err)
 	}
 
 	copyCfg := migration.CopyPhaseConfig{
-		DBPath:       dbPath,
+		BoltDB:       dbInstance,
 		SrcAdapter:   srcAdapter,
 		DstAdapter:   dstAdapter,
 		WorkerCount:  m.selectWorkerCount(opts.WorkerCount),
@@ -66,8 +39,6 @@ func (m *Manager) RunCopyPhase(record *MigrationRecord, dbPath, configPath strin
 		LogAddress:   m.selectLogAddress(opts.LogAddress),
 		LogLevel:     m.selectLogLevel(opts.LogLevel),
 		SkipListener: m.selectSkipListener(opts),
-		ConfigPath:   configPath,
-		YAMLConfig:   yamlCfg,
 	}
 
 	if opts.StartupDelaySec > 0 {
@@ -97,14 +68,6 @@ func (m *Manager) RunCopyPhase(record *MigrationRecord, dbPath, configPath strin
 			Str("migration_id", record.ID).
 			Msg("copy phase failed")
 
-		yamlCfg.State.Status = "Copy-Failed"
-		if saveErr := migration.SaveMigrationConfig(configPath, yamlCfg); saveErr != nil {
-			m.logger.Warn().
-				Err(saveErr).
-				Str("migration_id", record.ID).
-				Msg("failed to update status to Copy-Failed")
-		}
-
 		m.closeAdapters(srcAdapter, dstAdapter, record.ID)
 
 		return fmt.Errorf("copy phase failed: %w", err)
@@ -118,18 +81,6 @@ func (m *Manager) RunCopyPhase(record *MigrationRecord, dbPath, configPath strin
 		Int("total_tracked", stats.TotalTracked).
 		Int("workers", stats.Workers).
 		Msg("copy phase completed successfully")
-
-	yamlCfg.State.Status = "Copy-Complete"
-	if err := migration.SaveMigrationConfig(configPath, yamlCfg); err != nil {
-		m.logger.Warn().
-			Err(err).
-			Str("migration_id", record.ID).
-			Msg("failed to update status to Copy-Complete")
-	} else {
-		m.logger.Info().
-			Str("migration_id", record.ID).
-			Msg("updated status to Copy-Complete")
-	}
 
 	m.closeAdapters(srcAdapter, dstAdapter, record.ID)
 

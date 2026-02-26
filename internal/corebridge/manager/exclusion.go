@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 
+	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
-	"codeberg.org/Sylos/Sylos-API/internal/corebridge/database"
 )
 
 func (m *Manager) ExcludeNodes(ctx context.Context, migrationID string, req corebridge.ExclusionRequest) (*corebridge.ExclusionResponse, error) {
@@ -30,73 +30,38 @@ func (m *Manager) ExcludeNodes(ctx context.Context, migrationID string, req core
 		}, fmt.Errorf("exclusion operations are locked in copy phase")
 	}
 
+	mig, err := m.engineMgr.GetMigration(prc.MigrationID)
+	if err != nil {
+		return &corebridge.ExclusionResponse{Success: false, Error: err.Error()}, err
+	}
+	if mig == nil {
+		return &corebridge.ExclusionResponse{Success: false, Error: "migration not found"}, corebridge.ErrMigrationNotFound
+	}
+
 	if req.All {
-		if req.Filter != nil && req.Filter.Status == "failed" {
-			taskID := m.bgTaskMgr.StartTask(prc.MigrationID, corebridge.BackgroundTaskTypeExclusionSweep)
-			go func() {
-				defer m.bgTaskMgr.CompleteTask(prc.MigrationID, taskID)
-				if err := database.MarkAllFailedAsExcludedDuckDB(context.Background(), m.logger, prc.DuckDBConn); err != nil {
-					m.logger.Error().Err(err).Str("migration_id", prc.MigrationID).Msg("failed to mark all failed items as excluded")
-					m.bgTaskMgr.FailTask(prc.MigrationID, taskID, err)
-					return
-				}
-				if err := m.markPathReviewChanges(migrationID, true); err != nil {
-					m.logger.Warn().Err(err).Str("migration_id", migrationID).Msg("failed to mark path review changes")
-				}
-			}()
-			return &corebridge.ExclusionResponse{
-				Success: true,
-				TaskID:  taskID,
-			}, nil
+		filter := migration.NodeQueryFilter{
+			Queue:  "SRC",
+			Limit:  1000,
+			Offset: 0,
 		}
-		pendingPaths, err := database.GetAllNodesByStatusDuckDB(ctx, m.logger, prc.DuckDBConn, "pending")
+		if req.Filter != nil && req.Filter.Status != "" {
+			filter.Status = req.Filter.Status
+		}
+		updated, err := mig.BulkExcludeWithPropagation(filter, true)
 		if err != nil {
 			return &corebridge.ExclusionResponse{
 				Success: false,
-				Error:   fmt.Sprintf("failed to get pending nodes: %v", err),
+				Error:   err.Error(),
 			}, err
 		}
-		failedPaths, err := database.GetAllNodesByStatusDuckDB(ctx, m.logger, prc.DuckDBConn, "failed")
-		if err != nil {
-			return &corebridge.ExclusionResponse{
-				Success: false,
-				Error:   fmt.Sprintf("failed to get failed nodes: %v", err),
-			}, err
-		}
-		allPaths := make(map[string]bool)
-		for _, p := range pendingPaths {
-			allPaths[p] = true
-		}
-		for _, p := range failedPaths {
-			allPaths[p] = true
-		}
-		req.NodeIDs = make([]string, 0, len(allPaths))
-		for p := range allPaths {
-			req.NodeIDs = append(req.NodeIDs, p)
-		}
+		_ = updated
+		return &corebridge.ExclusionResponse{Success: true}, nil
 	}
 
 	for _, nodeID := range req.NodeIDs {
-		nodePath, err := m.findNodePathFromID(ctx, prc, nodeID)
-		if err != nil {
-			m.logger.Warn().Err(err).Str("node_id", nodeID).Msg("failed to find node path, skipping")
-			continue
+		if err := mig.SetNodeExcludedWithPropagation("SRC", nodeID, true); err != nil {
+			_ = mig.SetNodeExcludedWithPropagation("DST", nodeID, true)
 		}
-
-		err = database.SetNodeExclusionDuckDB(ctx, m.logger, prc.DuckDBConn, nodePath, true)
-		if err != nil {
-			m.logger.Warn().Err(err).Str("node_path", nodePath).Msg("failed to set node exclusion, skipping")
-			continue
-		}
-
-		taskID := m.bgTaskMgr.StartTaskWithPath(prc.MigrationID, corebridge.BackgroundTaskTypeExclusionPropagate, nodePath)
-		go func(path string) {
-			defer m.bgTaskMgr.CompleteTask(prc.MigrationID, taskID)
-			if err := database.PropagateExclusionDuckDB(context.Background(), m.logger, prc.DuckDBConn, path, true); err != nil {
-				m.logger.Error().Err(err).Str("migration_id", prc.MigrationID).Str("node_path", path).Msg("failed to propagate exclusion")
-				m.bgTaskMgr.FailTask(prc.MigrationID, taskID, err)
-			}
-		}(nodePath)
 	}
 
 	if err := m.markPathReviewChanges(migrationID, true); err != nil {
@@ -130,55 +95,34 @@ func (m *Manager) UnexcludeNodes(ctx context.Context, migrationID string, req co
 		}, fmt.Errorf("exclusion operations are locked in copy phase")
 	}
 
+	mig, err := m.engineMgr.GetMigration(prc.MigrationID)
+	if err != nil {
+		return &corebridge.ExclusionResponse{Success: false, Error: err.Error()}, err
+	}
+	if mig == nil {
+		return &corebridge.ExclusionResponse{Success: false, Error: "migration not found"}, corebridge.ErrMigrationNotFound
+	}
+
 	if req.All {
-		explicitPaths, err := database.GetAllNodesByStatusDuckDB(ctx, m.logger, prc.DuckDBConn, "exclusion_explicit")
+		updated, err := mig.BulkExcludeWithPropagation(migration.NodeQueryFilter{
+			Queue:    "SRC",
+			Excluded: ptrBool(true),
+			Limit:    1000,
+		}, false)
 		if err != nil {
 			return &corebridge.ExclusionResponse{
 				Success: false,
-				Error:   fmt.Sprintf("failed to get exclusion_explicit nodes: %v", err),
+				Error:   err.Error(),
 			}, err
 		}
-		inheritedPaths, err := database.GetAllNodesByStatusDuckDB(ctx, m.logger, prc.DuckDBConn, "exclusion_inherited")
-		if err != nil {
-			return &corebridge.ExclusionResponse{
-				Success: false,
-				Error:   fmt.Sprintf("failed to get exclusion_inherited nodes: %v", err),
-			}, err
-		}
-		allPaths := make(map[string]bool)
-		for _, p := range explicitPaths {
-			allPaths[p] = true
-		}
-		for _, p := range inheritedPaths {
-			allPaths[p] = true
-		}
-		req.NodeIDs = make([]string, 0, len(allPaths))
-		for p := range allPaths {
-			req.NodeIDs = append(req.NodeIDs, p)
-		}
+		_ = updated
+		return &corebridge.ExclusionResponse{Success: true}, nil
 	}
 
 	for _, nodeID := range req.NodeIDs {
-		nodePath, err := m.findNodePathFromID(ctx, prc, nodeID)
-		if err != nil {
-			m.logger.Warn().Err(err).Str("node_id", nodeID).Msg("failed to find node path, skipping")
-			continue
+		if err := mig.SetNodeExcludedWithPropagation("SRC", nodeID, false); err != nil {
+			_ = mig.SetNodeExcludedWithPropagation("DST", nodeID, false)
 		}
-
-		err = database.SetNodeExclusionDuckDB(ctx, m.logger, prc.DuckDBConn, nodePath, false)
-		if err != nil {
-			m.logger.Warn().Err(err).Str("node_path", nodePath).Msg("failed to set node unexclusion, skipping")
-			continue
-		}
-
-		taskID := m.bgTaskMgr.StartTaskWithPath(prc.MigrationID, corebridge.BackgroundTaskTypeUnexclusionPropagate, nodePath)
-		go func(path string) {
-			defer m.bgTaskMgr.CompleteTask(prc.MigrationID, taskID)
-			if err := database.PropagateExclusionDuckDB(context.Background(), m.logger, prc.DuckDBConn, path, false); err != nil {
-				m.logger.Error().Err(err).Str("migration_id", prc.MigrationID).Str("node_path", path).Msg("failed to propagate unexclusion")
-				m.bgTaskMgr.FailTask(prc.MigrationID, taskID, err)
-			}
-		}(nodePath)
 	}
 
 	if err := m.markPathReviewChanges(migrationID, true); err != nil {
@@ -189,3 +133,5 @@ func (m *Manager) UnexcludeNodes(ctx context.Context, migrationID string, req co
 		Success: true,
 	}, nil
 }
+
+func ptrBool(v bool) *bool { return &v }

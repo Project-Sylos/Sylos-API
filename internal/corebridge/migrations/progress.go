@@ -80,8 +80,7 @@ func (m *Manager) publishProgress(id, event string, srcStats, dstStats *queue.Qu
 		update.Destination = queueStatsSnapshotFrom(*dstStats)
 	}
 
-	// Migration Engine will update its YAML config with round changes
-	// No need to update our minimal metadata here
+	// Migration Engine persists runtime state in DB; metadata remains minimal.
 
 	for _, ch := range channels {
 		select {

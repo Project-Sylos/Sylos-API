@@ -10,7 +10,7 @@ if [ -d "data/" ]; then
         # Get just the filename/dirname
         name=$(basename "$item")
         # Skip api-runtime.log and migrations.yaml
-        if [ "$name" != "api-runtime.log" ] && [ "$name" != "migrations.yaml" ]; then
+        if [ "$name" != "api-runtime.log" ] && [ "$name" != "migrations.yaml" ] && [ "$name" != "preferences.json" ]; then
             # Delete the item (file or directory)
             rm -rf "$item"
         fi

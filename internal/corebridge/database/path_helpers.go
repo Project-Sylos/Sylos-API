@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
-
-	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
 )
 
 // ResolveDatabasePath resolves the database path from migration ID or explicit path.
@@ -30,9 +28,12 @@ func GetMigrationDir(dataDir, migrationID string) string {
 }
 
 // ConfigPathFromDatabasePath derives the config path from a database path.
-// Uses engine convention: {dbPath minus .db}.yaml
+// Legacy-only helper kept for backwards compatibility with older metadata/code.
 func ConfigPathFromDatabasePath(dbPath string) string {
-	return migration.ConfigPathFromDatabasePath(dbPath)
+	if strings.HasSuffix(dbPath, ".db") {
+		return strings.TrimSuffix(dbPath, ".db") + ".yaml"
+	}
+	return dbPath + ".yaml"
 }
 
 // DatabasePathFromConfigPath derives the database path from a config path.

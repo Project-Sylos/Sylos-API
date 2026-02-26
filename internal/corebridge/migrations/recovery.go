@@ -1,10 +1,9 @@
 package migrations
 
 import (
+	"context"
 	"os"
-	"strings"
 
-	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
 	corebridgeDB "codeberg.org/Sylos/Sylos-API/internal/corebridge/database"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/metadata"
 )
@@ -23,35 +22,21 @@ func (m *Manager) RecoverInterruptedETL() {
 
 	recoveredCount := 0
 	for _, meta := range allMeta.Migrations {
-		if meta.ConfigPath == "" {
-			continue
-		}
-		if _, err := os.Stat(meta.ConfigPath); os.IsNotExist(err) {
-			continue
-		}
-
-		yamlCfg, err := migration.LoadMigrationConfig(meta.ConfigPath)
-		if err != nil {
-			continue
-		}
-
-		currentStatus := strings.TrimSpace(yamlCfg.State.Status)
-		dbPath := corebridgeDB.DatabasePathFromConfigPath(meta.ConfigPath)
+		dbPath := meta.DatabasePath
 		if dbPath == "" {
 			continue
 		}
+		if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+			continue
+		}
 
-		// If status is Preparing-Path-Review (obsolete) but DB exists, fix status
-		if currentStatus == "Preparing-Path-Review" {
-			if _, err := os.Stat(dbPath); err == nil {
-				yamlCfg.State.Status = "Awaiting-Path-Review"
-				if err := migration.SaveMigrationConfig(meta.ConfigPath, yamlCfg); err != nil {
-					m.logger.Error().Err(err).Str("migration_id", meta.ID).Msg("failed to update status during recovery")
-				} else {
-					m.logger.Info().Str("migration_id", meta.ID).Msg("recovered: updated stale Preparing-Path-Review to Awaiting-Path-Review")
-					recoveredCount++
-				}
-			}
+		status, err := corebridgeDB.InspectMigrationStatusFromDB(context.TODO(), m.logger, dbPath)
+		if err != nil {
+			continue
+		}
+		if status.HasPending() || status.HasFailures() {
+			recoveredCount++
+			m.logger.Info().Str("migration_id", meta.ID).Msg("found resumable migration state in DB-only mode")
 		}
 	}
 

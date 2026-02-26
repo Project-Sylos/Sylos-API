@@ -292,7 +292,8 @@ type MigrationDBInfo struct {
 type MigrationMetadata struct {
 	ID             string    `json:"id"`
 	Name           string    `json:"name"`
-	ConfigPath     string    `json:"configPath"` // Path to the Migration Engine's YAML config file
+	ConfigPath     string    `json:"configPath"`   // Legacy path retained for older metadata files
+	DatabasePath   string    `json:"databasePath"` // Canonical DB path in DB-only mode
 	CreatedAt      time.Time `json:"createdAt"`
 	IsNewMigration bool      `json:"isNewMigration"` // Flag to indicate this is a new migration (not a resume)
 }
@@ -460,7 +461,6 @@ type Bridge interface {
 	StartMigration(ctx context.Context, req StartMigrationRequest) (Migration, error)
 	GetMigrationStatus(ctx context.Context, id string) (Status, error)
 	InspectMigrationStatus(ctx context.Context, migrationID string) (migration.MigrationStatus, error)
-	InspectMigrationStatusFromDB(ctx context.Context, dbPath string) (migration.MigrationStatus, error)
 	UploadMigrationDB(ctx context.Context, migrationID string, data []byte, overwrite bool) (UploadMigrationDBResponse, error)
 	UploadMigrationYAML(ctx context.Context, migrationID string, data []byte, overwrite bool) (UploadMigrationDBResponse, error)
 	UploadMigrationData(ctx context.Context, migrationID string, zipData []byte, overwrite bool) (UploadMigrationDBResponse, error)

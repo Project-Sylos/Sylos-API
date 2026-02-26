@@ -4,41 +4,12 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"strings"
 	"time"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/db"
 	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
-	corebridgeDB "codeberg.org/Sylos/Sylos-API/internal/corebridge/database"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/metadata"
-	"codeberg.org/Sylos/Sylos-API/internal/corebridge/services"
 )
-
-// checkYAMLStatus checks the status from the YAML config file and returns an error if migration cannot be started
-// Returns nil if migration can proceed (suspended, failed, or no YAML found), error if it cannot (running, completed)
-func (m *Manager) checkYAMLStatus(migrationID string, configPath string) error {
-	if _, err := os.Stat(configPath); os.IsNotExist(err) {
-		return nil
-	}
-
-	yamlCfg, err := migration.LoadMigrationConfig(configPath)
-	if err != nil {
-		return nil
-	}
-
-	status := strings.ToLower(strings.TrimSpace(yamlCfg.State.Status))
-
-	switch status {
-	case "running":
-		return fmt.Errorf("migration %s is already running", migrationID)
-	case "completed":
-		return fmt.Errorf("migration %s has already completed", migrationID)
-	case "suspended", "failed":
-		return nil
-	default:
-		return nil
-	}
-}
 
 func (m *Manager) applyLogDefaults(opts *MigrationOptions) {
 	if opts.LogAddress == "" {
@@ -46,22 +17,6 @@ func (m *Manager) applyLogDefaults(opts *MigrationOptions) {
 	}
 	if opts.LogLevel == "" {
 		opts.LogLevel = m.cfg.Runtime.LogLevel
-	}
-}
-
-// setYAMLStatusRunning sets the migration YAML config status to "Running" for traversal phase.
-func (m *Manager) setYAMLStatusRunning(configPath string) {
-	if configPath == "" {
-		return
-	}
-	yamlCfg, err := migration.LoadMigrationConfig(configPath)
-	if err != nil {
-		m.logger.Warn().Err(err).Str("config_path", configPath).Msg("failed to load config to set Running status")
-		return
-	}
-	yamlCfg.State.Status = "Running"
-	if err := migration.SaveMigrationConfig(configPath, yamlCfg); err != nil {
-		m.logger.Warn().Err(err).Str("config_path", configPath).Msg("failed to set YAML status to Running")
 	}
 }
 
@@ -121,98 +76,25 @@ func (m *Manager) startMigrationFromUploadedDB(_ context.Context, migrationID st
 		return Migration{}, fmt.Errorf("database is empty, roots must be set first")
 	}
 
-	configPath := corebridgeDB.ConfigPathFromDatabasePath(opts.DatabasePath)
-
-	overridePath, exists, _ := services.LoadSpectraConfigOverride(m.cfg.Runtime.DataDir, migrationID)
-	var spectraConfigPath string
-	if exists {
-		spectraConfigPath = overridePath
-	}
-
-	if err := m.checkYAMLStatus(migrationID, configPath); err != nil {
-		return Migration{}, err
-	}
-
 	opts.UsePreseededDB = true
 	opts.RemoveExistingDB = false
 	m.applyLogDefaults(&opts)
+	m.logger.Info().Str("migration_id", migrationID).Str("database_path", opts.DatabasePath).Msg("starting migration from uploaded DB")
 
-	yamlCfg, err := migration.LoadMigrationConfig(configPath)
-	if err == nil {
-		// Pre-flight: acquire adapters and load full config (from YAML)
-		srcAdapter, dstAdapter, shared, err := m.acquireSharedSpectraAdapters(yamlCfg.Services.Source, yamlCfg.Services.Destination, spectraConfigPath)
-		if err != nil {
-			return Migration{}, fmt.Errorf("failed to acquire shared adapters: %w", err)
-		}
-
-		if !shared {
-			srcAdapter, err = m.acquireAdapterFromYAMLConfig(yamlCfg.Services.Source, spectraConfigPath)
-			if err != nil {
-				return Migration{}, fmt.Errorf("failed to acquire source adapter: %w", err)
-			}
-
-			dstAdapter, err = m.acquireAdapterFromYAMLConfig(yamlCfg.Services.Destination, spectraConfigPath)
-			if err != nil {
-				if srcAdapter != nil {
-					if closer, ok := srcAdapter.(interface{ Close() error }); ok {
-						_ = closer.Close()
-					}
-				}
-				return Migration{}, fmt.Errorf("failed to acquire destination adapter: %w", err)
-			}
-		}
-
-		cfg, err := migration.LoadMigrationConfigFromYAML(configPath, srcAdapter, dstAdapter)
-		if err != nil {
-			return Migration{}, fmt.Errorf("failed to load migration config: %w", err)
-		}
-
-		cfg.Database.RemoveExisting = false
-		cfg.SeedRoots = true
-
-		m.logger.Info().Str("migration_id", migrationID).Msg("resuming migration from uploaded DB config")
-
-		m.setYAMLStatusRunning(configPath)
-
-		record := &MigrationRecord{
-			ID:            migrationID,
-			SourceID:      cfg.Source.Name,
-			DestinationID: cfg.Destination.Name,
-			Status:        MigrationStatusRunning,
-			StartedAt:     time.Now().UTC(),
-		}
-		if err := m.registerNewRunningRecord(migrationID, record); err != nil {
-			return Migration{}, err
-		}
-
-		m.publishProgress(record.ID, "started", nil, nil)
-
-		go m.runMigrationEngine(record, RunParams{
-			FromConfig: &RunParamsFromConfig{Cfg: cfg, Opts: opts},
-		})
-
-		return Migration{
-			ID:            record.ID,
-			SourceID:      record.SourceID,
-			DestinationID: record.DestinationID,
-			StartedAt:     record.StartedAt,
-			Status:        record.Status,
-		}, nil
+	if err := m.updateMetadataForMigration(migrationID, migrationID, opts.DatabasePath); err != nil {
+		m.logger.Warn().Err(err).Str("migration_id", migrationID).Msg("failed to update metadata for uploaded DB migration")
 	}
 
-	// Uploaded DB without YAML: stub defs, run from roots path (plan may be nil and runner will fail)
-	if _, err := os.Stat(configPath); err == nil {
-		if err := m.checkYAMLStatus(migrationID, configPath); err != nil {
-			return Migration{}, err
-		}
+	sourceID := "uploaded-db-source"
+	destinationID := "uploaded-db-destination"
+	if plan := m.rootsMgr.GetPlan(migrationID); plan != nil {
+		sourceID = plan.SourceDefinition.ID
+		destinationID = plan.DestinationDefinition.ID
 	}
-
-	m.logger.Info().Str("migration_id", migrationID).Msg("starting migration from uploaded DB")
-
 	record := &MigrationRecord{
 		ID:            migrationID,
-		SourceID:      "uploaded-db-source",
-		DestinationID: "uploaded-db-destination",
+		SourceID:      sourceID,
+		DestinationID: destinationID,
 		Status:        MigrationStatusRunning,
 		StartedAt:     time.Now().UTC(),
 	}
@@ -225,9 +107,7 @@ func (m *Manager) startMigrationFromUploadedDB(_ context.Context, migrationID st
 	go m.runMigrationEngine(record, RunParams{
 		FromRoots: &RunParamsFromRoots{
 			DbPath:            opts.DatabasePath,
-			ConfigPath:        configPath,
 			Opts:              opts,
-			SpectraConfigPath: "",
 		},
 	})
 
@@ -261,8 +141,6 @@ func (m *Manager) startMigrationFromRootsPlan(_ context.Context, migrationID str
 		opts.DatabasePath = dbPath
 	}
 
-	configPath := corebridgeDB.ConfigPathFromDatabasePath(opts.DatabasePath)
-
 	// Log start/resume
 	metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
 	meta, err := metaMgr.GetMigrationMetadata(migrationID)
@@ -273,6 +151,7 @@ func (m *Manager) startMigrationFromRootsPlan(_ context.Context, migrationID str
 		meta = metadata.MigrationMetadata{
 			ID:             migrationID,
 			Name:           migrationID,
+			DatabasePath:   opts.DatabasePath,
 			IsNewMigration: true,
 		}
 	}
@@ -287,66 +166,10 @@ func (m *Manager) startMigrationFromRootsPlan(_ context.Context, migrationID str
 		m.logger.Info().Str("migration_id", migrationID).Msg("resuming existing migration")
 	}
 
-	// Spectra override and connection IDs
-	var spectraConfigPath string
-	isSpectraMigration := plan.SourceDefinition.Type == services.ServiceTypeSpectra || plan.DestinationDefinition.Type == services.ServiceTypeSpectra
-	bothSpectra := plan.SourceDefinition.Type == services.ServiceTypeSpectra && plan.DestinationDefinition.Type == services.ServiceTypeSpectra
-
-	if isSpectraMigration {
-		var spectraDef services.ServiceDefinition
-		if plan.SourceDefinition.Type == services.ServiceTypeSpectra {
-			spectraDef = plan.SourceDefinition
-		} else {
-			spectraDef = plan.DestinationDefinition
-		}
-
-		existingOverride, exists, err := services.LoadSpectraConfigOverride(m.cfg.Runtime.DataDir, migrationID)
-		if err != nil {
-			return Migration{}, fmt.Errorf("failed to check for existing Spectra config override: %w", err)
-		}
-
-		if exists {
-			spectraConfigPath = existingOverride
-		} else {
-			overridePath, err := services.SaveSpectraConfigOverride(m.cfg.Runtime.DataDir, migrationID, spectraDef.Spectra.ConfigPath)
-			if err != nil {
-				return Migration{}, fmt.Errorf("failed to create Spectra config override: %w", err)
-			}
-			spectraConfigPath = overridePath
-		}
-
-		if bothSpectra {
-			sharedConnectionID := fmt.Sprintf("spectra-%s", migrationID)
-			opts.SourceConnectionID = sharedConnectionID
-			opts.DestinationConnectionID = sharedConnectionID
-		} else {
-			if opts.SourceConnectionID == "" {
-				opts.SourceConnectionID = plan.SourceConnectionID
-			}
-			if opts.DestinationConnectionID == "" {
-				opts.DestinationConnectionID = plan.DestinationConnectionID
-			}
-		}
-	} else {
-		if opts.SourceConnectionID == "" {
-			opts.SourceConnectionID = plan.SourceConnectionID
-		}
-		if opts.DestinationConnectionID == "" {
-			opts.DestinationConnectionID = plan.DestinationConnectionID
-		}
-	}
-
 	m.applyLogDefaults(&opts)
 
-	// Config path and YAML checks
-	if _, err := os.Stat(configPath); err == nil {
-		if err := m.checkYAMLStatus(migrationID, configPath); err != nil {
-			return Migration{}, err
-		}
-	}
-
 	// Metadata
-	if err := m.updateMetadataForMigration(migrationID, migrationID, configPath); err != nil {
+	if err := m.updateMetadataForMigration(migrationID, migrationID, opts.DatabasePath); err != nil {
 		m.logger.Warn().Err(err).Str("migration_id", migrationID).Msg("failed to update migration metadata")
 	}
 
@@ -356,8 +179,6 @@ func (m *Manager) startMigrationFromRootsPlan(_ context.Context, migrationID str
 			m.logger.Warn().Err(err).Str("migration_id", migrationID).Msg("failed to clear IsNewMigration flag")
 		}
 	}
-
-	m.setYAMLStatusRunning(configPath)
 
 	// Register record and publish started
 	record := &MigrationRecord{
@@ -376,9 +197,7 @@ func (m *Manager) startMigrationFromRootsPlan(_ context.Context, migrationID str
 	go m.runMigrationEngine(record, RunParams{
 		FromRoots: &RunParamsFromRoots{
 			DbPath:            opts.DatabasePath,
-			ConfigPath:        configPath,
 			Opts:              opts,
-			SpectraConfigPath: spectraConfigPath,
 		},
 	})
 
@@ -469,98 +288,16 @@ func (m *Manager) StopMigration(ctx context.Context, id string) (*migration.Resu
 	return &result, nil
 }
 
-// LoadMigrationFromConfigPath loads and resumes a migration from its YAML config file path
+// LoadMigrationFromConfigPath remains for backward compatibility. In DB-only mode,
+// the provided path is treated as a DB path.
 func (m *Manager) LoadMigrationFromConfigPath(ctx context.Context, migrationID, configPath string) (Migration, error) {
-	if _, err := os.Stat(configPath); os.IsNotExist(err) {
-		return Migration{}, fmt.Errorf("migration config file not found: %s", configPath)
-	}
-
-	if err := m.checkYAMLStatus(migrationID, configPath); err != nil {
-		return Migration{}, err
-	}
-
-	overridePath, exists, _ := services.LoadSpectraConfigOverride(m.cfg.Runtime.DataDir, migrationID)
-	var spectraConfigPath string
-	if exists {
-		spectraConfigPath = overridePath
-	}
-
-	yamlCfg, err := migration.LoadMigrationConfig(configPath)
-	if err != nil {
-		return Migration{}, fmt.Errorf("failed to load YAML config: %w", err)
-	}
-
-	srcAdapter, dstAdapter, shared, err := m.acquireSharedSpectraAdapters(yamlCfg.Services.Source, yamlCfg.Services.Destination, spectraConfigPath)
-	if err != nil {
-		return Migration{}, fmt.Errorf("failed to acquire shared adapters: %w", err)
-	}
-
-	if !shared {
-		srcAdapter, err = m.acquireAdapterFromYAMLConfig(yamlCfg.Services.Source, spectraConfigPath)
-		if err != nil {
-			return Migration{}, fmt.Errorf("failed to acquire source adapter: %w", err)
-		}
-
-		dstAdapter, err = m.acquireAdapterFromYAMLConfig(yamlCfg.Services.Destination, spectraConfigPath)
-		if err != nil {
-			if srcAdapter != nil {
-				if closer, ok := srcAdapter.(interface{ Close() error }); ok {
-					_ = closer.Close()
-				}
-			}
-			return Migration{}, fmt.Errorf("failed to acquire destination adapter: %w", err)
-		}
-	}
-
-	cfg, err := migration.LoadMigrationConfigFromYAML(configPath, srcAdapter, dstAdapter)
-	if err != nil {
-		return Migration{}, fmt.Errorf("failed to load migration config: %w", err)
-	}
-
-	dbPath := cfg.Database.Path
-	if dbPath == "" {
-		return Migration{}, fmt.Errorf("migration config has no database path")
-	}
-
-	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
-		return Migration{}, fmt.Errorf("migration database file not found: %s", dbPath)
-	}
-
-	cfg.Database.RemoveExisting = false
-	cfg.SeedRoots = true
-
 	opts := MigrationOptions{
 		MigrationID:      migrationID,
-		DatabasePath:     dbPath,
+		DatabasePath:     configPath,
 		UsePreseededDB:   true,
 		RemoveExistingDB: false,
 		LogAddress:       m.cfg.Runtime.LogAddress,
 		LogLevel:         m.cfg.Runtime.LogLevel,
 	}
-
-	record := &MigrationRecord{
-		ID:            migrationID,
-		SourceID:      cfg.Source.Name,
-		DestinationID: cfg.Destination.Name,
-		Status:        MigrationStatusRunning,
-		StartedAt:     time.Now().UTC(),
-	}
-
-	if err := m.registerNewRunningRecord(migrationID, record); err != nil {
-		return Migration{}, err
-	}
-
-	m.publishProgress(record.ID, "started", nil, nil)
-
-	go m.runMigrationEngine(record, RunParams{
-		FromConfig: &RunParamsFromConfig{Cfg: cfg, Opts: opts},
-	})
-
-	return Migration{
-		ID:            record.ID,
-		SourceID:      record.SourceID,
-		DestinationID: record.DestinationID,
-		StartedAt:     record.StartedAt,
-		Status:        record.Status,
-	}, nil
+	return m.startMigrationFromUploadedDB(ctx, migrationID, opts)
 }

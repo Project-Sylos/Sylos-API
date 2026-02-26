@@ -3,38 +3,26 @@ package manager
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
-	"codeberg.org/Sylos/Sylos-API/internal/corebridge/database"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/metadata"
 )
 
 func (m *Manager) getMigrationPhase(migrationID string) (string, error) {
-	metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
-	meta, err := metaMgr.GetMigrationMetadata(migrationID)
-	if err != nil {
-		return "roots", nil
-	}
-
-	if meta.ConfigPath == "" {
-		return "roots", nil
-	}
-
-	yamlCfg, err := migration.LoadMigrationConfig(meta.ConfigPath)
+	mig, err := m.engineMgr.GetMigration(migrationID)
 	if err != nil {
 		return "unknown", err
 	}
-
-	status := strings.TrimSpace(yamlCfg.State.Status)
-
-	switch {
-	case status == "" || status == "Roots-Set":
+	if mig == nil {
 		return "roots", nil
-	case strings.Contains(status, "Traversal") || status == "Awaiting-Path-Review" || status == "Filters-Set":
+	}
+	switch mig.Phase().String() {
+	case "created":
+		return "roots", nil
+	case "traversing", "review":
 		return "traversal", nil
-	case strings.Contains(status, "Copy") || status == "Awaiting-Copy-Review" || status == "Preparing-For-Copy":
+	case "copying", "completed":
 		return "copy", nil
 	default:
 		return "unknown", nil
@@ -88,23 +76,32 @@ func (m *Manager) markPathReviewChanges(migrationID string, hasChanges bool) err
 	return metaMgr.UpdateMigrationMetadata(meta)
 }
 
-func (m *Manager) CheckPendingWork(ctx context.Context, migrationID string) (corebridge.PendingWorkResponse, error) {
-	prc, err := m.preparePathReviewContext(ctx, migrationID)
+func (m *Manager) CheckPendingWork(_ context.Context, migrationID string) (corebridge.PendingWorkResponse, error) {
+	mig, err := m.engineMgr.GetMigration(migrationID)
 	if err != nil {
-		if err == corebridge.ErrMigrationNotFound {
-			return corebridge.PendingWorkResponse{}, err
-		}
-		return corebridge.PendingWorkResponse{
-			HasPendingRetries:    false,
-			HasPathReviewChanges: false,
-			PendingRetriesCount:  0,
-		}, nil
+		return corebridge.PendingWorkResponse{}, err
+	}
+	if mig == nil {
+		return corebridge.PendingWorkResponse{}, corebridge.ErrMigrationNotFound
 	}
 
-	retriesCount, err := database.CountPendingRetriesDuckDB(ctx, m.logger, prc.DuckDBConn)
+	srcPending, err := mig.QueryNodes(migration.NodeQueryFilter{
+		Queue:  "SRC",
+		Status: "pending",
+		Limit:  1000,
+	})
 	if err != nil {
-		return corebridge.PendingWorkResponse{}, fmt.Errorf("failed to count pending retries: %w", err)
+		return corebridge.PendingWorkResponse{}, fmt.Errorf("failed to query pending source nodes: %w", err)
 	}
+	dstPending, err := mig.QueryNodes(migration.NodeQueryFilter{
+		Queue:  "DST",
+		Status: "pending",
+		Limit:  1000,
+	})
+	if err != nil {
+		return corebridge.PendingWorkResponse{}, fmt.Errorf("failed to query pending destination nodes: %w", err)
+	}
+	retriesCount := len(srcPending) + len(dstPending)
 
 	metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
 	meta, err := metaMgr.GetMigrationMetadata(migrationID)

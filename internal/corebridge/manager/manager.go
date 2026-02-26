@@ -1,9 +1,14 @@
 package manager
 
 import (
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+
+	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/database"
-	"codeberg.org/Sylos/Sylos-API/internal/corebridge/migrations"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/roots"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/services"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/terminal"
@@ -13,13 +18,28 @@ import (
 
 // Manager implements corebridge.Bridge.
 type Manager struct {
-	logger        zerolog.Logger
-	cfg           config.Config
-	serviceMgr    *services.ServiceManager
-	rootsMgr      *roots.Manager
-	migrationsMgr *migrations.Manager
-	terminalMgr   *terminal.Manager
-	bgTaskMgr     *corebridge.BackgroundTaskManager
+	logger      zerolog.Logger
+	cfg         config.Config
+	serviceMgr  *services.ServiceManager
+	rootsMgr    *roots.Manager
+	engineMgr   *migration.MigrationManager
+	terminalMgr *terminal.Manager
+	bgTaskMgr   *corebridge.BackgroundTaskManager
+
+	mu              sync.RWMutex
+	runtimeByID     map[string]*runtimeMigration
+	progressByID    map[string]map[string]chan corebridge.ProgressEvent
+	progressCounter uint64
+}
+
+type runtimeMigration struct {
+	Migration     *migration.Migration
+	SourceID      string
+	DestinationID string
+	StartedAt     time.Time
+	CompletedAt   *time.Time
+	Status        string
+	Error         string
 }
 
 // NewManager creates a new Manager implementing corebridge.Bridge.
@@ -34,31 +54,28 @@ func NewManager(logger zerolog.Logger, cfg config.Config) (*Manager, error) {
 	}
 
 	rootsMgr := roots.NewManager(logger, cfg.Runtime.DataDir, serviceMgr, resolveDBPath)
-	migrationsMgr := migrations.NewManager(logger, cfg, serviceMgr, rootsMgr, resolveDBPath)
+	engineDBPath := filepath.Join(cfg.Runtime.DataDir, "engine_migrations.duckdb")
+	if err := os.MkdirAll(filepath.Dir(engineDBPath), 0o755); err != nil {
+		return nil, err
+	}
+	engineMgr, err := migration.NewMigrationManager(migration.DatabaseConfig{Path: engineDBPath})
+	if err != nil {
+		return nil, err
+	}
 	terminalMgr := terminal.NewManager(logger, cfg)
 	bgTaskMgr := corebridge.NewBackgroundTaskManager(logger)
 
-	migrationsMgr.SetBackgroundTaskCallback(func(migrationID string, taskType string, path string) string {
-		return bgTaskMgr.StartTaskWithPath(migrationID, corebridge.BackgroundTaskType(taskType), path)
-	})
-	migrationsMgr.SetBackgroundTaskCompleteCallback(func(migrationID, taskID string) {
-		bgTaskMgr.CompleteTask(migrationID, taskID)
-	})
-	migrationsMgr.SetBackgroundTaskFailCallback(func(migrationID, taskID string, err error) {
-		bgTaskMgr.FailTask(migrationID, taskID, err)
-	})
-
 	mgr := &Manager{
-		logger:        logger,
-		cfg:           cfg,
-		serviceMgr:    serviceMgr,
-		rootsMgr:      rootsMgr,
-		migrationsMgr: migrationsMgr,
-		terminalMgr:   terminalMgr,
-		bgTaskMgr:     bgTaskMgr,
+		logger:       logger,
+		cfg:          cfg,
+		serviceMgr:   serviceMgr,
+		rootsMgr:     rootsMgr,
+		engineMgr:    engineMgr,
+		terminalMgr:  terminalMgr,
+		bgTaskMgr:    bgTaskMgr,
+		runtimeByID:  make(map[string]*runtimeMigration),
+		progressByID: make(map[string]map[string]chan corebridge.ProgressEvent),
 	}
-
-	go migrationsMgr.RecoverInterruptedETL()
 
 	return mgr, nil
 }

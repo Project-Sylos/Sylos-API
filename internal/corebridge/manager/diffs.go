@@ -7,288 +7,156 @@ import (
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
-	"codeberg.org/Sylos/Sylos-API/internal/corebridge/database"
-	"codeberg.org/Sylos/Sylos-API/internal/corebridge/metadata"
 )
 
-func convertDBPathNodesToCorebridge(dbItems map[string]database.PathNodes) map[string]corebridge.PathNodes {
-	items := make(map[string]corebridge.PathNodes, len(dbItems))
-	for path, dbPathNodes := range dbItems {
-		pathNodes := corebridge.PathNodes{}
-
-		if dbPathNodes.Src != nil {
-			pathNodes.Src = &corebridge.PathNodeItem{
-				Queue:           dbPathNodes.Src.Queue,
-				Id:              dbPathNodes.Src.Id,
-				ParentId:        dbPathNodes.Src.ParentId,
-				ParentPath:      dbPathNodes.Src.ParentPath,
-				Name:            dbPathNodes.Src.Name,
-				LocationPath:    dbPathNodes.Src.LocationPath,
-				LastUpdated:     dbPathNodes.Src.LastUpdated,
-				DepthLevel:      dbPathNodes.Src.DepthLevel,
-				Type:            dbPathNodes.Src.Type,
-				Size:            dbPathNodes.Src.Size,
-				TraversalStatus: dbPathNodes.Src.TraversalStatus,
-				CopyStatus:      dbPathNodes.Src.CopyStatus,
-			}
+func diffItemToPathNodes(item migration.DiffItem) corebridge.PathNodes {
+	pathNodes := corebridge.PathNodes{}
+	if !item.MissingOnSource {
+		pathNodes.Src = &corebridge.PathNodeItem{
+			Queue:           "SRC",
+			Id:              item.SrcNodeID,
+			Name:            item.Name,
+			LocationPath:    item.Path,
+			DepthLevel:      item.Depth,
+			Type:            item.Type,
+			Size:            item.Size,
+			TraversalStatus: item.SrcTraversalStatus,
+			CopyStatus:      item.CopyStatus,
 		}
-
-		if dbPathNodes.Dst != nil {
-			pathNodes.Dst = &corebridge.PathNodeItem{
-				Queue:           dbPathNodes.Dst.Queue,
-				Id:              dbPathNodes.Dst.Id,
-				ParentId:        dbPathNodes.Dst.ParentId,
-				ParentPath:      dbPathNodes.Dst.ParentPath,
-				Name:            dbPathNodes.Dst.Name,
-				LocationPath:    dbPathNodes.Dst.LocationPath,
-				LastUpdated:     dbPathNodes.Dst.LastUpdated,
-				DepthLevel:      dbPathNodes.Dst.DepthLevel,
-				Type:            dbPathNodes.Dst.Type,
-				Size:            dbPathNodes.Dst.Size,
-				TraversalStatus: dbPathNodes.Dst.TraversalStatus,
-				CopyStatus:      dbPathNodes.Dst.CopyStatus,
-			}
-		}
-
-		items[path] = pathNodes
 	}
-	return items
+	if !item.MissingOnDest {
+		pathNodes.Dst = &corebridge.PathNodeItem{
+			Queue:           "DST",
+			Id:              item.DstNodeID,
+			Name:            item.Name,
+			LocationPath:    item.Path,
+			DepthLevel:      item.Depth,
+			Type:            item.Type,
+			Size:            item.Size,
+			TraversalStatus: item.DstTraversalStatus,
+			CopyStatus:      item.CopyStatus,
+		}
+	}
+	return pathNodes
 }
 
-func (m *Manager) ListChildrenDiffs(ctx context.Context, req corebridge.ListChildrenDiffsRequest) (corebridge.ListChildrenDiffsResponse, error) {
-	metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
-	meta, err := metaMgr.GetMigrationMetadata(req.MigrationID)
+func (m *Manager) ListChildrenDiffs(_ context.Context, req corebridge.ListChildrenDiffsRequest) (corebridge.ListChildrenDiffsResponse, error) {
+	mig, err := m.engineMgr.GetMigration(req.MigrationID)
 	if err != nil {
+		return corebridge.ListChildrenDiffsResponse{}, err
+	}
+	if mig == nil {
 		return corebridge.ListChildrenDiffsResponse{}, corebridge.ErrMigrationNotFound
 	}
 
-	dbPath := strings.TrimSuffix(meta.ConfigPath, ".yaml") + ".db"
-	if dbPath == ".db" {
-		dbPath, err = database.ResolveDatabasePath(m.cfg.Runtime.DataDir, "", req.MigrationID)
-		if err != nil {
-			return corebridge.ListChildrenDiffsResponse{}, fmt.Errorf("failed to resolve database path: %w", err)
+	sortBy := ""
+	sortDirection := "asc"
+	if req.Sort != nil {
+		sortBy = req.Sort.Field
+		if req.Sort.Direction != "" {
+			sortDirection = strings.ToLower(req.Sort.Direction)
 		}
 	}
-
-	useDuckDB := false
-	if meta.ConfigPath != "" {
-		yamlCfg, err := migration.LoadMigrationConfig(meta.ConfigPath)
-		if err == nil {
-			status := strings.TrimSpace(yamlCfg.State.Status)
-			switch status {
-			case "Awaiting-Path-Review", "Awaiting-Copy-Review":
-				useDuckDB = true
-			}
-		}
+	result, err := mig.ListChildrenDiffs(migration.ListChildrenDiffsRequest{
+		Path:          req.Path,
+		Limit:       req.Limit,
+		Offset:      req.Offset,
+		SortBy:        sortBy,
+		SortDirection: sortDirection,
+		FoldersOnly:   req.FoldersOnly,
+	})
+	if err != nil {
+		return corebridge.ListChildrenDiffsResponse{}, fmt.Errorf("failed to list children diffs: %w", err)
 	}
 
-	var dbItems map[string]database.PathNodes
-	var dbPagination database.PaginationInfo
-
-	if useDuckDB {
-		duckdbConn := m.migrationsMgr.GetDuckDB(req.MigrationID)
-		if duckdbConn == nil {
-			duckdbPool := m.migrationsMgr.GetDuckDBPool()
-			if duckdbPool != nil {
-				duckdbConn, err = duckdbPool.OpenDuckDB(req.MigrationID, dbPath)
-				if err != nil {
-					return corebridge.ListChildrenDiffsResponse{}, fmt.Errorf("failed to open DuckDB: %w", err)
-				}
-			} else {
-				return corebridge.ListChildrenDiffsResponse{}, fmt.Errorf("DuckDB pool not available")
-			}
-		}
-
-		sortField := ""
-		sortDir := "asc"
-		if req.Sort != nil {
-			sortField = req.Sort.Field
-			if req.Sort.Direction != "" {
-				sortDir = req.Sort.Direction
-			}
-		}
-
-		reviewPhase := "traversal"
-		if meta.ConfigPath != "" {
-			yamlCfg, err := migration.LoadMigrationConfig(meta.ConfigPath)
-			if err == nil {
-				status := strings.TrimSpace(yamlCfg.State.Status)
-				if status == "Awaiting-Copy-Review" {
-					reviewPhase = "copy"
-				}
-			}
-		}
-
-		dbItems, dbPagination, err = database.GetChildrenDiffsFromDuckDB(ctx, m.logger, duckdbConn, req.Path, req.AfterPath, req.Offset, req.Limit, req.FoldersOnly, sortField, sortDir, reviewPhase, false)
-		if err != nil {
-			return corebridge.ListChildrenDiffsResponse{}, fmt.Errorf("failed to get children diffs from DuckDB: %w", err)
-		}
+	items := make(map[string]corebridge.PathNodes)
+	for _, item := range result.Items {
+		items[item.Path] = diffItemToPathNodes(item)
 	}
 
-	items := convertDBPathNodesToCorebridge(dbItems)
-
+	hasMore := result.Offset+result.Limit < result.Total
 	return corebridge.ListChildrenDiffsResponse{
 		Items: items,
 		Pagination: corebridge.PaginationInfo{
-			Offset:       dbPagination.Offset,
-			Limit:        dbPagination.Limit,
-			Total:        dbPagination.Total,
-			TotalFolders: dbPagination.TotalFolders,
-			TotalFiles:   dbPagination.TotalFiles,
-			HasMore:      dbPagination.HasMore,
-			NextCursor:   dbPagination.NextCursor,
+			Offset:  result.Offset,
+			Limit:   result.Limit,
+			Total:   result.Total,
+			HasMore: hasMore,
 		},
 	}, nil
 }
 
-func (m *Manager) GetChildrenDiffsStats(ctx context.Context, migrationID, path string, foldersOnly bool) (corebridge.DiffsStatsResponse, error) {
-	metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
-	meta, err := metaMgr.GetMigrationMetadata(migrationID)
+func (m *Manager) GetChildrenDiffsStats(_ context.Context, migrationID, path string, foldersOnly bool) (corebridge.DiffsStatsResponse, error) {
+	mig, err := m.engineMgr.GetMigration(migrationID)
 	if err != nil {
+		return corebridge.DiffsStatsResponse{}, err
+	}
+	if mig == nil {
 		return corebridge.DiffsStatsResponse{}, corebridge.ErrMigrationNotFound
 	}
-
-	dbPath := strings.TrimSuffix(meta.ConfigPath, ".yaml") + ".db"
-	if dbPath == ".db" {
-		dbPath, err = database.ResolveDatabasePath(m.cfg.Runtime.DataDir, "", migrationID)
-		if err != nil {
-			return corebridge.DiffsStatsResponse{}, fmt.Errorf("failed to resolve database path: %w", err)
-		}
-	}
-
-	useDuckDB := false
-	if meta.ConfigPath != "" {
-		yamlCfg, err := migration.LoadMigrationConfig(meta.ConfigPath)
-		if err == nil {
-			status := strings.TrimSpace(yamlCfg.State.Status)
-			switch status {
-			case "Awaiting-Path-Review", "Awaiting-Copy-Review":
-				useDuckDB = true
-			}
-		}
-	}
-
-	if !useDuckDB {
-		return corebridge.DiffsStatsResponse{}, corebridge.ErrDatabaseNotAvailable
-	}
-
-	duckdbConn := m.migrationsMgr.GetDuckDB(migrationID)
-	if duckdbConn == nil {
-		pool := m.migrationsMgr.GetDuckDBPool()
-		if pool == nil {
-			return corebridge.DiffsStatsResponse{}, fmt.Errorf("DuckDB pool not available")
-		}
-		var openErr error
-		duckdbConn, openErr = pool.OpenDuckDB(migrationID, dbPath)
-		if openErr != nil {
-			return corebridge.DiffsStatsResponse{}, fmt.Errorf("failed to open DuckDB: %w", openErr)
-		}
-	}
-
-	total, foldersCount, filesCount, err := database.GetChildrenDiffsStatsFromDuckDB(ctx, m.logger, duckdbConn, path, foldersOnly)
+	stats, err := mig.GetChildrenDiffsStats(path, foldersOnly)
 	if err != nil {
-		return corebridge.DiffsStatsResponse{}, fmt.Errorf("failed to get diffs stats from DuckDB: %w", err)
+		return corebridge.DiffsStatsResponse{}, fmt.Errorf("failed to get diffs stats: %w", err)
+	}
+	folders := stats.Folders
+	files := stats.Files
+	if foldersOnly {
+		files = 0
 	}
 	return corebridge.DiffsStatsResponse{
-		Total:        total,
-		TotalFolders: foldersCount,
-		TotalFiles:   filesCount,
+		Total:        stats.Total,
+		TotalFolders: folders,
+		TotalFiles:   files,
 	}, nil
 }
 
-func (m *Manager) SearchPathReviewItems(ctx context.Context, migrationID string, req corebridge.SearchRequest, offset, limit int) (corebridge.ListChildrenDiffsResponse, error) {
-	metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
-	meta, err := metaMgr.GetMigrationMetadata(migrationID)
+func (m *Manager) SearchPathReviewItems(_ context.Context, migrationID string, req corebridge.SearchRequest, offset, limit int) (corebridge.ListChildrenDiffsResponse, error) {
+	mig, err := m.engineMgr.GetMigration(migrationID)
 	if err != nil {
+		return corebridge.ListChildrenDiffsResponse{}, err
+	}
+	if mig == nil {
 		return corebridge.ListChildrenDiffsResponse{}, corebridge.ErrMigrationNotFound
 	}
 
-	dbPath := strings.TrimSuffix(meta.ConfigPath, ".yaml") + ".db"
-	if dbPath == ".db" {
-		dbPath, err = database.ResolveDatabasePath(m.cfg.Runtime.DataDir, "", migrationID)
-		if err != nil {
-			return corebridge.ListChildrenDiffsResponse{}, fmt.Errorf("failed to resolve database path: %w", err)
+	query := ""
+	for _, cond := range req.Conditions {
+		if cond.Field == "path" || cond.Field == "name" {
+			query = fmt.Sprintf("%v", cond.Value)
+			break
 		}
 	}
-
-	useDuckDB := false
-	if meta.ConfigPath != "" {
-		yamlCfg, err := migration.LoadMigrationConfig(meta.ConfigPath)
-		if err == nil {
-			status := strings.TrimSpace(yamlCfg.State.Status)
-			if status == "Awaiting-Path-Review" || status == "Awaiting-Copy-Review" {
-				useDuckDB = true
-			}
-		}
-	}
-
-	if !useDuckDB {
-		return corebridge.ListChildrenDiffsResponse{}, corebridge.ErrDatabaseNotAvailable
-	}
-
-	duckdbConn := m.migrationsMgr.GetDuckDB(migrationID)
-	if duckdbConn == nil {
-		duckdbPool := m.migrationsMgr.GetDuckDBPool()
-		if duckdbPool != nil {
-			duckdbConn, err = duckdbPool.OpenDuckDB(migrationID, dbPath)
-			if err != nil {
-				return corebridge.ListChildrenDiffsResponse{}, fmt.Errorf("failed to open DuckDB: %w", err)
-			}
-		} else {
-			return corebridge.ListChildrenDiffsResponse{}, fmt.Errorf("DuckDB pool not available")
-		}
-	}
-
-	dbConditions := make([]database.SearchCondition, len(req.Conditions))
-	for i, cond := range req.Conditions {
-		dbConditions[i] = database.SearchCondition{
-			Field:    cond.Field,
-			Operator: cond.Operator,
-			Value:    cond.Value,
-		}
-	}
-
-	sortField := ""
-	sortDir := "asc"
+	sortBy := ""
+	sortDirection := "asc"
 	if req.Sort != nil {
-		sortField = req.Sort.Field
+		sortBy = req.Sort.Field
 		if req.Sort.Direction != "" {
-			sortDir = req.Sort.Direction
+			sortDirection = strings.ToLower(req.Sort.Direction)
 		}
 	}
-
-	statusSearchType := req.StatusSearchType
-	if statusSearchType == "" {
-		statusSearchType = "both"
-	}
-
-	reviewPhase := "traversal"
-	if meta.ConfigPath != "" {
-		yamlCfg, err := migration.LoadMigrationConfig(meta.ConfigPath)
-		if err == nil {
-			status := strings.TrimSpace(yamlCfg.State.Status)
-			if status == "Awaiting-Copy-Review" {
-				reviewPhase = "copy"
-			}
-		}
-	}
-
-	dbItems, dbPagination, err := database.SearchPathReviewItemsDuckDB(ctx, m.logger, duckdbConn, dbConditions, offset, limit, sortField, sortDir, statusSearchType, reviewPhase)
+	result, err := mig.SearchPathReviewItems(migration.SearchRequest{
+		Query:         query,
+		Path:          "",
+		Limit:       limit,
+		Offset:      offset,
+		SortBy:        sortBy,
+		SortDirection: sortDirection,
+	})
 	if err != nil {
 		return corebridge.ListChildrenDiffsResponse{}, fmt.Errorf("failed to search path review items: %w", err)
 	}
 
-	items := convertDBPathNodesToCorebridge(dbItems)
-
+	items := make(map[string]corebridge.PathNodes)
+	for _, item := range result.Items {
+		items[item.Path] = diffItemToPathNodes(item)
+	}
 	return corebridge.ListChildrenDiffsResponse{
 		Items: items,
 		Pagination: corebridge.PaginationInfo{
-			Offset:       dbPagination.Offset,
-			Limit:        dbPagination.Limit,
-			Total:        dbPagination.Total,
-			TotalFolders: dbPagination.TotalFolders,
-			TotalFiles:   dbPagination.TotalFiles,
-			HasMore:      dbPagination.HasMore,
+			Offset:  result.Offset,
+			Limit:   result.Limit,
+			Total:   result.Total,
+			HasMore: result.Offset+result.Limit < result.Total,
 		},
 	}, nil
 }

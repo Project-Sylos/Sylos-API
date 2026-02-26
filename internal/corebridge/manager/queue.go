@@ -3,185 +3,150 @@ package manager
 import (
 	"context"
 	"fmt"
-	"os"
-	"strings"
+	"time"
 
-	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
-	"codeberg.org/Sylos/Migration-Engine/pkg/queue"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
-	"codeberg.org/Sylos/Sylos-API/internal/corebridge/database"
-	"codeberg.org/Sylos/Sylos-API/internal/corebridge/metadata"
 )
 
-func (m *Manager) GetQueueMetrics(ctx context.Context, migrationID string) (*corebridge.QueueMetricsResponse, error) {
-	if controller := m.migrationsMgr.GetController(migrationID); controller != nil {
-		liveStats, err := controller.GetLiveStats()
-		if err == nil && len(liveStats) > 0 {
-			dbMetrics := liveStatsToQueueMetricsResponse(liveStats)
-			return metricsToResponse(dbMetrics), nil
-		}
-	}
-
-	metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
-	meta, err := metaMgr.GetMigrationMetadata(migrationID)
+func (m *Manager) GetQueueMetrics(_ context.Context, migrationID string) (*corebridge.QueueMetricsResponse, error) {
+	mig, err := m.engineMgr.GetMigration(migrationID)
 	if err != nil {
+		return nil, err
+	}
+	if mig == nil {
 		return nil, corebridge.ErrMigrationNotFound
 	}
-
-	dbPath := strings.TrimSuffix(meta.ConfigPath, ".yaml") + ".db"
-	if dbPath == ".db" {
-		dbPath, err = database.ResolveDatabasePath(m.cfg.Runtime.DataDir, "", migrationID)
-		if err != nil {
-			return nil, fmt.Errorf("failed to resolve database path: %w", err)
-		}
-	}
-
-	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
-		return nil, corebridge.ErrMigrationNotFound
-	}
-
-	engineMetrics, err := migration.GetQueueMetricsFromDB(dbPath)
+	metrics, err := mig.GetQueueMetrics()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get queue metrics: %w", err)
+		return nil, fmt.Errorf("failed to query queue metrics: %w", err)
 	}
-	dbMetrics := liveStatsToQueueMetricsResponse(engineMetrics)
-	return metricsToResponse(dbMetrics), nil
-}
 
-func liveStatsToQueueMetricsResponse(liveStats map[string]queue.ExternalQueueMetrics) *database.QueueMetricsResponse {
-	resp := &database.QueueMetricsResponse{}
-	if met, ok := liveStats["src-traversal"]; ok {
-		resp.SrcTraversal = queueMetricsToDB(&met)
-	}
-	if met, ok := liveStats["dst-traversal"]; ok {
-		resp.DstTraversal = queueMetricsToDB(&met)
-	}
-	if met, ok := liveStats["copy"]; ok {
-		resp.Copy = queueMetricsToDB(&met)
-	}
-	return resp
-}
-
-func queueMetricsToDB(met *queue.ExternalQueueMetrics) *database.ExternalQueueMetrics {
-	if met == nil {
-		return nil
-	}
-	return &database.ExternalQueueMetrics{
-		FilesDiscoveredTotal:     met.FilesDiscoveredTotal,
-		FoldersDiscoveredTotal:   met.FoldersDiscoveredTotal,
-		DiscoveryRateItemsPerSec: met.DiscoveryRateItemsPerSec,
-		TotalDiscovered:          met.TotalDiscovered,
-		Folders:                  met.Folders,
-		Files:                    met.Files,
-		Total:                    met.Total,
-		Bytes:                    met.Bytes,
-		ItemsPerSecond:           met.ItemsPerSecond,
-		BytesPerSecond:           met.BytesPerSecond,
-		Round:                    met.Round,
-		Pending:                  met.Pending,
-		InProgress:               met.InProgress,
-		Workers:                  met.Workers,
-		TotalPending:             met.TotalPending,
-		TotalFailed:              met.TotalFailed,
-		Name:                     met.Name,
-	}
-}
-
-func metricsToResponse(dbMetrics *database.QueueMetricsResponse) *corebridge.QueueMetricsResponse {
-	if dbMetrics == nil {
-		return &corebridge.QueueMetricsResponse{Success: true}
-	}
-	metrics := &corebridge.QueueMetricsResponse{Success: true}
-	if dbMetrics.SrcTraversal != nil {
-		metrics.SrcTraversal = &corebridge.ExternalQueueMetrics{
-			FilesDiscoveredTotal:     dbMetrics.SrcTraversal.FilesDiscoveredTotal,
-			FoldersDiscoveredTotal:   dbMetrics.SrcTraversal.FoldersDiscoveredTotal,
-			DiscoveryRateItemsPerSec: dbMetrics.SrcTraversal.DiscoveryRateItemsPerSec,
-			TotalDiscovered:          dbMetrics.SrcTraversal.TotalDiscovered,
-			Round:                    dbMetrics.SrcTraversal.Round,
-			Pending:                  dbMetrics.SrcTraversal.Pending,
-			InProgress:               dbMetrics.SrcTraversal.InProgress,
-			Workers:                  dbMetrics.SrcTraversal.Workers,
-			TotalPending:             dbMetrics.SrcTraversal.TotalPending,
-			TotalFailed:              dbMetrics.SrcTraversal.TotalFailed,
-			Name:                     dbMetrics.SrcTraversal.Name,
+	resp := &corebridge.QueueMetricsResponse{Success: true}
+	if q, ok := metrics.Queues["src-traversal"]; ok {
+		resp.SrcTraversal = &corebridge.ExternalQueueMetrics{
+			Name:                     "src-traversal",
+			FilesDiscoveredTotal:     asInt64(q["files_discovered_total"]),
+			FoldersDiscoveredTotal:   asInt64(q["folders_discovered_total"]),
+			DiscoveryRateItemsPerSec: asFloat64(q["discovery_rate_items_per_sec"]),
+			TotalDiscovered:          asInt64(q["total_discovered"]),
+			Round:                    asInt(q["round"]),
+			Pending:                  asInt(q["pending"]),
+			InProgress:               asInt(q["in_progress"]),
+			Workers:                  asInt(q["workers"]),
+			TotalPending:             asInt(q["total_pending"]),
+			TotalFailed:              asInt(q["total_failed"]),
 		}
 	}
-	if dbMetrics.DstTraversal != nil {
-		metrics.DstTraversal = &corebridge.ExternalQueueMetrics{
-			FilesDiscoveredTotal:     dbMetrics.DstTraversal.FilesDiscoveredTotal,
-			FoldersDiscoveredTotal:   dbMetrics.DstTraversal.FoldersDiscoveredTotal,
-			DiscoveryRateItemsPerSec: dbMetrics.DstTraversal.DiscoveryRateItemsPerSec,
-			TotalDiscovered:          dbMetrics.DstTraversal.TotalDiscovered,
-			Round:                    dbMetrics.DstTraversal.Round,
-			Pending:                  dbMetrics.DstTraversal.Pending,
-			InProgress:               dbMetrics.DstTraversal.InProgress,
-			Workers:                  dbMetrics.DstTraversal.Workers,
-			TotalPending:             dbMetrics.DstTraversal.TotalPending,
-			TotalFailed:              dbMetrics.DstTraversal.TotalFailed,
-			Name:                     dbMetrics.DstTraversal.Name,
+	if q, ok := metrics.Queues["dst-traversal"]; ok {
+		resp.DstTraversal = &corebridge.ExternalQueueMetrics{
+			Name:                     "dst-traversal",
+			FilesDiscoveredTotal:     asInt64(q["files_discovered_total"]),
+			FoldersDiscoveredTotal:   asInt64(q["folders_discovered_total"]),
+			DiscoveryRateItemsPerSec: asFloat64(q["discovery_rate_items_per_sec"]),
+			TotalDiscovered:          asInt64(q["total_discovered"]),
+			Round:                    asInt(q["round"]),
+			Pending:                  asInt(q["pending"]),
+			InProgress:               asInt(q["in_progress"]),
+			Workers:                  asInt(q["workers"]),
+			TotalPending:             asInt(q["total_pending"]),
+			TotalFailed:              asInt(q["total_failed"]),
 		}
 	}
-	if dbMetrics.Copy != nil {
-		metrics.Copy = &corebridge.ExternalQueueMetrics{
-			Folders:                  dbMetrics.Copy.Folders,
-			Files:                    dbMetrics.Copy.Files,
-			Total:                    dbMetrics.Copy.Total,
-			Bytes:                    dbMetrics.Copy.Bytes,
-			ItemsPerSecond:           dbMetrics.Copy.ItemsPerSecond,
-			BytesPerSecond:           dbMetrics.Copy.BytesPerSecond,
-			Round:                    dbMetrics.Copy.Round,
-			Pending:                  dbMetrics.Copy.Pending,
-			InProgress:               dbMetrics.Copy.InProgress,
-			Workers:                  dbMetrics.Copy.Workers,
-			TotalPending:             dbMetrics.Copy.TotalPending,
-			TotalFailed:              dbMetrics.Copy.TotalFailed,
-			Name:                     dbMetrics.Copy.Name,
-			FilesDiscoveredTotal:     dbMetrics.Copy.FilesDiscoveredTotal,
-			FoldersDiscoveredTotal:   dbMetrics.Copy.FoldersDiscoveredTotal,
-			DiscoveryRateItemsPerSec: dbMetrics.Copy.DiscoveryRateItemsPerSec,
-			TotalDiscovered:          dbMetrics.Copy.TotalDiscovered,
+	if q, ok := metrics.Queues["copy"]; ok {
+		resp.Copy = &corebridge.ExternalQueueMetrics{
+			Name:           "copy",
+			Folders:        asInt64(q["folders"]),
+			Files:          asInt64(q["files"]),
+			Total:          asInt64(q["total"]),
+			Bytes:          asInt64(q["bytes"]),
+			ItemsPerSecond: asFloat64(q["items_per_second"]),
+			BytesPerSecond: asFloat64(q["bytes_per_second"]),
+			Round:          asInt(q["round"]),
+			Pending:        asInt(q["pending"]),
+			InProgress:     asInt(q["in_progress"]),
+			Workers:        asInt(q["workers"]),
+			TotalPending:   asInt(q["total_pending"]),
+			TotalFailed:    asInt(q["total_failed"]),
 		}
 	}
-	return metrics
+
+	return &corebridge.QueueMetricsResponse{
+		Success:      resp.Success,
+		SrcTraversal: resp.SrcTraversal,
+		DstTraversal: resp.DstTraversal,
+		Copy:         resp.Copy,
+	}, nil
 }
 
-func (m *Manager) GetLogs(ctx context.Context, migrationID string, req corebridge.GetLogsRequest) (*corebridge.GetLogsResponse, error) {
-	metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
-	meta, err := metaMgr.GetMigrationMetadata(migrationID)
+func (m *Manager) GetLogs(_ context.Context, migrationID string, _ corebridge.GetLogsRequest) (*corebridge.GetLogsResponse, error) {
+	mig, err := m.engineMgr.GetMigration(migrationID)
 	if err != nil {
+		return nil, err
+	}
+	if mig == nil {
 		return nil, corebridge.ErrMigrationNotFound
 	}
-
-	dbPath := strings.TrimSuffix(meta.ConfigPath, ".yaml") + ".db"
-	if dbPath == ".db" {
-		dbPath, err = database.ResolveDatabasePath(m.cfg.Runtime.DataDir, "", migrationID)
-		if err != nil {
-			return nil, fmt.Errorf("failed to resolve database path: %w", err)
-		}
-	}
-
-	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
-		return nil, corebridge.ErrMigrationNotFound
-	}
-
-	dbLogs, err := migration.GetLogsFromDB(ctx, dbPath, migration.GetLogsOptions{MaxPerLevel: 1000})
+	logs, err := mig.GetLogs(1000, true)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get logs: %w", err)
 	}
-
-	logs := make(map[string][]corebridge.LogEntry)
-	for level, entries := range dbLogs {
-		logEntries := make([]corebridge.LogEntry, len(entries))
+	out := make(map[string][]corebridge.LogEntry)
+	for level, entries := range logs.ByLevel {
 		for i, entry := range entries {
-			logEntries[i] = corebridge.LogEntry{
-				ID:    entry.ID,
-				Level: entry.Level,
-				Data:  entry.Data,
-			}
+			out[level] = append(out[level], corebridge.LogEntry{
+				ID:    fmt.Sprintf("%d", i+1),
+				Level: level,
+				Data: map[string]any{
+					"message":   entry.Message,
+					"timestamp": entry.Timestamp.Format(time.RFC3339),
+				},
+			})
 		}
-		logs[level] = logEntries
 	}
+	return &corebridge.GetLogsResponse{Success: true, Logs: out}, nil
+}
 
-	return &corebridge.GetLogsResponse{Success: true, Logs: logs}, nil
+func asInt(v any) int {
+	switch t := v.(type) {
+	case int:
+		return t
+	case int32:
+		return int(t)
+	case int64:
+		return int(t)
+	case float64:
+		return int(t)
+	default:
+		return 0
+	}
+}
+
+func asInt64(v any) int64 {
+	switch t := v.(type) {
+	case int:
+		return int64(t)
+	case int32:
+		return int64(t)
+	case int64:
+		return t
+	case float64:
+		return int64(t)
+	default:
+		return 0
+	}
+}
+
+func asFloat64(v any) float64 {
+	switch t := v.(type) {
+	case float64:
+		return t
+	case float32:
+		return float64(t)
+	case int:
+		return float64(t)
+	case int64:
+		return float64(t)
+	default:
+		return 0
+	}
 }

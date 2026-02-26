@@ -3,8 +3,8 @@ package manager
 import (
 	"context"
 
+	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
-	"codeberg.org/Sylos/Sylos-API/internal/corebridge/database"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/metadata"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/roots"
 )
@@ -14,8 +14,17 @@ func (m *Manager) SetRoot(ctx context.Context, req corebridge.SetRootRequest) (c
 		return corebridge.SetRootResponse{}, err
 	}
 
+	migrationID := req.MigrationID
+	if migrationID == "" {
+		created, err := m.engineMgr.CreateMigration(migration.CreateMigrationConfig{Name: "migration"})
+		if err != nil {
+			return corebridge.SetRootResponse{}, err
+		}
+		migrationID = created.ID
+	}
+
 	rootsReq := roots.SetRootRequest{
-		MigrationID:  req.MigrationID,
+		MigrationID:  migrationID,
 		Role:         req.Role,
 		ServiceID:    req.ServiceID,
 		ConnectionID: req.ConnectionID,
@@ -43,15 +52,10 @@ func (m *Manager) SetRoot(ctx context.Context, req corebridge.SetRootRequest) (c
 		isNewMigration = existingMeta.IsNewMigration
 	}
 
-	var configPath string
-	if resp.DatabasePath != "" {
-		configPath = database.ConfigPathFromDatabasePath(resp.DatabasePath)
-	}
-
 	meta := metadata.MigrationMetadata{
 		ID:             resp.MigrationID,
 		Name:           resp.MigrationID,
-		ConfigPath:     configPath,
+		DatabasePath:   resp.DatabasePath,
 		IsNewMigration: isNewMigration,
 	}
 	if err := metaMgr.UpdateMigrationMetadata(meta); err != nil {

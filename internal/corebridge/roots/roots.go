@@ -3,7 +3,6 @@ package roots
 import (
 	"context"
 	"fmt"
-	"path/filepath"
 	"strings"
 	"sync"
 
@@ -321,9 +320,11 @@ func (m *Manager) SetRoot(ctx context.Context, req SetRootRequest) (SetRootRespo
 	m.mu.Unlock()
 
 	if planReady {
-		if _, _, _, err := m.SeedPlanIfReady(migrationID); err != nil {
-			return SetRootResponse{}, err
+		m.mu.Lock()
+		if latestPlan := m.plans[migrationID]; latestPlan != nil {
+			latestPlan.Seeded = true
 		}
+		m.mu.Unlock()
 	}
 
 	m.mu.RLock()
@@ -336,7 +337,7 @@ func (m *Manager) SetRoot(ctx context.Context, req SetRootRequest) (SetRootRespo
 		destConn   string
 	)
 	if plan != nil {
-		ready = plan.Seeded
+		ready = plan.HasSource && plan.HasDestination
 		dbPath = plan.DatabasePath
 		sourceConn = plan.SourceConnectionID
 		destConn = plan.DestinationConnectionID
@@ -362,93 +363,15 @@ func (m *Manager) SetRoot(ctx context.Context, req SetRootRequest) (SetRootRespo
 }
 
 func (m *Manager) SeedPlanIfReady(migrationID string) (bool, migration.RootSeedSummary, string, error) {
-	m.mu.Lock()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
 	plan, ok := m.plans[migrationID]
-	if !ok || !plan.HasSource || !plan.HasDestination {
-		m.mu.Unlock()
-		return false, migration.RootSeedSummary{}, "", nil
-	}
-	if plan.Seeding {
-		seeded := plan.Seeded
-		summary := plan.RootSummary
-		dbPath := plan.DatabasePath
-		m.mu.Unlock()
-		return seeded, summary, dbPath, nil
-	}
-
-	plan.Seeding = true
-	sourceDef := plan.SourceDefinition
-	destDef := plan.DestinationDefinition
-	sourceRoot := plan.SourceRoot
-	destRoot := plan.DestinationRoot
-	sourceConn := plan.SourceConnectionID
-	destConn := plan.DestinationConnectionID
-	dbPath := plan.DatabasePath
-	m.mu.Unlock()
-
-	if dbPath == "" {
-		var err error
-		dbPath, err = m.resolveDBPath("", migrationID)
-		if err != nil {
-			m.mu.Lock()
-			if plan, ok := m.plans[migrationID]; ok {
-				plan.Seeding = false
-			}
-			m.mu.Unlock()
-			return false, migration.RootSeedSummary{}, "", err
-		}
-	}
-
-	// Engine owns DB lifecycle: creates dir, opens, seeds (or skips if roots exist), closes.
-	// API never opens the DB for root seeding.
-	sourceRoot.LocationPath = "/"
-	destRoot.LocationPath = "/"
-
-	configPath := filepath.Join(filepath.Dir(dbPath), strings.TrimSuffix(filepath.Base(dbPath), ".db")+".yaml")
-	summary, seedErr := migration.SeedRootsIntoDatabase(migration.SeedRootsOptions{
-		DBPath:     dbPath,
-		SrcRoot:    sourceRoot,
-		DstRoot:    destRoot,
-		ConfigPath: configPath,
-	})
-	if seedErr != nil {
-		m.mu.Lock()
-		if plan, ok := m.plans[migrationID]; ok {
-			plan.Seeding = false
-		}
-		m.mu.Unlock()
-		return false, migration.RootSeedSummary{}, "", seedErr
-	}
-
-	m.mu.Lock()
-	plan, ok = m.plans[migrationID]
 	if !ok {
-		m.mu.Unlock()
-		return false, migration.RootSeedSummary{}, "", fmt.Errorf("migration %s plan removed during seeding", migrationID)
-	}
-
-	plan.Seeding = false
-	if !plan.HasSource ||
-		plan.SourceDefinition.ID != sourceDef.ID ||
-		plan.SourceRoot.ID() != sourceRoot.ID() ||
-		!plan.HasDestination ||
-		plan.DestinationDefinition.ID != destDef.ID ||
-		plan.DestinationRoot.ID() != destRoot.ID() {
-		plan.Seeded = false
-		plan.DatabasePath = ""
-		plan.RootSummary = migration.RootSeedSummary{}
-		m.mu.Unlock()
 		return false, migration.RootSeedSummary{}, "", nil
 	}
-
-	plan.Seeded = true
-	plan.DatabasePath = dbPath
-	plan.RootSummary = summary
-	plan.SourceConnectionID = sourceConn
-	plan.DestinationConnectionID = destConn
-	m.mu.Unlock()
-
-	return true, summary, dbPath, nil
+	ready := plan.HasSource && plan.HasDestination
+	return ready, migration.RootSeedSummary{}, "", nil
 }
 
 func (m *Manager) GetPlan(migrationID string) *RootPlan {
