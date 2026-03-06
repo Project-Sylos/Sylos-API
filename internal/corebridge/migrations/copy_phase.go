@@ -31,7 +31,7 @@ func (m *Manager) RunCopyPhase(record *MigrationRecord, dbPath, _ string, opts M
 	}
 
 	copyCfg := migration.CopyPhaseConfig{
-		BoltDB:       dbInstance,
+		DuckDB:       dbInstance,
 		SrcAdapter:   srcAdapter,
 		DstAdapter:   dstAdapter,
 		WorkerCount:  m.selectWorkerCount(opts.WorkerCount),
