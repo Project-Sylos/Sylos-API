@@ -30,31 +30,14 @@ func (m *Manager) TriggerRetrySweep(ctx context.Context, migrationID string, con
 		}, fmt.Errorf("retry sweep is already running")
 	}
 
-	mig, err := m.engineMgr.GetMigration(migrationID)
+	mig, err := m.GetMigration(context.TODO(), migrationID)
 	if err != nil {
 		return corebridge.SweepResponse{
 			Success: false,
 			Error:   err.Error(),
 		}, err
 	}
-	if mig == nil {
-		return corebridge.SweepResponse{
-			Success: false,
-			Error:   "migration not found",
-		}, corebridge.ErrMigrationNotFound
-	}
-
-	opts := migration.RetrySweepOptions{
-		WorkerCount:   config.WorkerCount,
-		MaxRetries:    config.MaxRetries,
-		LogAddress:    config.LogAddress,
-		LogLevel:      config.LogLevel,
-		MaxKnownDepth: config.MaxKnownDepth,
-		SkipListener:  true,
-	}
-	if config.SkipListener != nil {
-		opts.SkipListener = *config.SkipListener
-	}
+	opts := m.buildRetrySweepOptions(config)
 
 	taskID := m.bgTaskMgr.StartTask(migrationID, corebridge.BackgroundTaskTypeRetrySweep)
 	go func() {
@@ -62,7 +45,7 @@ func (m *Manager) TriggerRetrySweep(ctx context.Context, migrationID string, con
 			m.bgTaskMgr.FailTask(migrationID, taskID, err)
 			return
 		}
-		if err := m.markPathReviewChanges(migrationID, false); err != nil {
+		if err := m.MarkPathReviewChanges(context.TODO(), migrationID, false); err != nil {
 			m.logger.Warn().Err(err).Str("migration_id", migrationID).Msg("failed to clear path review changes flag")
 		}
 		m.bgTaskMgr.CompleteTask(migrationID, taskID)
@@ -72,4 +55,44 @@ func (m *Manager) TriggerRetrySweep(ctx context.Context, migrationID string, con
 		Success: true,
 		Message: "Retry sweep started",
 	}, nil
+}
+
+func (m *Manager) buildRetrySweepOptions(config corebridge.SweepConfigRequest) migration.RetrySweepOptions {
+	workerCount := config.WorkerCount
+	if workerCount <= 0 {
+		workerCount = m.cfg.Runtime.DefaultWorkerCount
+	}
+	if workerCount <= 0 {
+		workerCount = 10
+	}
+	maxRetries := config.MaxRetries
+	if maxRetries <= 0 {
+		maxRetries = m.cfg.Runtime.DefaultMaxRetries
+	}
+	if maxRetries <= 0 {
+		maxRetries = 3
+	}
+	logAddress := config.LogAddress
+	if logAddress == "" {
+		logAddress = m.cfg.Runtime.LogAddress
+	}
+	logLevel := config.LogLevel
+	if logLevel == "" {
+		logLevel = m.cfg.Runtime.LogLevel
+	}
+	if logLevel == "" {
+		logLevel = "info"
+	}
+	skipListener := true
+	if config.SkipListener != nil {
+		skipListener = *config.SkipListener
+	}
+	return migration.RetrySweepOptions{
+		WorkerCount:   workerCount,
+		MaxRetries:    maxRetries,
+		LogAddress:    logAddress,
+		LogLevel:      logLevel,
+		MaxKnownDepth: config.MaxKnownDepth,
+		SkipListener:  skipListener,
+	}
 }

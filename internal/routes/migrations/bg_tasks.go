@@ -17,7 +17,7 @@ func (h handler) bgTasks(ctx *middleware.Context) {
 		return
 	}
 
-	tasks, err := h.core.GetBackgroundTasks(ctx.Request().Context(), migrationID)
+	tasks, err := h.mgr.GetBackgroundTasks(ctx.Request().Context(), migrationID)
 	if err != nil {
 		ctx.Error(http.StatusInternalServerError, "failed to get background tasks", err)
 		return
@@ -35,7 +35,7 @@ func (h handler) bgTasksRunning(ctx *middleware.Context) {
 		return
 	}
 
-	runningTasks, err := h.core.GetRunningBackgroundTasks(ctx.Request().Context(), migrationID)
+	runningTasks, err := h.mgr.GetRunningBackgroundTasks(ctx.Request().Context(), migrationID)
 	if err != nil {
 		ctx.Error(http.StatusInternalServerError, "failed to get running background tasks", err)
 		return
@@ -65,7 +65,7 @@ func (h handler) bgTaskByID(ctx *middleware.Context) {
 		return
 	}
 
-	task, err := h.core.GetBackgroundTask(ctx.Request().Context(), migrationID, taskID)
+	task, err := h.mgr.GetBackgroundTask(ctx.Request().Context(), migrationID, taskID)
 	if err != nil {
 		// Check if it's a "not found" error
 		if err.Error() == "task "+taskID+" not found for migration "+migrationID ||

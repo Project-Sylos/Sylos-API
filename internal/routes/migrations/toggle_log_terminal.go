@@ -14,7 +14,7 @@ type toggleLogTerminalRequest struct {
 }
 
 func (h handler) toggleLogTerminal(ctx *middleware.Context, req toggleLogTerminalRequest) {
-	err := h.core.ToggleLogTerminal(ctx.Request().Context(), req.Enable, req.LogAddress)
+	err := h.mgr.ToggleLogTerminal(ctx.Request().Context(), req.Enable, req.LogAddress)
 	if err != nil {
 		status := http.StatusInternalServerError
 		if errors.Is(err, corebridge.ErrServiceNotFound) || isUserInputError(err) {

@@ -55,7 +55,7 @@ func (h handler) uploadUnified(ctx *middleware.Context) {
 		return
 	}
 
-	response, err := h.core.UploadByType(ctx.Request().Context(), migrationID, uploadType, data, overwrite)
+	response, err := h.mgr.UploadByType(ctx.Request().Context(), migrationID, uploadType, data, overwrite)
 	if err != nil {
 		ctx.Error(http.StatusInternalServerError, "failed to upload migration data", err)
 		return

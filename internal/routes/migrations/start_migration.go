@@ -25,7 +25,7 @@ func (h handler) start(ctx *middleware.Context, payload corebridge.StartMigratio
 	// Use background context since the HTTP request context will be canceled when handler returns
 	go func() {
 		bgCtx := context.Background()
-		migration, err := h.core.StartMigration(bgCtx, payload)
+		migration, err := h.mgr.StartMigration(bgCtx, payload)
 		if err != nil {
 			// Errors are logged by the core bridge
 			// The migration status will reflect the error when queried

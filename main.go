@@ -54,6 +54,7 @@ func main() {
 	router := routes.New(routes.Dependencies{
 		Logger:      log,
 		CoreBridge:  coreBridge,
+		Manager:     coreBridge,
 		AuthManager: authManager,
 		Middleware:  apiMiddleware,
 		DataDir:     cfg.Runtime.DataDir,

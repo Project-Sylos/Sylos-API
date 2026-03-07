@@ -2,9 +2,11 @@ package manager
 
 import (
 	"context"
+	"os"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge/database"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/metadata"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/roots"
 )
@@ -21,6 +23,9 @@ func (m *Manager) SetRoot(ctx context.Context, req corebridge.SetRootRequest) (c
 			return corebridge.SetRootResponse{}, err
 		}
 		migrationID = created.ID
+		// Per-migration flow: API creates the folder; engine will create/open DB at migrationDir/{id}.db when GetMigration is called.
+		migrationDir := database.GetMigrationDir(m.cfg.Runtime.DataDir, migrationID)
+		_ = os.MkdirAll(migrationDir, 0755)
 	}
 
 	rootsReq := roots.SetRootRequest{

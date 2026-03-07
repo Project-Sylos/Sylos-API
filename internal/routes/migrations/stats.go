@@ -1,10 +1,12 @@
 package migrations
 
 import (
+	"errors"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
 
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
 	"codeberg.org/Sylos/Sylos-API/internal/routes/middleware"
 )
 
@@ -15,11 +17,19 @@ func (h handler) stats(ctx *middleware.Context) {
 		return
 	}
 
-	stats, err := h.core.GetPathReviewStats(ctx.Request().Context(), migrationID)
+	mig, err := h.mgr.GetMigration(ctx.Request().Context(), migrationID)
+	if err != nil {
+		if errors.Is(err, corebridge.ErrMigrationNotFound) {
+			ctx.Error(http.StatusNotFound, "migration not found", err)
+			return
+		}
+		ctx.Error(http.StatusInternalServerError, "failed to get migration", err)
+		return
+	}
+	stats, err := corebridge.PathReviewStatsFromMigration(mig)
 	if err != nil {
 		ctx.Error(http.StatusInternalServerError, "failed to get path review stats", err)
 		return
 	}
-
 	ctx.Response(http.StatusOK, stats)
 }

@@ -4,20 +4,20 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/rs/zerolog"
 
-	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge/manager"
 	"codeberg.org/Sylos/Sylos-API/internal/routes/middleware"
 )
 
 type handler struct {
 	logger zerolog.Logger
-	core   corebridge.Bridge
+	mgr    *manager.Manager
 }
 
 // Register mounts migration orchestration endpoints.
-func Register(router chi.Router, logger zerolog.Logger, core corebridge.Bridge, mw *middleware.Middleware) {
+func Register(router chi.Router, logger zerolog.Logger, mgr *manager.Manager, mw *middleware.Middleware) {
 	h := handler{
 		logger: logger,
-		core:   core,
+		mgr:    mgr,
 	}
 
 	router.Post("/migrations/roots", middleware.JSON(mw, h.setRoot))
