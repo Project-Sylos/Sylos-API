@@ -23,9 +23,12 @@ func (m *Manager) SetRoot(ctx context.Context, req corebridge.SetRootRequest) (c
 			return corebridge.SetRootResponse{}, err
 		}
 		migrationID = created.ID
-		// Per-migration flow: API creates the folder; engine will create/open DB at migrationDir/{id}.db when GetMigration is called.
+		// Per-migration flow: create folder and materialize the migration (DB + row) so Start and polling never race on pending→persist.
 		migrationDir := database.GetMigrationDir(m.cfg.Runtime.DataDir, migrationID)
 		_ = os.MkdirAll(migrationDir, 0755)
+		if _, err := m.GetMigration(ctx, migrationID); err != nil {
+			return corebridge.SetRootResponse{}, err
+		}
 	}
 
 	rootsReq := roots.SetRootRequest{

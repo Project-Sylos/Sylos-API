@@ -3,6 +3,8 @@ package manager
 import (
 	"context"
 	"fmt"
+	"time"
+
 	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
 )
@@ -37,12 +39,41 @@ func (m *Manager) TriggerRetrySweep(ctx context.Context, migrationID string, con
 			Error:   err.Error(),
 		}, err
 	}
+	// Persist phase to traversal-in-progress before 202 so polls see the correct phase before the goroutine runs.
+	if err := mig.PrepareRetrySweep(); err != nil {
+		return corebridge.SweepResponse{
+			Success: false,
+			Error:   err.Error(),
+		}, err
+	}
+	m.mu.Lock()
+	if rec := m.runtimeByID[migrationID]; rec != nil {
+		rec.Status = migration.PhaseTraversing
+		rec.CompletedAt = nil
+		rec.Error = ""
+	}
+	m.mu.Unlock()
+
 	opts := m.buildRetrySweepOptions(config)
 
 	taskID := m.bgTaskMgr.StartTask(migrationID, corebridge.BackgroundTaskTypeRetrySweep)
 	go func() {
-		if _, err := mig.RunRetrySweep(opts); err != nil {
-			m.bgTaskMgr.FailTask(migrationID, taskID, err)
+		_, runErr := mig.RunRetrySweep(opts)
+		doneAt := time.Now().UTC()
+		m.mu.Lock()
+		if rec := m.runtimeByID[migrationID]; rec != nil {
+			rec.CompletedAt = &doneAt
+			if runErr != nil {
+				rec.Status = corebridge.MigrationStatusFailed
+				rec.Error = runErr.Error()
+			} else {
+				rec.Status = mig.Phase()
+				rec.Error = ""
+			}
+		}
+		m.mu.Unlock()
+		if runErr != nil {
+			m.bgTaskMgr.FailTask(migrationID, taskID, runErr)
 			return
 		}
 		if err := m.MarkPathReviewChanges(context.TODO(), migrationID, false); err != nil {

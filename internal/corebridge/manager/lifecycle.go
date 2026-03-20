@@ -35,7 +35,7 @@ func (m *Manager) StartMigration(ctx context.Context, req corebridge.StartMigrat
 		SourceID:      plan.SourceDefinition.ID,
 		DestinationID: plan.DestinationDefinition.ID,
 		StartedAt:     now,
-		Status:        corebridge.MigrationStatusRunning,
+		Status:        migration.PhaseTraversing,
 	}
 	m.mu.Unlock()
 
@@ -50,7 +50,7 @@ func (m *Manager) StartMigration(ctx context.Context, req corebridge.StartMigrat
 				rec.Status = corebridge.MigrationStatusFailed
 				rec.Error = runErr.Error()
 			} else {
-				rec.Status = migration.PhaseReview.String()
+				rec.Status = mig.Phase()
 			}
 		}
 	}()
@@ -64,7 +64,7 @@ func (m *Manager) StartMigration(ctx context.Context, req corebridge.StartMigrat
 		SourceID:      plan.SourceDefinition.ID,
 		DestinationID: plan.DestinationDefinition.ID,
 		StartedAt:     now,
-		Status:        corebridge.MigrationStatusRunning,
+		Status:        migration.PhaseTraversing,
 	}, nil
 }
 
@@ -196,23 +196,72 @@ func (m *Manager) ChangePhase(ctx context.Context, migrationID string, phase str
 	if err != nil {
 		return corebridge.Migration{}, err
 	}
+	plan := m.rootsMgr.GetPlan(migrationID)
+
+	now := time.Now().UTC()
+	m.mu.Lock()
+	rec := m.runtimeByID[migrationID]
+	if rec == nil {
+		sourceID, destID := "", ""
+		if plan != nil {
+			sourceID = plan.SourceDefinition.ID
+			destID = plan.DestinationDefinition.ID
+		}
+		rec = &runtimeMigration{
+			Migration:     mig,
+			SourceID:      sourceID,
+			DestinationID: destID,
+			StartedAt:     now,
+			Status:        "",
+			Error:         "",
+		}
+		m.runtimeByID[migrationID] = rec
+	}
+	if phase == "copy" {
+		rec.Status = migration.PhaseCopying
+		rec.CompletedAt = nil
+		rec.Error = ""
+	} else {
+		rec.Status = migration.PhaseTraversing
+		rec.CompletedAt = nil
+		rec.Error = ""
+	}
+	m.mu.Unlock()
 
 	go func() {
+		var runErr error
 		if phase == "copy" {
-			_, _ = mig.StartCopy()
-			return
+			_, runErr = mig.StartCopy()
+		} else {
+			if plan == nil || !plan.HasSource || !plan.HasDestination {
+				runErr = fmt.Errorf("roots not configured for migration %s", migrationID)
+			} else {
+				cfg := m.buildTraversalConfig(req.Options, plan)
+				_, runErr = mig.StartTraversal(cfg)
+			}
 		}
-		plan := m.rootsMgr.GetPlan(migrationID)
-		if plan == nil || !plan.HasSource || !plan.HasDestination {
-			return
+		// Forced-sync: update runtime cache from engine state when goroutine ends.
+		doneAt := time.Now().UTC()
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if rec := m.runtimeByID[migrationID]; rec != nil {
+			rec.CompletedAt = &doneAt
+			if runErr != nil {
+				rec.Status = corebridge.MigrationStatusFailed
+				rec.Error = runErr.Error()
+			} else {
+				rec.Status = mig.Phase()
+			}
 		}
-		cfg := m.buildTraversalConfig(req.Options, plan)
-		_, _ = mig.StartTraversal(cfg)
 	}()
 
+	status := migration.PhaseCopying
+	if phase != "copy" {
+		status = migration.PhaseTraversing
+	}
 	return corebridge.Migration{
 		ID:      migrationID,
-		Status:  "running",
+		Status:  status,
 		Success: true,
 	}, nil
 }
@@ -230,7 +279,7 @@ func (m *Manager) GetMigrationStatus(ctx context.Context, id string) (corebridge
 	sourceID := ""
 	destinationID := ""
 	startedAt := time.Time{}
-	status := mig.Phase().String()
+	status := mig.Phase()
 	errText := ""
 	var completedAt *time.Time
 	if rec != nil {
@@ -264,7 +313,7 @@ func (m *Manager) LoadMigration(ctx context.Context, migrationID string) (corebr
 	}
 	return corebridge.Migration{
 		ID:     migrationID,
-		Status: mig.Phase().String(),
+		Status: mig.Phase(),
 	}, nil
 }
 
@@ -283,7 +332,7 @@ func (m *Manager) StopMigration(ctx context.Context, migrationID string) (corebr
 		return corebridge.Status{
 			Migration: corebridge.Migration{
 				ID:     migrationID,
-				Status: stopResult.Phase.String(),
+				Status: stopResult.Phase,
 			},
 		}, nil
 	}

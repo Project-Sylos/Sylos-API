@@ -9,17 +9,20 @@ import (
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/metadata"
 )
 
+// getMigrationPhase maps the engine phase to a coarse API phase for locking/UX.
+// Engine phases: roots-set, filters-set, traversal-in-progress, awaiting-traversal-review, copy-in-progress, awaiting-copy-review.
 func (m *Manager) getMigrationPhase(migrationID string) (string, error) {
 	mig, err := m.GetMigration(context.TODO(), migrationID)
 	if err != nil {
 		return "unknown", err
 	}
-	switch mig.Phase().String() {
-	case "created":
+	p := mig.Phase()
+	switch p {
+	case migration.PhaseCreated, migration.PhaseFiltersSet:
 		return "roots", nil
-	case "traversing", "review":
+	case migration.PhaseTraversing, migration.PhaseTraversalReview:
 		return "traversal", nil
-	case "copying", "completed":
+	case migration.PhaseCopying, migration.PhaseCopyReview:
 		return "copy", nil
 	default:
 		return "unknown", nil

@@ -2,6 +2,8 @@ package manager
 
 import (
 	"context"
+
+	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
 )
 
 // PathReviewContext holds the context needed for path review operations.
@@ -16,7 +18,7 @@ func (m *Manager) preparePathReviewContext(_ context.Context, migrationID string
 		return nil, err
 	}
 	reviewPhase := "traversal"
-	if mig.Phase().String() == "copying" || mig.Phase().String() == "completed" {
+	if mig.Phase() == migration.PhaseCopying || mig.Phase() == migration.PhaseCopyReview {
 		reviewPhase = "copy"
 	}
 

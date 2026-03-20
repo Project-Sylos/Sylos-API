@@ -379,7 +379,7 @@ func ExcludeNodes(mig *migration.Migration, req ExclusionRequest) (*ExclusionRes
 	if mig == nil {
 		return &ExclusionResponse{Success: false, Error: "migration is nil", Deltas: map[string]int64{}}, nil
 	}
-	if mig.Phase() == migration.PhaseCopying || mig.Phase() == migration.PhaseCompleted {
+	if mig.Phase() == migration.PhaseCopying || mig.Phase() == migration.PhaseCopyReview {
 		return &ExclusionResponse{
 			Success: false,
 			Error:   "exclusion operations are not available in copy phase (exclusion only applies to traversal)",
@@ -425,7 +425,7 @@ func UnexcludeNodes(mig *migration.Migration, req ExclusionRequest) (*ExclusionR
 	if mig == nil {
 		return &ExclusionResponse{Success: false, Error: "migration is nil", Deltas: map[string]int64{}}, nil
 	}
-	if mig.Phase() == migration.PhaseCopying || mig.Phase() == migration.PhaseCompleted {
+	if mig.Phase() == migration.PhaseCopying || mig.Phase() == migration.PhaseCopyReview {
 		return &ExclusionResponse{
 			Success: false,
 			Error:   "exclusion operations are not available in copy phase (exclusion only applies to traversal)",

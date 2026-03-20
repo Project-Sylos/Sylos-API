@@ -373,12 +373,13 @@ type ExclusionRequest struct {
 
 // ExclusionResponse represents the response from exclude/unexclude operations.
 // AffectedCount and Deltas come from the engine's PathReviewActionResult so the UI can update local stats without refetching.
+// Delta keys (traversal only): traversalPending, traversalFailed, excluded. Apply to the phase's pending/failed/excluded counts.
 type ExclusionResponse struct {
 	Success       bool            `json:"success"`
 	Error         string          `json:"error,omitempty"`
 	TaskID        string          `json:"taskID,omitempty"` // Background task ID for 'all' operations
 	AffectedCount int64           `json:"affectedCount"`
-	Deltas        map[string]int64 `json:"deltas"` // Per-status changes (e.g. "pending": -1, "excluded": 1); omit or {} when none
+	Deltas        map[string]int64 `json:"deltas"` // Engine keys: traversalPending, traversalFailed, excluded; only keys that changed are present
 }
 
 // SweepConfigRequest represents the configuration for exclusion or retry sweeps
@@ -416,12 +417,17 @@ type MarkRetryRequest struct {
 
 // MarkRetryResponse represents the response from marking/unmarking a node for retry.
 // AffectedCount and Deltas come from the engine's PathReviewActionResult so the UI can update local stats without refetching.
+// Delta keys depend on action:
+//   - Discovery retry (mark/unmark for retry discovery): traversalPending, traversalFailed, pendingRetries; plus folders, files, excluded, sizeDst when DST descendants removed.
+//   - Copy retry (mark/unmark for retry copy): copyPending, copyFailed.
+//   - Retry all failed: traversalFailed, traversalPending.
+// UI should apply traversal keys to traversal review counters and copy keys to copy review counters.
 type MarkRetryResponse struct {
 	Success       bool            `json:"success"`
 	Error         string          `json:"error,omitempty"`
 	TaskID        string          `json:"taskID,omitempty"` // Background task ID for 'all' operations
 	AffectedCount int64           `json:"affectedCount"`
-	Deltas        map[string]int64 `json:"deltas"` // Per-status changes; omit or {} when none
+	Deltas        map[string]int64 `json:"deltas"` // Engine keys above; only keys that changed are present
 }
 
 // SearchCondition represents a single search condition
