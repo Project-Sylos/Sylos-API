@@ -10,7 +10,7 @@ import (
 )
 
 func (h handler) setRoot(ctx *middleware.Context, payload corebridge.SetRootRequest) {
-	resp, err := h.core.SetRoot(ctx.Request().Context(), payload)
+	resp, err := h.mgr.SetRoot(ctx.Request().Context(), payload)
 	if err != nil {
 		status := http.StatusInternalServerError
 		if errors.Is(err, corebridge.ErrServiceNotFound) ||

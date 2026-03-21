@@ -20,7 +20,7 @@ func (h handler) handleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	updates, cancel, err := h.core.SubscribeProgress(r.Context(), migrationID)
+	updates, cancel, err := h.mgr.SubscribeProgress(r.Context(), migrationID)
 	if err != nil {
 		if errors.Is(err, corebridge.ErrMigrationNotFound) {
 			httputil.WriteError(h.logger, w, http.StatusNotFound, "migration not found")

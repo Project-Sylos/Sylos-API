@@ -1,6 +1,7 @@
 package migrations
 
 import (
+	"errors"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
@@ -16,21 +17,27 @@ func (h handler) excludeNodes(ctx *middleware.Context, payload corebridge.Exclus
 		ctx.Error(http.StatusBadRequest, "migration id is required", nil)
 		return
 	}
-
 	h.logger.Info().Str("migration_id", migrationID).Interface("request", payload).Msg("excluding nodes")
 
-	// Use the new ExcludeNodes method
-	result, err := h.core.ExcludeNodes(ctx.Request().Context(), migrationID, payload)
+	mig, err := h.mgr.GetMigration(ctx.Request().Context(), migrationID)
+	if err != nil {
+		if errors.Is(err, corebridge.ErrMigrationNotFound) {
+			ctx.Error(http.StatusNotFound, "migration not found", err)
+			return
+		}
+		ctx.Error(http.StatusInternalServerError, "failed to get migration", err)
+		return
+	}
+	result, err := corebridge.ExcludeNodes(mig, payload)
 	if err != nil {
 		ctx.Error(http.StatusInternalServerError, "failed to exclude nodes", err)
 		return
 	}
-
 	if !result.Success {
 		ctx.Error(http.StatusBadRequest, result.Error, nil)
 		return
 	}
-
+	_ = h.mgr.MarkPathReviewChanges(ctx.Request().Context(), migrationID, true)
 	ctx.Response(http.StatusOK, result)
 }
 
@@ -41,20 +48,26 @@ func (h handler) unexcludeNodes(ctx *middleware.Context, payload corebridge.Excl
 		ctx.Error(http.StatusBadRequest, "migration id is required", nil)
 		return
 	}
-
 	h.logger.Info().Str("migration_id", migrationID).Interface("request", payload).Msg("unexcluding nodes")
 
-	// Use the new UnexcludeNodes method
-	result, err := h.core.UnexcludeNodes(ctx.Request().Context(), migrationID, payload)
+	mig, err := h.mgr.GetMigration(ctx.Request().Context(), migrationID)
+	if err != nil {
+		if errors.Is(err, corebridge.ErrMigrationNotFound) {
+			ctx.Error(http.StatusNotFound, "migration not found", err)
+			return
+		}
+		ctx.Error(http.StatusInternalServerError, "failed to get migration", err)
+		return
+	}
+	result, err := corebridge.UnexcludeNodes(mig, payload)
 	if err != nil {
 		ctx.Error(http.StatusInternalServerError, "failed to unexclude nodes", err)
 		return
 	}
-
 	if !result.Success {
 		ctx.Error(http.StatusBadRequest, result.Error, nil)
 		return
 	}
-
+	_ = h.mgr.MarkPathReviewChanges(ctx.Request().Context(), migrationID, true)
 	ctx.Response(http.StatusOK, result)
 }

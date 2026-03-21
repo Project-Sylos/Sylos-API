@@ -3,7 +3,7 @@ package manager
 import (
 	"context"
 
-	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
+	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
 )
 
 // PathReviewContext holds the context needed for path review operations.
@@ -13,15 +13,12 @@ type PathReviewContext struct {
 }
 
 func (m *Manager) preparePathReviewContext(_ context.Context, migrationID string) (*PathReviewContext, error) {
-	mig, err := m.engineMgr.GetMigration(migrationID)
+	mig, err := m.GetMigration(context.TODO(), migrationID)
 	if err != nil {
 		return nil, err
 	}
-	if mig == nil {
-		return nil, corebridge.ErrMigrationNotFound
-	}
 	reviewPhase := "traversal"
-	if mig.Phase().String() == "copying" || mig.Phase().String() == "completed" {
+	if mig.Phase() == migration.PhaseCopying || mig.Phase() == migration.PhaseCopyReview {
 		reviewPhase = "copy"
 	}
 

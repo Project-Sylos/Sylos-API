@@ -46,7 +46,7 @@ func (h handler) changePhase(ctx *middleware.Context, payload PhaseChangeRequest
 	// Validate synchronously before starting background operation
 	// This allows us to return immediate errors to the client
 	bgCtx := context.Background()
-	migration, err := h.core.ChangePhase(bgCtx, migrationID, payload.Phase, payload.StartMigrationRequest)
+	migration, err := h.mgr.ChangePhase(bgCtx, migrationID, payload.Phase, payload.StartMigrationRequest)
 	if err != nil {
 		// Return error response with success: false
 		h.logger.Error().

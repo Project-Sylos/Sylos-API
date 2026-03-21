@@ -19,7 +19,7 @@ func (h handler) retrySweep(ctx *middleware.Context, payload corebridge.SweepCon
 	}
 
 	// Trigger retry sweep
-	response, err := h.core.TriggerRetrySweep(ctx.Request().Context(), migrationID, payload)
+	response, err := h.mgr.TriggerRetrySweep(ctx.Request().Context(), migrationID, payload)
 	if err != nil {
 		// Determine appropriate HTTP status code
 		statusCode := http.StatusInternalServerError

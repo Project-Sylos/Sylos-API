@@ -17,7 +17,7 @@ func (h handler) stop(ctx *middleware.Context) {
 		return
 	}
 
-	status, err := h.core.StopMigration(ctx.Request().Context(), migrationID)
+	status, err := h.mgr.StopMigration(ctx.Request().Context(), migrationID)
 	if err != nil {
 		if errors.Is(err, corebridge.ErrMigrationNotFound) {
 			ctx.Error(http.StatusNotFound, "migration not found", err)

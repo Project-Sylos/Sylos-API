@@ -50,14 +50,7 @@ func (h handler) listDiffs(ctx *middleware.Context) {
 		}
 	}
 
-	diffs, err := h.core.ListChildrenDiffs(ctx.Request().Context(), corebridge.ListChildrenDiffsRequest{
-		MigrationID: migrationID,
-		Path:        path,
-		Offset:      offset,
-		Limit:       limit,
-		AfterPath:   afterPath,
-		FoldersOnly: foldersOnly,
-	})
+	mig, err := h.mgr.GetMigration(ctx.Request().Context(), migrationID)
 	if err != nil {
 		if errors.Is(err, corebridge.ErrMigrationNotFound) {
 			ctx.Error(http.StatusNotFound, "migration not found", err)
@@ -67,11 +60,21 @@ func (h handler) listDiffs(ctx *middleware.Context) {
 			ctx.Error(http.StatusServiceUnavailable, "database not available", err)
 			return
 		}
-
+		ctx.Error(http.StatusInternalServerError, "failed to get migration", err)
+		return
+	}
+	diffs, err := corebridge.ListChildrenDiffs(mig, corebridge.ListChildrenDiffsRequest{
+		MigrationID: migrationID,
+		Path:        path,
+		Offset:      offset,
+		Limit:       limit,
+		AfterPath:   afterPath,
+		FoldersOnly: foldersOnly,
+	})
+	if err != nil {
 		ctx.Error(http.StatusInternalServerError, "failed to list children diffs", err)
 		return
 	}
-
 	ctx.Response(http.StatusOK, diffs)
 }
 
@@ -95,7 +98,7 @@ func (h handler) diffsStats(ctx *middleware.Context) {
 		}
 	}
 
-	stats, err := h.core.GetChildrenDiffsStats(ctx.Request().Context(), migrationID, path, foldersOnly)
+	mig, err := h.mgr.GetMigration(ctx.Request().Context(), migrationID)
 	if err != nil {
 		if errors.Is(err, corebridge.ErrMigrationNotFound) {
 			ctx.Error(http.StatusNotFound, "migration not found", err)
@@ -105,9 +108,13 @@ func (h handler) diffsStats(ctx *middleware.Context) {
 			ctx.Error(http.StatusServiceUnavailable, "database not available", err)
 			return
 		}
+		ctx.Error(http.StatusInternalServerError, "failed to get migration", err)
+		return
+	}
+	stats, err := corebridge.GetChildrenDiffsStats(mig, path, foldersOnly)
+	if err != nil {
 		ctx.Error(http.StatusInternalServerError, "failed to get diffs stats", err)
 		return
 	}
-
 	ctx.Response(http.StatusOK, stats)
 }

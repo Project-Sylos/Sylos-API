@@ -380,6 +380,59 @@ func (m *Manager) GetPlan(migrationID string) *RootPlan {
 	return m.plans[migrationID]
 }
 
+// ApplyRehydratedSide attaches an adapter for one role after loading FS credential state from the migration DB (e.g. API restart).
+// It replaces any existing adapter for that role, calling the previous release callback first.
+func (m *Manager) ApplyRehydratedSide(migrationID, role string, def services.ServiceDefinition, folder fstypes.Folder, connectionID string, adapter fstypes.FSAdapter, release func()) error {
+	role = strings.ToLower(strings.TrimSpace(role))
+	if role != "source" && role != "destination" {
+		return fmt.Errorf("role must be 'source' or 'destination'")
+	}
+	var oldRelease func()
+	m.mu.Lock()
+	plan := m.plans[migrationID]
+	if plan == nil {
+		plan = &RootPlan{}
+		m.plans[migrationID] = plan
+	}
+	if role == "source" {
+		oldRelease = plan.SourceAdapterRelease
+		plan.SourceAdapterRelease = nil
+		plan.SourceAdapter = nil
+	} else {
+		oldRelease = plan.DestinationAdapterRelease
+		plan.DestinationAdapterRelease = nil
+		plan.DestinationAdapter = nil
+	}
+	m.mu.Unlock()
+	if oldRelease != nil {
+		oldRelease()
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	plan = m.plans[migrationID]
+	if plan == nil {
+		release()
+		return fmt.Errorf("migration plan was removed during rehydration")
+	}
+	if role == "source" {
+		plan.HasSource = true
+		plan.SourceDefinition = def
+		plan.SourceRoot = folder
+		plan.SourceConnectionID = connectionID
+		plan.SourceAdapter = adapter
+		plan.SourceAdapterRelease = release
+	} else {
+		plan.HasDestination = true
+		plan.DestinationDefinition = def
+		plan.DestinationRoot = folder
+		plan.DestinationConnectionID = connectionID
+		plan.DestinationAdapter = adapter
+		plan.DestinationAdapterRelease = release
+	}
+	return nil
+}
+
 // ClearAdapters clears adapter references from a RootPlan after migration completes
 // For Spectra: ServiceManager automatically closes sessions when all adapters are released
 // The API doesn't need to (and shouldn't) manually close sessions - ServiceManager handles that

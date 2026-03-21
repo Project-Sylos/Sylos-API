@@ -62,9 +62,7 @@ func (h handler) search(ctx *middleware.Context, payload corebridge.SearchReques
 		}
 	}
 
-	// If no search conditions provided (empty conditions), search all items
-	// Use SearchPathReviewItems with empty conditions to get all items, not just root-level
-	diffs, err := h.core.SearchPathReviewItems(ctx.Request().Context(), migrationID, payload, offset, limit)
+	mig, err := h.mgr.GetMigration(ctx.Request().Context(), migrationID)
 	if err != nil {
 		if errors.Is(err, corebridge.ErrMigrationNotFound) {
 			ctx.Error(http.StatusNotFound, "migration not found", err)
@@ -74,6 +72,11 @@ func (h handler) search(ctx *middleware.Context, payload corebridge.SearchReques
 			ctx.Error(http.StatusServiceUnavailable, "database not available", err)
 			return
 		}
+		ctx.Error(http.StatusInternalServerError, "failed to get migration", err)
+		return
+	}
+	diffs, err := corebridge.SearchPathReviewItems(mig, payload, offset, limit)
+	if err != nil {
 		ctx.Error(http.StatusInternalServerError, "failed to search", err)
 		return
 	}

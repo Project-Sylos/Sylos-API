@@ -11,6 +11,7 @@ import (
 
 	"codeberg.org/Sylos/Sylos-API/internal/auth"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge/manager"
 	authroutes "codeberg.org/Sylos/Sylos-API/internal/routes/auth"
 	healthroutes "codeberg.org/Sylos/Sylos-API/internal/routes/health"
 	middlewarepkg "codeberg.org/Sylos/Sylos-API/internal/routes/middleware"
@@ -22,6 +23,7 @@ import (
 type Dependencies struct {
 	Logger      zerolog.Logger
 	CoreBridge  corebridge.Bridge
+	Manager     *manager.Manager
 	AuthManager *auth.Manager
 	Middleware  *middlewarepkg.Middleware
 	DataDir     string
@@ -55,7 +57,7 @@ func New(deps Dependencies) chi.Router {
 
 	healthroutes.RegisterProtected(apiRouter)
 	serviceroutes.Register(apiRouter, deps.Logger, deps.CoreBridge, mw)
-	migrationroutes.Register(apiRouter, deps.Logger, deps.CoreBridge, mw)
+	migrationroutes.Register(apiRouter, deps.Logger, deps.Manager, mw)
 	preferencesroutes.Register(apiRouter, deps.Logger, deps.DataDir, mw)
 
 	router.Mount("/api", apiRouter)

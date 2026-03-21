@@ -336,21 +336,23 @@ type FileSizeStats struct {
 	Dst int64 `json:"dst"`
 }
 
-// PathReviewStats represents statistics for path review
+// PathReviewStats is the phase-aware path review stats from the engine (GetPathReviewStats). Returned as JSON for GET /migrations/{id}/stats.
 type PathReviewStats struct {
-	TraversalStatusCounts map[string]int `json:"traversalStatusCounts"` // Counts by traversal_status (pending, successful, failed, not_on_src)
-	CopyStatusCounts      map[string]int `json:"copyStatusCounts"`      // Counts by copy_status (pending, in_progress, successful, failed, skipped)
-	ExcludedCount         int            `json:"excludedCount"`         // Count where excluded = true (engine schema)
-	FoldersCount          int            `json:"foldersCount"`
-	FilesCount            int            `json:"filesCount"`
-	FoldersRatio          float64        `json:"foldersRatio"` // Rounded to 2 decimal places
-	FilesRatio            float64        `json:"filesRatio"`   // Rounded to 2 decimal places
-	TotalFileSize         FileSizeStats  `json:"totalFileSize"`
+	PendingCount        int           `json:"pendingCount"`
+	FailedCount         int           `json:"failedCount"`
+	ExcludedCount       int           `json:"excludedCount"`
+	PendingRetriesCount int           `json:"pendingRetriesCount"`
+	FoldersCount        int           `json:"foldersCount"`
+	FilesCount          int           `json:"filesCount"`
+	FoldersRatio        float64      `json:"foldersRatio"`
+	FilesRatio          float64      `json:"filesRatio"`
+	TotalFileSize       FileSizeStats `json:"totalFileSize"`
 }
 
 // ListChildrenDiffsResponse wraps the diff result with pagination metadata
 type ListChildrenDiffsResponse struct {
 	Items      map[string]PathNodes `json:"items"` // path -> {src?: {...}, dst?: {...}}
+	ItemOrder  []string               `json:"itemOrder,omitempty"` // paths in engine/SQL order; use when present — JSON object keys are sorted by path, not by sort
 	Pagination PaginationInfo       `json:"pagination"`
 }
 
@@ -370,11 +372,15 @@ type ExclusionRequest struct {
 	} `json:"filter,omitempty"`
 }
 
-// ExclusionResponse represents the response from exclude/unexclude operations
+// ExclusionResponse represents the response from exclude/unexclude operations.
+// AffectedCount and Deltas come from the engine's PathReviewActionResult so the UI can update local stats without refetching.
+// Delta keys (traversal only): traversalPending, traversalFailed, excluded. Apply to the phase's pending/failed/excluded counts.
 type ExclusionResponse struct {
-	Success bool   `json:"success"`
-	Error   string `json:"error,omitempty"`
-	TaskID  string `json:"taskID,omitempty"` // Background task ID for 'all' operations
+	Success       bool            `json:"success"`
+	Error         string          `json:"error,omitempty"`
+	TaskID        string          `json:"taskID,omitempty"` // Background task ID for 'all' operations
+	AffectedCount int64           `json:"affectedCount"`
+	Deltas        map[string]int64 `json:"deltas"` // Engine keys: traversalPending, traversalFailed, excluded; only keys that changed are present
 }
 
 // SweepConfigRequest represents the configuration for exclusion or retry sweeps
@@ -410,11 +416,19 @@ type MarkRetryRequest struct {
 	MarkAsFailed bool     `json:"markAsFailed,omitempty"` // If true, mark nodes as failed instead of retry
 }
 
-// MarkRetryResponse represents the response from marking a node for retry
+// MarkRetryResponse represents the response from marking/unmarking a node for retry.
+// AffectedCount and Deltas come from the engine's PathReviewActionResult so the UI can update local stats without refetching.
+// Delta keys depend on action:
+//   - Discovery retry (mark/unmark for retry discovery): traversalPending, traversalFailed, pendingRetries; plus folders, files, excluded, sizeDst when DST descendants removed.
+//   - Copy retry (mark/unmark for retry copy): copyPending, copyFailed.
+//   - Retry all failed: traversalFailed, traversalPending.
+// UI should apply traversal keys to traversal review counters and copy keys to copy review counters.
 type MarkRetryResponse struct {
-	Success bool   `json:"success"`
-	Error   string `json:"error,omitempty"`
-	TaskID  string `json:"taskID,omitempty"` // Background task ID for 'all' operations
+	Success       bool            `json:"success"`
+	Error         string          `json:"error,omitempty"`
+	TaskID        string          `json:"taskID,omitempty"` // Background task ID for 'all' operations
+	AffectedCount int64           `json:"affectedCount"`
+	Deltas        map[string]int64 `json:"deltas"` // Engine keys above; only keys that changed are present
 }
 
 // SearchCondition represents a single search condition
@@ -460,7 +474,6 @@ type Bridge interface {
 	SetRoot(ctx context.Context, req SetRootRequest) (SetRootResponse, error)
 	StartMigration(ctx context.Context, req StartMigrationRequest) (Migration, error)
 	GetMigrationStatus(ctx context.Context, id string) (Status, error)
-	InspectMigrationStatus(ctx context.Context, migrationID string) (migration.MigrationStatus, error)
 	UploadMigrationDB(ctx context.Context, migrationID string, data []byte, overwrite bool) (UploadMigrationDBResponse, error)
 	UploadMigrationYAML(ctx context.Context, migrationID string, data []byte, overwrite bool) (UploadMigrationDBResponse, error)
 	UploadMigrationData(ctx context.Context, migrationID string, zipData []byte, overwrite bool) (UploadMigrationDBResponse, error)
@@ -471,23 +484,11 @@ type Bridge interface {
 	ListAllMigrations(ctx context.Context, req ListMigrationsRequest) (ListMigrationsResponse, error)
 	LoadMigration(ctx context.Context, migrationID string) (Migration, error)
 	StopMigration(ctx context.Context, migrationID string) (Status, error)
-	GetQueueMetrics(ctx context.Context, migrationID string) (*QueueMetricsResponse, error)
-	GetLogs(ctx context.Context, migrationID string, req GetLogsRequest) (*GetLogsResponse, error)
-	ListChildrenDiffs(ctx context.Context, req ListChildrenDiffsRequest) (ListChildrenDiffsResponse, error)
-	GetChildrenDiffsStats(ctx context.Context, migrationID, path string, foldersOnly bool) (DiffsStatsResponse, error)
-	ExcludeNodes(ctx context.Context, migrationID string, req ExclusionRequest) (*ExclusionResponse, error)
-	UnexcludeNodes(ctx context.Context, migrationID string, req ExclusionRequest) (*ExclusionResponse, error)
 	CheckPendingWork(ctx context.Context, migrationID string) (PendingWorkResponse, error)
 	ChangePhase(ctx context.Context, migrationID string, phase string, req StartMigrationRequest) (Migration, error)
-	MarkNodesForRetryDiscovery(ctx context.Context, migrationID string, req MarkRetryRequest) (*MarkRetryResponse, error)
-	MarkNodesForRetryCopy(ctx context.Context, migrationID string, req MarkRetryRequest) (*MarkRetryResponse, error)
-	UnmarkNodeForRetryDiscovery(ctx context.Context, migrationID string, nodeID string) (*MarkRetryResponse, error)
-	UnmarkNodeForRetryCopy(ctx context.Context, migrationID string, nodeID string) (*MarkRetryResponse, error)
 	GetBackgroundTasks(ctx context.Context, migrationID string) ([]BackgroundTask, error)
 	GetRunningBackgroundTasks(ctx context.Context, migrationID string) ([]BackgroundTask, error)
 	GetBackgroundTask(ctx context.Context, migrationID, taskID string) (*BackgroundTask, error)
-	GetPathReviewStats(ctx context.Context, migrationID string) (*PathReviewStats, error)
-	SearchPathReviewItems(ctx context.Context, migrationID string, req SearchRequest, offset, limit int) (ListChildrenDiffsResponse, error)
 	TriggerRetrySweep(ctx context.Context, migrationID string, config SweepConfigRequest) (SweepResponse, error)
 }
 

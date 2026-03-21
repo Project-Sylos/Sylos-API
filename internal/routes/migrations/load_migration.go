@@ -17,7 +17,7 @@ func (h handler) load(ctx *middleware.Context) {
 		return
 	}
 
-	migration, err := h.core.LoadMigration(ctx.Request().Context(), migrationID)
+	migration, err := h.mgr.LoadMigration(ctx.Request().Context(), migrationID)
 	if err != nil {
 		if errors.Is(err, corebridge.ErrMigrationNotFound) {
 			ctx.Error(http.StatusNotFound, "migration not found", err)

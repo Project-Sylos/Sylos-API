@@ -3,6 +3,7 @@ package manager
 import (
 	"context"
 	"fmt"
+	"os"
 	"time"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
@@ -34,7 +35,7 @@ func (m *Manager) StartMigration(ctx context.Context, req corebridge.StartMigrat
 		SourceID:      plan.SourceDefinition.ID,
 		DestinationID: plan.DestinationDefinition.ID,
 		StartedAt:     now,
-		Status:        corebridge.MigrationStatusRunning,
+		Status:        migration.PhaseTraversing,
 	}
 	m.mu.Unlock()
 
@@ -49,7 +50,7 @@ func (m *Manager) StartMigration(ctx context.Context, req corebridge.StartMigrat
 				rec.Status = corebridge.MigrationStatusFailed
 				rec.Error = runErr.Error()
 			} else {
-				rec.Status = migration.PhaseReview.String()
+				rec.Status = mig.Phase()
 			}
 		}
 	}()
@@ -63,7 +64,7 @@ func (m *Manager) StartMigration(ctx context.Context, req corebridge.StartMigrat
 		SourceID:      plan.SourceDefinition.ID,
 		DestinationID: plan.DestinationDefinition.ID,
 		StartedAt:     now,
-		Status:        corebridge.MigrationStatusRunning,
+		Status:        migration.PhaseTraversing,
 	}, nil
 }
 
@@ -136,13 +137,16 @@ func (m *Manager) buildTraversalConfig(opts corebridge.MigrationOptions, plan *r
 
 func (m *Manager) ensureMigration(_ context.Context, requestedID string) (*migration.Migration, error) {
 	if requestedID != "" {
-		existing, err := m.engineMgr.GetMigration(requestedID)
-		if err != nil {
+		existing, err := m.GetMigration(context.TODO(), requestedID)
+		if err != nil && err != corebridge.ErrMigrationNotFound {
 			return nil, err
 		}
 		if existing != nil {
 			return existing, nil
 		}
+		// Requested ID was not found. Do not create a new migration (that would get a new ID
+		// and then roots would not match). Caller must create the migration first (e.g. via SetRoot).
+		return nil, fmt.Errorf("migration %q not found: ensure roots were set first so the migration exists", requestedID)
 	}
 	created, err := m.engineMgr.CreateMigration(migration.CreateMigrationConfig{
 		Name: "migration",
@@ -150,7 +154,17 @@ func (m *Manager) ensureMigration(_ context.Context, requestedID string) (*migra
 	if err != nil {
 		return nil, err
 	}
-	return created, nil
+	// Per-migration flow: create folder and load so the engine creates the DB at migrationDir/{id}.db and attaches it.
+	dir, err := m.migrationDirFor(created.ID)
+	if err != nil {
+		return nil, err
+	}
+	_ = os.MkdirAll(dir, 0755)
+	loaded, err := m.GetMigration(context.TODO(), created.ID)
+	if err != nil {
+		return nil, err
+	}
+	return loaded, nil
 }
 
 func (m *Manager) updateMetadataForMigrationID(migrationID string) error {
@@ -178,41 +192,89 @@ func (m *Manager) ChangePhase(ctx context.Context, migrationID string, phase str
 	if phase != "traversal" && phase != "copy" {
 		return corebridge.Migration{}, fmt.Errorf("invalid phase: %s (must be 'traversal' or 'copy')", phase)
 	}
-	mig, err := m.engineMgr.GetMigration(migrationID)
+	mig, err := m.GetMigration(context.TODO(), migrationID)
 	if err != nil {
 		return corebridge.Migration{}, err
 	}
-	if mig == nil {
-		return corebridge.Migration{}, corebridge.ErrMigrationNotFound
+	plan := m.rootsMgr.GetPlan(migrationID)
+
+	now := time.Now().UTC()
+	m.mu.Lock()
+	rec := m.runtimeByID[migrationID]
+	if rec == nil {
+		sourceID, destID := "", ""
+		if plan != nil {
+			sourceID = plan.SourceDefinition.ID
+			destID = plan.DestinationDefinition.ID
+		}
+		rec = &runtimeMigration{
+			Migration:     mig,
+			SourceID:      sourceID,
+			DestinationID: destID,
+			StartedAt:     now,
+			Status:        "",
+			Error:         "",
+		}
+		m.runtimeByID[migrationID] = rec
 	}
+	if phase == "copy" {
+		rec.Status = migration.PhaseCopying
+		rec.CompletedAt = nil
+		rec.Error = ""
+	} else {
+		rec.Status = migration.PhaseTraversing
+		rec.CompletedAt = nil
+		rec.Error = ""
+	}
+	m.mu.Unlock()
 
 	go func() {
+		var runErr error
 		if phase == "copy" {
-			_, _ = mig.StartCopy()
-			return
+			if plan == nil || !plan.HasSource || !plan.HasDestination {
+				runErr = fmt.Errorf("roots not configured for migration %s", migrationID)
+			} else {
+				cfg := m.buildTraversalConfig(req.Options, plan)
+				_, runErr = mig.StartCopy(cfg)
+			}
+		} else {
+			if plan == nil || !plan.HasSource || !plan.HasDestination {
+				runErr = fmt.Errorf("roots not configured for migration %s", migrationID)
+			} else {
+				cfg := m.buildTraversalConfig(req.Options, plan)
+				_, runErr = mig.StartTraversal(cfg)
+			}
 		}
-		plan := m.rootsMgr.GetPlan(migrationID)
-		if plan == nil || !plan.HasSource || !plan.HasDestination {
-			return
+		// Forced-sync: update runtime cache from engine state when goroutine ends.
+		doneAt := time.Now().UTC()
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if rec := m.runtimeByID[migrationID]; rec != nil {
+			rec.CompletedAt = &doneAt
+			if runErr != nil {
+				rec.Status = corebridge.MigrationStatusFailed
+				rec.Error = runErr.Error()
+			} else {
+				rec.Status = mig.Phase()
+			}
 		}
-		cfg := m.buildTraversalConfig(req.Options, plan)
-		_, _ = mig.StartTraversal(cfg)
 	}()
 
+	status := migration.PhaseCopying
+	if phase != "copy" {
+		status = migration.PhaseTraversing
+	}
 	return corebridge.Migration{
 		ID:      migrationID,
-		Status:  "running",
+		Status:  status,
 		Success: true,
 	}, nil
 }
 
 func (m *Manager) GetMigrationStatus(ctx context.Context, id string) (corebridge.Status, error) {
-	mig, err := m.engineMgr.GetMigration(id)
+	mig, err := m.GetMigration(context.TODO(), id)
 	if err != nil {
 		return corebridge.Status{}, err
-	}
-	if mig == nil {
-		return corebridge.Status{}, corebridge.ErrMigrationNotFound
 	}
 
 	m.mu.RLock()
@@ -222,7 +284,7 @@ func (m *Manager) GetMigrationStatus(ctx context.Context, id string) (corebridge
 	sourceID := ""
 	destinationID := ""
 	startedAt := time.Time{}
-	status := mig.Phase().String()
+	status := mig.Phase()
 	errText := ""
 	var completedAt *time.Time
 	if rec != nil {
@@ -250,28 +312,21 @@ func (m *Manager) GetMigrationStatus(ctx context.Context, id string) (corebridge
 }
 
 func (m *Manager) LoadMigration(ctx context.Context, migrationID string) (corebridge.Migration, error) {
-	mig, err := m.engineMgr.GetMigration(migrationID)
+	mig, err := m.GetMigration(context.TODO(), migrationID)
 	if err != nil {
 		return corebridge.Migration{}, err
 	}
-	if mig == nil {
-		return corebridge.Migration{}, corebridge.ErrMigrationNotFound
-	}
 	return corebridge.Migration{
 		ID:     migrationID,
-		Status: mig.Phase().String(),
+		Status: mig.Phase(),
 	}, nil
 }
 
 func (m *Manager) StopMigration(ctx context.Context, migrationID string) (corebridge.Status, error) {
-	mig, err := m.engineMgr.GetMigration(migrationID)
+	mig, err := m.GetMigration(context.TODO(), migrationID)
 	if err != nil {
 		return corebridge.Status{}, err
 	}
-	if mig == nil {
-		return corebridge.Status{}, corebridge.ErrMigrationNotFound
-	}
-
 	stopResult, err := mig.Stop()
 	if err != nil {
 		return corebridge.Status{}, err
@@ -282,7 +337,7 @@ func (m *Manager) StopMigration(ctx context.Context, migrationID string) (corebr
 		return corebridge.Status{
 			Migration: corebridge.Migration{
 				ID:     migrationID,
-				Status: stopResult.Phase.String(),
+				Status: stopResult.Phase,
 			},
 		}, nil
 	}

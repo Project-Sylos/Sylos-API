@@ -17,15 +17,19 @@ func (h handler) inspect(ctx *middleware.Context) {
 		return
 	}
 
-	status, err := h.core.InspectMigrationStatus(ctx.Request().Context(), migrationID)
+	mig, err := h.mgr.GetMigration(ctx.Request().Context(), migrationID)
 	if err != nil {
 		if errors.Is(err, corebridge.ErrMigrationNotFound) {
 			ctx.Error(http.StatusNotFound, "migration not found", err)
 			return
 		}
+		ctx.Error(http.StatusInternalServerError, "failed to get migration", err)
+		return
+	}
+	status, err := corebridge.InspectMigrationStatus(mig)
+	if err != nil {
 		ctx.Error(http.StatusInternalServerError, "failed to inspect migration status", err)
 		return
 	}
-
 	ctx.Response(http.StatusOK, status)
 }

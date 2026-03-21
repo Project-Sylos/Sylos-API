@@ -4,11 +4,10 @@ go 1.25.6
 
 require (
 	codeberg.org/Sylos/Migration-Engine v0.1.31
-	codeberg.org/Sylos/Sylos-FS v0.1.4
+	codeberg.org/Sylos/Sylos-FS v0.1.6
 	github.com/go-chi/chi/v5 v5.2.3
 	github.com/go-chi/cors v1.2.1
 	github.com/golang-jwt/jwt/v5 v5.3.0
-	github.com/marcboeker/go-duckdb v1.7.0
 	github.com/oklog/ulid/v2 v2.1.1
 	github.com/rs/zerolog v1.34.0
 	github.com/spf13/viper v1.21.0
@@ -25,6 +24,7 @@ require (
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/klauspost/compress v1.17.11 // indirect
 	github.com/klauspost/cpuid/v2 v2.2.9 // indirect
+	github.com/marcboeker/go-duckdb v1.7.0 // indirect
 	github.com/mattn/go-colorable v0.1.13 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/mitchellh/mapstructure v1.5.0 // indirect
@@ -42,7 +42,7 @@ require (
 	golang.org/x/exp v0.0.0-20250128182459-e0ece0dbea4c // indirect
 	golang.org/x/mod v0.26.0 // indirect
 	golang.org/x/sync v0.16.0 // indirect
-	golang.org/x/sys v0.39.0 // indirect
+	golang.org/x/sys v0.42.0 // indirect
 	golang.org/x/text v0.28.0 // indirect
 	golang.org/x/tools v0.35.0 // indirect
 	golang.org/x/xerrors v0.0.0-20240903120638-7835f813f4da // indirect
@@ -50,7 +50,5 @@ require (
 )
 
 replace codeberg.org/Sylos/Migration-Engine => ../Migration-Engine
-
-replace codeberg.org/Sylos/Sylos-FS => ../Sylos-FS
 
 replace codeberg.org/Sylos/Spectra => ../Spectra

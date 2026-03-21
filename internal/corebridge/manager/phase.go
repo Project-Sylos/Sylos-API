@@ -9,20 +9,20 @@ import (
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/metadata"
 )
 
+// getMigrationPhase maps the engine phase to a coarse API phase for locking/UX.
+// Engine phases: roots-set, filters-set, traversal-in-progress, awaiting-traversal-review, copy-in-progress, awaiting-copy-review.
 func (m *Manager) getMigrationPhase(migrationID string) (string, error) {
-	mig, err := m.engineMgr.GetMigration(migrationID)
+	mig, err := m.GetMigration(context.TODO(), migrationID)
 	if err != nil {
 		return "unknown", err
 	}
-	if mig == nil {
+	p := mig.Phase()
+	switch p {
+	case migration.PhaseCreated, migration.PhaseFiltersSet:
 		return "roots", nil
-	}
-	switch mig.Phase().String() {
-	case "created":
-		return "roots", nil
-	case "traversing", "review":
+	case migration.PhaseTraversing, migration.PhaseTraversalReview:
 		return "traversal", nil
-	case "copying", "completed":
+	case migration.PhaseCopying, migration.PhaseCopyReview:
 		return "copy", nil
 	default:
 		return "unknown", nil
@@ -60,31 +60,11 @@ func (m *Manager) checkPhaseLock(migrationID string, operation string) error {
 	return nil
 }
 
-func (m *Manager) markPathReviewChanges(migrationID string, hasChanges bool) error {
-	metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
-	meta, err := metaMgr.GetMigrationMetadata(migrationID)
-	if err != nil {
-		meta = metadata.MigrationMetadata{
-			ID:                   migrationID,
-			Name:                 migrationID,
-			HasPathReviewChanges: hasChanges,
-		}
-	} else {
-		meta.HasPathReviewChanges = hasChanges
-	}
-
-	return metaMgr.UpdateMigrationMetadata(meta)
-}
-
-func (m *Manager) CheckPendingWork(_ context.Context, migrationID string) (corebridge.PendingWorkResponse, error) {
-	mig, err := m.engineMgr.GetMigration(migrationID)
+func (m *Manager) CheckPendingWork(ctx context.Context, migrationID string) (corebridge.PendingWorkResponse, error) {
+	mig, err := m.GetMigration(ctx, migrationID)
 	if err != nil {
 		return corebridge.PendingWorkResponse{}, err
 	}
-	if mig == nil {
-		return corebridge.PendingWorkResponse{}, corebridge.ErrMigrationNotFound
-	}
-
 	srcPending, err := mig.QueryNodes(migration.NodeQueryFilter{
 		Queue:  "SRC",
 		Status: "pending",

@@ -9,7 +9,7 @@ import (
 )
 
 func (h handler) listDBs(ctx *middleware.Context) {
-	dbs, err := h.core.ListMigrationDBs(ctx.Request().Context())
+	dbs, err := h.mgr.ListMigrationDBs(ctx.Request().Context())
 	if err != nil {
 		if errors.Is(err, corebridge.ErrMigrationNotFound) {
 			ctx.Error(http.StatusNotFound, "migration DBs not found", err)

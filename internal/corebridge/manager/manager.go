@@ -1,7 +1,7 @@
 package manager
 
 import (
-	"os"
+	"context"
 	"path/filepath"
 	"sync"
 	"time"
@@ -9,6 +9,7 @@ import (
 	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/database"
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge/metadata"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/roots"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/services"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/terminal"
@@ -54,11 +55,7 @@ func NewManager(logger zerolog.Logger, cfg config.Config) (*Manager, error) {
 	}
 
 	rootsMgr := roots.NewManager(logger, cfg.Runtime.DataDir, serviceMgr, resolveDBPath)
-	engineDBPath := filepath.Join(cfg.Runtime.DataDir, "engine_migrations.duckdb")
-	if err := os.MkdirAll(filepath.Dir(engineDBPath), 0o755); err != nil {
-		return nil, err
-	}
-	engineMgr, err := migration.NewMigrationManager(migration.DatabaseConfig{Path: engineDBPath})
+	engineMgr, err := migration.NewMigrationManager(migration.DatabaseConfig{})
 	if err != nil {
 		return nil, err
 	}
@@ -78,6 +75,48 @@ func NewManager(logger zerolog.Logger, cfg config.Config) (*Manager, error) {
 	}
 
 	return mgr, nil
+}
+
+// migrationDirFor returns the absolute path to the folder for the given migration (e.g. dataDir/{id}).
+func (m *Manager) migrationDirFor(migrationID string) (string, error) {
+	dir := database.GetMigrationDir(m.cfg.Runtime.DataDir, migrationID)
+	return filepath.Abs(dir)
+}
+
+// GetMigration returns the engine *Migration for the given ID, or ErrMigrationNotFound.
+// When using per-migration DBs, the engine expects the migration folder path (e.g. data/{id}) so it can open or create the DB there.
+func (m *Manager) GetMigration(_ context.Context, migrationID string) (*migration.Migration, error) {
+	migrationDir, err := m.migrationDirFor(migrationID)
+	if err != nil {
+		return nil, err
+	}
+	mig, err := m.engineMgr.GetMigration(migrationID, migrationDir)
+	if err != nil {
+		return nil, err
+	}
+	if mig == nil {
+		return nil, corebridge.ErrMigrationNotFound
+	}
+	if err := m.rehydrateFSAdaptersIfNeeded(migrationID, mig); err != nil {
+		m.logger.Warn().Err(err).Str("migration_id", migrationID).Msg("rehydrate FS adapters from migration DB")
+	}
+	return mig, nil
+}
+
+// MarkPathReviewChanges updates metadata after exclusion or retry mark/unmark.
+func (m *Manager) MarkPathReviewChanges(_ context.Context, migrationID string, hasChanges bool) error {
+	metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
+	meta, err := metaMgr.GetMigrationMetadata(migrationID)
+	if err != nil {
+		meta = metadata.MigrationMetadata{
+			ID:                   migrationID,
+			Name:                 migrationID,
+			HasPathReviewChanges: hasChanges,
+		}
+	} else {
+		meta.HasPathReviewChanges = hasChanges
+	}
+	return metaMgr.UpdateMigrationMetadata(meta)
 }
 
 // Ensure Manager implements corebridge.Bridge at compile time.
