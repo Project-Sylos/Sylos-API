@@ -39,6 +39,14 @@ func (m *Manager) TriggerRetrySweep(ctx context.Context, migrationID string, con
 			Error:   err.Error(),
 		}, err
 	}
+	plan := m.rootsMgr.GetPlan(migrationID)
+	if plan == nil || !plan.HasSource || !plan.HasDestination {
+		return corebridge.SweepResponse{
+			Success: false,
+			Error:   fmt.Sprintf("roots not fully configured for migration %s", migrationID),
+		}, fmt.Errorf("roots not configured for migration %s", migrationID)
+	}
+	runCfg := m.buildTraversalConfig(corebridge.MigrationOptions{}, plan)
 	// Persist phase to traversal-in-progress before 202 so polls see the correct phase before the goroutine runs.
 	if err := mig.PrepareRetrySweep(); err != nil {
 		return corebridge.SweepResponse{
@@ -58,7 +66,7 @@ func (m *Manager) TriggerRetrySweep(ctx context.Context, migrationID string, con
 
 	taskID := m.bgTaskMgr.StartTask(migrationID, corebridge.BackgroundTaskTypeRetrySweep)
 	go func() {
-		_, runErr := mig.RunRetrySweep(opts)
+		_, runErr := mig.RunRetrySweep(runCfg, opts)
 		doneAt := time.Now().UTC()
 		m.mu.Lock()
 		if rec := m.runtimeByID[migrationID]; rec != nil {

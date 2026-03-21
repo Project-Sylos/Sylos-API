@@ -231,7 +231,12 @@ func (m *Manager) ChangePhase(ctx context.Context, migrationID string, phase str
 	go func() {
 		var runErr error
 		if phase == "copy" {
-			_, runErr = mig.StartCopy()
+			if plan == nil || !plan.HasSource || !plan.HasDestination {
+				runErr = fmt.Errorf("roots not configured for migration %s", migrationID)
+			} else {
+				cfg := m.buildTraversalConfig(req.Options, plan)
+				_, runErr = mig.StartCopy(cfg)
+			}
 		} else {
 			if plan == nil || !plan.HasSource || !plan.HasDestination {
 				runErr = fmt.Errorf("roots not configured for migration %s", migrationID)

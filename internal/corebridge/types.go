@@ -352,6 +352,7 @@ type PathReviewStats struct {
 // ListChildrenDiffsResponse wraps the diff result with pagination metadata
 type ListChildrenDiffsResponse struct {
 	Items      map[string]PathNodes `json:"items"` // path -> {src?: {...}, dst?: {...}}
+	ItemOrder  []string               `json:"itemOrder,omitempty"` // paths in engine/SQL order; use when present — JSON object keys are sorted by path, not by sort
 	Pagination PaginationInfo       `json:"pagination"`
 }
 

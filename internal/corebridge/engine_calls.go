@@ -94,12 +94,15 @@ func ListChildrenDiffs(mig *migration.Migration, req ListChildrenDiffsRequest) (
 		return ListChildrenDiffsResponse{}, fmt.Errorf("failed to list children diffs: %w", err)
 	}
 	items := make(map[string]PathNodes)
+	order := make([]string, 0, len(result.Items))
 	for _, item := range result.Items {
 		items[item.Path] = diffItemToPathNodes(item)
+		order = append(order, item.Path)
 	}
 	hasMore := result.Offset+result.Limit < result.Total
 	return ListChildrenDiffsResponse{
-		Items: items,
+		Items:     items,
+		ItemOrder: order,
 		Pagination: PaginationInfo{
 			Offset:  result.Offset,
 			Limit:   result.Limit,
@@ -130,17 +133,25 @@ func GetChildrenDiffsStats(mig *migration.Migration, path string, foldersOnly bo
 	}, nil
 }
 
+func enginePathReviewConditions(req SearchRequest) []migration.PathReviewSearchCondition {
+	if len(req.Conditions) == 0 {
+		return nil
+	}
+	out := make([]migration.PathReviewSearchCondition, 0, len(req.Conditions))
+	for _, c := range req.Conditions {
+		out = append(out, migration.PathReviewSearchCondition{
+			Field:    c.Field,
+			Operator: c.Operator,
+			Value:    c.Value,
+		})
+	}
+	return out
+}
+
 // SearchPathReviewItems calls the engine and converts to API response.
 func SearchPathReviewItems(mig *migration.Migration, req SearchRequest, offset, limit int) (ListChildrenDiffsResponse, error) {
 	if mig == nil {
 		return ListChildrenDiffsResponse{}, fmt.Errorf("migration is nil")
-	}
-	query := ""
-	for _, cond := range req.Conditions {
-		if cond.Field == "path" || cond.Field == "name" {
-			query = fmt.Sprintf("%v", cond.Value)
-			break
-		}
 	}
 	sortBy := ""
 	sortDirection := "asc"
@@ -151,22 +162,26 @@ func SearchPathReviewItems(mig *migration.Migration, req SearchRequest, offset, 
 		}
 	}
 	result, err := mig.SearchPathReviewItems(migration.SearchRequest{
-		Query:         query,
-		Path:          "",
-		Limit:         limit,
-		Offset:        offset,
-		SortBy:        sortBy,
-		SortDirection: sortDirection,
+		Path:             "",
+		Limit:            limit,
+		Offset:           offset,
+		SortBy:           sortBy,
+		SortDirection:    sortDirection,
+		Conditions:       enginePathReviewConditions(req),
+		StatusSearchType: req.StatusSearchType,
 	})
 	if err != nil {
 		return ListChildrenDiffsResponse{}, fmt.Errorf("failed to search path review items: %w", err)
 	}
 	items := make(map[string]PathNodes)
+	order := make([]string, 0, len(result.Items))
 	for _, item := range result.Items {
 		items[item.Path] = diffItemToPathNodes(item)
+		order = append(order, item.Path)
 	}
 	return ListChildrenDiffsResponse{
-		Items: items,
+		Items:     items,
+		ItemOrder: order,
 		Pagination: PaginationInfo{
 			Offset:  result.Offset,
 			Limit:   result.Limit,
@@ -181,13 +196,6 @@ func GetSearchStats(mig *migration.Migration, req SearchRequest) (DiffsStatsResp
 	if mig == nil {
 		return DiffsStatsResponse{}, fmt.Errorf("migration is nil")
 	}
-	query := ""
-	for _, cond := range req.Conditions {
-		if cond.Field == "path" || cond.Field == "name" {
-			query = fmt.Sprintf("%v", cond.Value)
-			break
-		}
-	}
 	sortBy := ""
 	sortDirection := "asc"
 	if req.Sort != nil {
@@ -197,14 +205,13 @@ func GetSearchStats(mig *migration.Migration, req SearchRequest) (DiffsStatsResp
 		}
 	}
 	engineReq := migration.SearchRequest{
-		Query:         query,
-		Path:          "",
-		Limit:         10000,
-		Offset:        0,
-		SortBy:        sortBy,
-		SortDirection: sortDirection,
-		FoldersOnly:   false,
-		Status:        req.StatusSearchType,
+		Path:             "",
+		Limit:            10000,
+		Offset:           0,
+		SortBy:           sortBy,
+		SortDirection:    sortDirection,
+		Conditions:       enginePathReviewConditions(req),
+		StatusSearchType: req.StatusSearchType,
 	}
 	stats, err := mig.GetSearchStats(engineReq)
 	if err != nil {

@@ -4,7 +4,7 @@ go 1.25.6
 
 require (
 	codeberg.org/Sylos/Migration-Engine v0.1.31
-	codeberg.org/Sylos/Sylos-FS v0.1.5
+	codeberg.org/Sylos/Sylos-FS v0.1.6
 	github.com/go-chi/chi/v5 v5.2.3
 	github.com/go-chi/cors v1.2.1
 	github.com/golang-jwt/jwt/v5 v5.3.0
@@ -50,7 +50,5 @@ require (
 )
 
 replace codeberg.org/Sylos/Migration-Engine => ../Migration-Engine
-
-replace codeberg.org/Sylos/Sylos-FS => ../Sylos-FS
 
 replace codeberg.org/Sylos/Spectra => ../Spectra

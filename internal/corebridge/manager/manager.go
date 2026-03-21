@@ -97,6 +97,9 @@ func (m *Manager) GetMigration(_ context.Context, migrationID string) (*migratio
 	if mig == nil {
 		return nil, corebridge.ErrMigrationNotFound
 	}
+	if err := m.rehydrateFSAdaptersIfNeeded(migrationID, mig); err != nil {
+		m.logger.Warn().Err(err).Str("migration_id", migrationID).Msg("rehydrate FS adapters from migration DB")
+	}
 	return mig, nil
 }
 

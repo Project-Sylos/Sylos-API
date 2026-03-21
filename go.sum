@@ -1,3 +1,5 @@
+codeberg.org/Sylos/Sylos-FS v0.1.6 h1:hH2f0yq5VSt69/9eWTE1bOtM66iiBj2NflvBOXcZAr4=
+codeberg.org/Sylos/Sylos-FS v0.1.6/go.mod h1:Ug6aEOfHJijA9O2tvbkm72OnNGzmX4L5V1xqTcXFepg=
 github.com/apache/arrow/go/v14 v14.0.2 h1:N8OkaJEOfI3mEZt07BIkvo4sC6XDbL+48MBPWO5IONw=
 github.com/apache/arrow/go/v14 v14.0.2/go.mod h1:u3fgh3EdgN/YQ8cVQRguVW3R+seMybFg8QBQ5LU+eBY=
 github.com/coreos/go-systemd/v22 v22.5.0/go.mod h1:Y58oyj3AT4RCenI/lSvhwexgC+NSVTIJ3seZv2GcEnc=
