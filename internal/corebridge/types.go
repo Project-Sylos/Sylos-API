@@ -146,7 +146,13 @@ type Status struct {
 	CompletedAt *time.Time  `json:"completedAt,omitempty"`
 	Error       string      `json:"error,omitempty"`
 	Result      *ResultView `json:"result,omitempty"`
-	// Status field in Migration now represents the checkpoint state (e.g., "Awaiting-Path-Review", "Traversal-In-Progress", "Copy-In-Progress")
+	// Live is true when the engine migration has an active run (traversal, copy, sweep, etc.).
+	Live bool `json:"live,omitempty"`
+	// SoftSuspendRequested is true after Stop() accepted a soft suspend; poll until phase is traversal-suspended or copy-suspended and live is false.
+	SoftSuspendRequested bool `json:"softSuspendRequested,omitempty"`
+	// Stopped is set only by StopMigration: true if the engine considered a run active when Stop() was called.
+	Stopped bool `json:"stopped,omitempty"`
+	// Status field in Migration is the lifecycle phase (engine lowercase-with-hyphens, e.g. traversal-in-progress, traversal-suspended).
 }
 
 type ResultView struct {

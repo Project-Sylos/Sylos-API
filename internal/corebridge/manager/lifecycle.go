@@ -297,6 +297,10 @@ func (m *Manager) GetMigrationStatus(ctx context.Context, id string) (corebridge
 		errText = rec.Error
 		completedAt = rec.CompletedAt
 	}
+	// Engine wins once soft suspend has persisted (runtime cache may still show *-in-progress).
+	if mig.Phase() == migration.PhaseTraversalSuspended || mig.Phase() == migration.PhaseCopySuspended {
+		status = mig.Phase()
+	}
 
 	return corebridge.Status{
 		Migration: corebridge.Migration{
@@ -308,6 +312,7 @@ func (m *Manager) GetMigrationStatus(ctx context.Context, id string) (corebridge
 		},
 		CompletedAt: completedAt,
 		Error:       errText,
+		Live:        mig.IsLive(),
 	}, nil
 }
 
@@ -339,9 +344,17 @@ func (m *Manager) StopMigration(ctx context.Context, migrationID string) (corebr
 				ID:     migrationID,
 				Status: stopResult.Phase,
 			},
+			Live:                 mig.IsLive(),
+			SoftSuspendRequested: stopResult.SoftSuspendRequested,
+			Stopped:              stopResult.Stopped,
 		}, nil
 	}
-	if stopResult.Stopped {
+	st.Live = mig.IsLive()
+	st.SoftSuspendRequested = stopResult.SoftSuspendRequested
+	st.Stopped = stopResult.Stopped
+	// Soft suspend: keep engine phase until drain finishes (e.g. still traversal-in-progress); do not force generic "suspended".
+	// Hard cancel / other stopped paths: surface legacy suspended label for clients that expect it.
+	if stopResult.Stopped && !stopResult.SoftSuspendRequested {
 		st.Status = corebridge.MigrationStatusSuspended
 	}
 	return st, nil

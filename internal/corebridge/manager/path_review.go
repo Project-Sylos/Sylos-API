@@ -18,7 +18,7 @@ func (m *Manager) preparePathReviewContext(_ context.Context, migrationID string
 		return nil, err
 	}
 	reviewPhase := "traversal"
-	if mig.Phase() == migration.PhaseCopying || mig.Phase() == migration.PhaseCopyReview {
+	if mig.Phase() == migration.PhaseCopying || mig.Phase() == migration.PhaseCopySuspended || mig.Phase() == migration.PhaseCopyReview {
 		reviewPhase = "copy"
 	}
 

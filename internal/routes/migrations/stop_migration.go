@@ -27,12 +27,16 @@ func (h handler) stop(ctx *middleware.Context) {
 		return
 	}
 
-	// Return status with a message indicating the migration was suspended
 	response := map[string]any{
-		"id":      migrationID,
-		"status":  status.Status,
-		"result":  status.Result,
-		"message": "Migration suspended. State saved for resumption.",
+		"id":                     migrationID,
+		"status":                 status.Status,
+		"result":                 status.Result,
+		"live":                   status.Live,
+		"stopped":                status.Stopped,
+		"softSuspendRequested":   status.SoftSuspendRequested,
+		"completedAt":            status.CompletedAt,
+		"error":                  status.Error,
+		"message":                "Stop requested. If softSuspendRequested is true, poll status until phase is traversal-suspended or copy-suspended and live is false.",
 	}
 
 	ctx.Response(http.StatusOK, response)

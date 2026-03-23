@@ -20,9 +20,9 @@ func (m *Manager) getMigrationPhase(migrationID string) (string, error) {
 	switch p {
 	case migration.PhaseCreated, migration.PhaseFiltersSet:
 		return "roots", nil
-	case migration.PhaseTraversing, migration.PhaseTraversalReview:
+	case migration.PhaseTraversing, migration.PhaseTraversalSuspended, migration.PhaseTraversalReview:
 		return "traversal", nil
-	case migration.PhaseCopying, migration.PhaseCopyReview:
+	case migration.PhaseCopying, migration.PhaseCopySuspended, migration.PhaseCopyReview:
 		return "copy", nil
 	default:
 		return "unknown", nil

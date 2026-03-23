@@ -380,13 +380,23 @@ func mergePathReviewResults(a, b migration.PathReviewActionResult) migration.Pat
 	return out
 }
 
+// isCopyPhaseFamily is true when exclusion must be blocked (copy running, suspended mid-copy, or copy review).
+func isCopyPhaseFamily(phase string) bool {
+	switch phase {
+	case migration.PhaseCopying, migration.PhaseCopySuspended, migration.PhaseCopyReview:
+		return true
+	default:
+		return false
+	}
+}
+
 // ExcludeNodes runs exclusion on the engine. Caller must call MarkPathReviewChanges after success if needed.
 // Returns error if migration is in copy phase. Response includes affectedCount and deltas for UI to update local stats.
 func ExcludeNodes(mig *migration.Migration, req ExclusionRequest) (*ExclusionResponse, error) {
 	if mig == nil {
 		return &ExclusionResponse{Success: false, Error: "migration is nil", Deltas: map[string]int64{}}, nil
 	}
-	if mig.Phase() == migration.PhaseCopying || mig.Phase() == migration.PhaseCopyReview {
+	if isCopyPhaseFamily(mig.Phase()) {
 		return &ExclusionResponse{
 			Success: false,
 			Error:   "exclusion operations are not available in copy phase (exclusion only applies to traversal)",
@@ -432,7 +442,7 @@ func UnexcludeNodes(mig *migration.Migration, req ExclusionRequest) (*ExclusionR
 	if mig == nil {
 		return &ExclusionResponse{Success: false, Error: "migration is nil", Deltas: map[string]int64{}}, nil
 	}
-	if mig.Phase() == migration.PhaseCopying || mig.Phase() == migration.PhaseCopyReview {
+	if isCopyPhaseFamily(mig.Phase()) {
 		return &ExclusionResponse{
 			Success: false,
 			Error:   "exclusion operations are not available in copy phase (exclusion only applies to traversal)",
