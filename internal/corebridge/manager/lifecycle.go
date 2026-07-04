@@ -10,6 +10,8 @@ import (
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/metadata"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/roots"
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge/services"
+	fstypes "codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
 func (m *Manager) StartMigration(ctx context.Context, req corebridge.StartMigrationRequest) (corebridge.Migration, error) {
@@ -69,13 +71,8 @@ func (m *Manager) StartMigration(ctx context.Context, req corebridge.StartMigrat
 }
 
 func (m *Manager) buildTraversalConfig(opts corebridge.MigrationOptions, plan *roots.RootPlan) migration.Config {
+	// WorkerCount 0 lets Migration-Engine pick provider-profile defaults (merged across src/dst).
 	workerCount := opts.WorkerCount
-	if workerCount <= 0 {
-		workerCount = m.cfg.Runtime.DefaultWorkerCount
-	}
-	if workerCount <= 0 {
-		workerCount = 10
-	}
 
 	maxRetries := opts.MaxRetries
 	if maxRetries <= 0 {
@@ -110,16 +107,8 @@ func (m *Manager) buildTraversalConfig(opts corebridge.MigrationOptions, plan *r
 	}
 
 	return migration.Config{
-		Source: migration.Service{
-			Name:    plan.SourceDefinition.ID,
-			Adapter: plan.SourceAdapter,
-			Root:    plan.SourceRoot,
-		},
-		Destination: migration.Service{
-			Name:    plan.DestinationDefinition.ID,
-			Adapter: plan.DestinationAdapter,
-			Root:    plan.DestinationRoot,
-		},
+		Source:          migrationService(plan.SourceDefinition, plan.SourceAdapter, plan.SourceRoot, plan.SourceConnectionID),
+		Destination:     migrationService(plan.DestinationDefinition, plan.DestinationAdapter, plan.DestinationRoot, plan.DestinationConnectionID),
 		WorkerCount:     workerCount,
 		MaxRetries:      maxRetries,
 		CoordinatorLead: coordinatorLead,
@@ -133,6 +122,30 @@ func (m *Manager) buildTraversalConfig(opts corebridge.MigrationOptions, plan *r
 			AllowNotOnSrc: opts.Verification.AllowNotOnSrc,
 		},
 	}
+}
+
+func migrationService(def services.ServiceDefinition, adapter fstypes.FSAdapter, root fstypes.Folder, connectionID string) migration.Service {
+	svc := migration.Service{
+		Name:    def.ID,
+		Adapter: adapter,
+		Root:    root,
+	}
+	switch def.Type {
+	case services.ServiceTypeCloud:
+		svc.ProviderID = services.CloudProviderID(def)
+		if connectionID != "" {
+			svc.BackendGroupID = "conn:" + connectionID
+		}
+	case services.ServiceTypeLocal:
+		svc.ProviderID = string(services.ServiceTypeLocal)
+	case services.ServiceTypeSpectra:
+		svc.ProviderID = string(services.ServiceTypeSpectra)
+	}
+	return svc
+}
+
+func cloudMigrationService(def services.ServiceDefinition, adapter fstypes.FSAdapter, root fstypes.Folder, connectionID string) migration.Service {
+	return migrationService(def, adapter, root, connectionID)
 }
 
 func (m *Manager) ensureMigration(_ context.Context, requestedID string) (*migration.Migration, error) {
@@ -337,6 +350,21 @@ func (m *Manager) StopMigration(ctx context.Context, migrationID string) (corebr
 		return corebridge.Status{}, err
 	}
 
+	const stopGracePeriod = 30 * time.Second
+	if stopResult.SoftSuspendRequested {
+		deadline := time.Now().Add(stopGracePeriod)
+		for mig.IsLive() && time.Now().Before(deadline) {
+			time.Sleep(200 * time.Millisecond)
+		}
+		if mig.IsLive() {
+			forceResult, forceErr := mig.ForceStop()
+			if forceErr != nil {
+				return corebridge.Status{}, forceErr
+			}
+			stopResult = forceResult
+		}
+	}
+
 	st, statusErr := m.GetMigrationStatus(ctx, migrationID)
 	if statusErr != nil {
 		return corebridge.Status{
@@ -352,9 +380,12 @@ func (m *Manager) StopMigration(ctx context.Context, migrationID string) (corebr
 	st.Live = mig.IsLive()
 	st.SoftSuspendRequested = stopResult.SoftSuspendRequested
 	st.Stopped = stopResult.Stopped
+	if stopResult.ForceStopped {
+		st.Status = corebridge.MigrationStatusSuspended
+	}
 	// Soft suspend: keep engine phase until drain finishes (e.g. still traversal-in-progress); do not force generic "suspended".
 	// Hard cancel / other stopped paths: surface legacy suspended label for clients that expect it.
-	if stopResult.Stopped && !stopResult.SoftSuspendRequested {
+	if stopResult.Stopped && !stopResult.SoftSuspendRequested && !stopResult.ForceStopped {
 		st.Status = corebridge.MigrationStatusSuspended
 	}
 	return st, nil

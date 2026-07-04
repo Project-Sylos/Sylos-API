@@ -18,6 +18,7 @@ type Config struct {
 	JWT         JWTConfig
 	Runtime     RuntimeConfig
 	Services    ServicesConfig
+	Providers   ProvidersConfig
 }
 
 type HTTPConfig struct {
@@ -79,6 +80,14 @@ func Load() (Config, error) {
 	if err := v.UnmarshalKey("services", &cfg.Services); err != nil {
 		return Config{}, fmt.Errorf("failed to parse services config: %w", err)
 	}
+
+	if err := v.UnmarshalKey("providers", &cfg.Providers); err != nil {
+		return Config{}, fmt.Errorf("failed to parse providers config: %w", err)
+	}
+	if cfg.Providers == nil {
+		cfg.Providers = make(ProvidersConfig)
+	}
+	cfg.Providers.applyDefaults()
 
 	if cfg.JWT.Secret == "" {
 		cfg.JWT.Secret = generateEphemeralSecret()
@@ -152,6 +161,7 @@ type RuntimeConfig struct {
 type ServicesConfig struct {
 	Local   []LocalServiceConfig   `mapstructure:"local"`
 	Spectra []SpectraServiceConfig `mapstructure:"spectra"`
+	Cloud   []CloudServiceConfig   `mapstructure:"cloud"`
 }
 
 type LocalServiceConfig struct {
@@ -166,4 +176,54 @@ type SpectraServiceConfig struct {
 	ConfigPath string `mapstructure:"config_path"`
 	World      string `mapstructure:"world"`
 	RootID     string `mapstructure:"root_id"`
+}
+
+type CloudServiceConfig struct {
+	ID         string   `mapstructure:"id"`
+	Name       string   `mapstructure:"name"`
+	ProviderID string   `mapstructure:"provider_id"`
+	Scopes     []string `mapstructure:"scopes"`
+}
+
+// ProvidersConfig is the static catalog of enabled cloud connectors.
+type ProvidersConfig map[string]ProviderConfig
+
+type ProviderConfig struct {
+	Enabled     bool     `mapstructure:"enabled"`
+	DisplayName string   `mapstructure:"display_name"`
+	ServiceID   string   `mapstructure:"service_id"`
+	Scopes      []string `mapstructure:"scopes"`
+}
+
+func (p ProvidersConfig) applyDefaults() {
+	if p == nil {
+		return
+	}
+	if _, ok := p["google_drive"]; !ok {
+		p["google_drive"] = ProviderConfig{
+			Enabled:     true,
+			DisplayName: "Google Drive",
+			ServiceID:   "google-drive",
+			Scopes: []string{
+				"https://www.googleapis.com/auth/drive",
+			},
+		}
+	}
+	if _, ok := p["dropbox"]; !ok {
+		p["dropbox"] = ProviderConfig{
+			Enabled:     false,
+			DisplayName: "Dropbox",
+			ServiceID:   "dropbox",
+		}
+	}
+	for id, cfg := range p {
+		if cfg.ServiceID == "" {
+			cfg.ServiceID = strings.ReplaceAll(id, "_", "-")
+			p[id] = cfg
+		}
+		if cfg.DisplayName == "" {
+			cfg.DisplayName = id
+			p[id] = cfg
+		}
+	}
 }

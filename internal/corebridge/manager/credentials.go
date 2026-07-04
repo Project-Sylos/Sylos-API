@@ -11,6 +11,7 @@ import (
 	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/database"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/services"
+	"codeberg.org/Sylos/Sylos-FS/pkg/cloud"
 	fstypes "codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
@@ -50,6 +51,9 @@ func (m *Manager) persistFSCredentialBinding(migrationID, role string) error {
 				binding.CredsConfRelPath = "spectra-config.json"
 			}
 		}
+		if plan.SourceDefinition.Type == services.ServiceTypeCloud && plan.SourceConnectionID != "" {
+			binding.CredsConfRelPath = cloud.CredsRelPath(plan.SourceConnectionID)
+		}
 	case migration.FSCredentialRoleDestination:
 		binding.ConnectionID = plan.DestinationConnectionID
 		binding.ServiceID = plan.DestinationDefinition.ID
@@ -62,6 +66,9 @@ func (m *Manager) persistFSCredentialBinding(migrationID, role string) error {
 			if _, ok, _ := services.LoadSpectraConfigOverride(m.cfg.Runtime.DataDir, migrationID); ok {
 				binding.CredsConfRelPath = "spectra-config.json"
 			}
+		}
+		if plan.DestinationDefinition.Type == services.ServiceTypeCloud && plan.DestinationConnectionID != "" {
+			binding.CredsConfRelPath = cloud.CredsRelPath(plan.DestinationConnectionID)
 		}
 	default:
 		return nil
@@ -125,6 +132,12 @@ func (m *Manager) rehydrateFSAdaptersIfNeeded(migrationID string, mig *migration
 						continue
 					}
 					spectraRegistered[b.ConnectionID] = true
+				}
+			}
+			if def.Type == services.ServiceTypeCloud {
+				if regErr := m.rehydrateCloudConnection(migrationID, b, def, masterKey); regErr != nil {
+					m.logger.Warn().Err(regErr).Str("migration_id", migrationID).Str("connection_id", b.ConnectionID).Msg("rehydrate: cloud connection")
+					continue
 				}
 			}
 			var folder fstypes.Folder

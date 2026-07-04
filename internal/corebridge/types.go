@@ -15,11 +15,12 @@ var (
 	ErrDatabaseNotAvailable = errors.New("database not available")
 )
 
-type ServiceType string
+type ServiceType = fstypes.ServiceType
 
 const (
-	ServiceTypeLocal   ServiceType = "local"
-	ServiceTypeSpectra ServiceType = "spectra"
+	ServiceTypeLocal   = fstypes.ServiceTypeLocal
+	ServiceTypeSpectra = fstypes.ServiceTypeSpectra
+	ServiceTypeCloud   = fstypes.ServiceTypeCloud
 )
 
 const (
@@ -61,11 +62,44 @@ type PaginationInfo struct {
 	NextCursor   string `json:"nextCursor,omitempty"` // Keyset cursor for next page (path of last item; use as afterPath)
 }
 
-// DriveInfo represents information about a drive/volume
-type DriveInfo struct {
-	Path        string `json:"path"`        // Absolute path to the drive (e.g., "C:\" on Windows, "/" on Unix)
-	DisplayName string `json:"displayName"` // Display name (e.g., "C:" or "Local Disk (C:)")
-	Type        string `json:"type"`        // Drive type (e.g., "fixed", "removable", "network")
+// DriveInfo is the Sylos-FS drive/volume descriptor returned by ListDrives.
+type DriveInfo = fstypes.DriveInfo
+
+type ProviderDescriptor struct {
+	ID          string   `json:"id"`
+	DisplayName string   `json:"displayName"`
+	ServiceID   string   `json:"serviceId"`
+	AuthType    string   `json:"authType"`
+	Scopes      []string `json:"scopes,omitempty"`
+}
+
+type ConnectionResponse struct {
+	ConnectionID string `json:"connectionId"`
+	ProviderID   string `json:"providerId"`
+}
+
+type OAuthTokenRequest struct {
+	AccessToken  string   `json:"access_token,omitempty"`
+	RefreshToken string   `json:"refresh_token"`
+	ExpiresIn    int64    `json:"expires_in,omitempty"`
+	Scopes       []string `json:"scopes,omitempty"`
+	ClientID     string   `json:"client_id,omitempty"`
+	ClientSecret string   `json:"client_secret,omitempty"`
+}
+
+type ConnectionStatus struct {
+	ConnectionID string    `json:"connectionId"`
+	ProviderID   string    `json:"providerId"`
+	Valid        bool      `json:"valid"`
+	ExpiresAt    time.Time `json:"expiresAt,omitempty"`
+}
+
+type CreateConnectionRequest struct {
+	MigrationID string `json:"migrationId,omitempty"`
+}
+
+type MountDriveRequest struct {
+	Device string `json:"device"`
 }
 
 type FolderDescriptor struct {
@@ -329,6 +363,8 @@ type PathNodeItem struct {
 	Size            int64  `json:"size,omitempty"`
 	TraversalStatus string `json:"traversalStatus"`
 	CopyStatus      string `json:"copyStatus,omitempty"`
+	FailureLogID    string `json:"failureLogId,omitempty"`
+	FailureMessage  string `json:"failureMessage,omitempty"`
 }
 
 // PathNodes represents the src and dst nodes for a given path
@@ -477,6 +513,7 @@ type Bridge interface {
 	ListSources(ctx context.Context) ([]Source, error)
 	ListChildren(ctx context.Context, req ListChildrenRequest) (ListChildrenResponse, error)
 	ListDrives(ctx context.Context, serviceID string) ([]DriveInfo, error)
+	MountDrive(ctx context.Context, serviceID string, req MountDriveRequest) (DriveInfo, error)
 	SetRoot(ctx context.Context, req SetRootRequest) (SetRootResponse, error)
 	StartMigration(ctx context.Context, req StartMigrationRequest) (Migration, error)
 	GetMigrationStatus(ctx context.Context, id string) (Status, error)

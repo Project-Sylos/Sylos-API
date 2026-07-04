@@ -82,6 +82,9 @@ func (m *Manager) SetRoot(ctx context.Context, req corebridge.SetRootRequest) (c
 	if err := m.persistFSCredentialBinding(resp.MigrationID, req.Role); err != nil {
 		m.logger.Warn().Err(err).Str("migration_id", resp.MigrationID).Msg("persist fs credential binding")
 	}
+	if err := m.initializePlanAdapters(resp.MigrationID); err != nil {
+		m.logger.Warn().Err(err).Str("migration_id", resp.MigrationID).Msg("initialize fs adapters")
+	}
 
 	metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
 	existingMeta, err := metaMgr.GetMigrationMetadata(resp.MigrationID)

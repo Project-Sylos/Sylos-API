@@ -17,7 +17,7 @@ func (m *Manager) ListSources(ctx context.Context) ([]corebridge.Source, error) 
 		result[i] = corebridge.Source{
 			ID:          s.ID,
 			DisplayName: s.DisplayName,
-			Type:        corebridge.ServiceType(s.Type),
+			Type:        s.Type,
 			Metadata:    s.Metadata,
 		}
 	}
@@ -52,17 +52,9 @@ func (m *Manager) ListChildren(ctx context.Context, req corebridge.ListChildrenR
 }
 
 func (m *Manager) ListDrives(ctx context.Context, serviceID string) ([]corebridge.DriveInfo, error) {
-	drives, err := m.serviceMgr.ListDrives(ctx, serviceID)
-	if err != nil {
-		return nil, err
-	}
-	result := make([]corebridge.DriveInfo, len(drives))
-	for i, d := range drives {
-		result[i] = corebridge.DriveInfo{
-			Path:        d.Path,
-			DisplayName: d.DisplayName,
-			Type:        d.Type,
-		}
-	}
-	return result, nil
+	return m.serviceMgr.ListDrives(ctx, serviceID)
+}
+
+func (m *Manager) MountDrive(ctx context.Context, serviceID string, req corebridge.MountDriveRequest) (corebridge.DriveInfo, error) {
+	return m.serviceMgr.MountDrive(ctx, serviceID, req)
 }

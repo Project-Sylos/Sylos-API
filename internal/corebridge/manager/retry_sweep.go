@@ -98,12 +98,6 @@ func (m *Manager) TriggerRetrySweep(ctx context.Context, migrationID string, con
 
 func (m *Manager) buildRetrySweepOptions(config corebridge.SweepConfigRequest) migration.RetrySweepOptions {
 	workerCount := config.WorkerCount
-	if workerCount <= 0 {
-		workerCount = m.cfg.Runtime.DefaultWorkerCount
-	}
-	if workerCount <= 0 {
-		workerCount = 10
-	}
 	maxRetries := config.MaxRetries
 	if maxRetries <= 0 {
 		maxRetries = m.cfg.Runtime.DefaultMaxRetries

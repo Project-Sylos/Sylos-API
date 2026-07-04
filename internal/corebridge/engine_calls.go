@@ -51,6 +51,8 @@ func diffItemToPathNodes(item migration.DiffItem) PathNodes {
 			Size:            item.Size,
 			TraversalStatus: item.SrcTraversalStatus,
 			CopyStatus:      item.CopyStatus,
+			FailureLogID:    item.SrcFailureLogID,
+			FailureMessage:  item.SrcFailureMessage,
 		}
 	}
 	if !item.MissingOnDest {
@@ -64,6 +66,8 @@ func diffItemToPathNodes(item migration.DiffItem) PathNodes {
 			Size:            item.Size,
 			TraversalStatus: item.DstTraversalStatus,
 			CopyStatus:      item.CopyStatus,
+			FailureLogID:    item.DstFailureLogID,
+			FailureMessage:  item.DstFailureMessage,
 		}
 	}
 	return pathNodes

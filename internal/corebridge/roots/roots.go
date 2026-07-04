@@ -271,10 +271,15 @@ func (m *Manager) SetRoot(ctx context.Context, req SetRootRequest) (SetRootRespo
 
 			fmt.Printf("Registered Spectra session successfully - sessionID: %s\n", sessionID)
 		} else {
-			// Session already registered - reuse the existing sessionID
+			// Reuse existing Spectra session - reuse the existing sessionID
 			sessionID = existingSessionID
 			fmt.Printf("Reusing existing Spectra session - sessionID: %s\n", sessionID)
 		}
+	} else if serviceDef.Type == services.ServiceTypeCloud {
+		if connectionID == "" {
+			return SetRootResponse{}, fmt.Errorf("connectionId is required for cloud services")
+		}
+		sessionID = connectionID
 	} else {
 		// For non-Spectra services, use connectionID as-is
 		sessionID = connectionID

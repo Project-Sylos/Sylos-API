@@ -17,6 +17,7 @@ import (
 	middlewarepkg "codeberg.org/Sylos/Sylos-API/internal/routes/middleware"
 	migrationroutes "codeberg.org/Sylos/Sylos-API/internal/routes/migrations"
 	preferencesroutes "codeberg.org/Sylos/Sylos-API/internal/routes/preferences"
+	providerroutes "codeberg.org/Sylos/Sylos-API/internal/routes/providers"
 	serviceroutes "codeberg.org/Sylos/Sylos-API/internal/routes/services"
 )
 
@@ -57,6 +58,7 @@ func New(deps Dependencies) chi.Router {
 
 	healthroutes.RegisterProtected(apiRouter)
 	serviceroutes.Register(apiRouter, deps.Logger, deps.CoreBridge, mw)
+	providerroutes.Register(apiRouter, deps.Logger, deps.Manager, mw)
 	migrationroutes.Register(apiRouter, deps.Logger, deps.Manager, mw)
 	preferencesroutes.Register(apiRouter, deps.Logger, deps.DataDir, mw)
 

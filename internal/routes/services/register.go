@@ -24,4 +24,5 @@ func Register(router chi.Router, logger zerolog.Logger, core corebridge.Bridge, 
 	router.Get("/source/list", middleware.NoBody(mw, h.listServices)) // legacy alias
 	router.Get("/services/{serviceID}/children", middleware.NoBody(mw, h.listChildren))
 	router.Get("/services/{serviceID}/drives", middleware.NoBody(mw, h.listDrives))
+	router.Post("/services/{serviceID}/drives/mount", middleware.JSON(mw, h.mountDrive))
 }

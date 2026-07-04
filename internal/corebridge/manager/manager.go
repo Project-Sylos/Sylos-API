@@ -8,6 +8,7 @@ import (
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge/connections"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/database"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/metadata"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/roots"
@@ -22,6 +23,7 @@ type Manager struct {
 	logger      zerolog.Logger
 	cfg         config.Config
 	serviceMgr  *services.ServiceManager
+	connMgr     *connections.Manager
 	rootsMgr    *roots.Manager
 	engineMgr   *migration.MigrationManager
 	terminalMgr *terminal.Manager
@@ -66,6 +68,7 @@ func NewManager(logger zerolog.Logger, cfg config.Config) (*Manager, error) {
 		logger:       logger,
 		cfg:          cfg,
 		serviceMgr:   serviceMgr,
+		connMgr:      connections.NewManager(),
 		rootsMgr:     rootsMgr,
 		engineMgr:    engineMgr,
 		terminalMgr:  terminalMgr,
