@@ -26,12 +26,15 @@ func (m *Manager) ListSources(ctx context.Context) ([]corebridge.Source, error) 
 
 func (m *Manager) ListChildren(ctx context.Context, req corebridge.ListChildrenRequest) (corebridge.ListChildrenResponse, error) {
 	svcReq := services.ListChildrenRequest{
-		ServiceID:   req.ServiceID,
-		Identifier:  req.Identifier,
-		Role:        req.Role,
-		Offset:      req.Offset,
-		Limit:       req.Limit,
-		FoldersOnly: req.FoldersOnly,
+		ServiceID:    req.ServiceID,
+		Identifier:   req.Identifier,
+		Role:         req.Role,
+		ConnectionID: req.ConnectionID,
+		RootType:     req.RootType,
+		DriveID:      req.DriveID,
+		Offset:       req.Offset,
+		Limit:        req.Limit,
+		FoldersOnly:  req.FoldersOnly,
 	}
 	result, pagination, err := m.serviceMgr.ListChildren(ctx, svcReq)
 	if err != nil {

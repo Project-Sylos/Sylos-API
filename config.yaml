@@ -27,4 +27,22 @@ services:
       world: "s1"
       root_id: "root"
 
+providers:
+  google_drive:
+    enabled: true
+    display_name: "Google Drive"
+    service_id: google-drive
+    scopes:
+      - "https://www.googleapis.com/auth/drive"
+  dropbox:
+    enabled: true
+    display_name: "Dropbox"
+    service_id: dropbox
+    scopes:
+      - files.metadata.read
+      - files.content.read
+      - files.content.write
+      - account_info.read
+      - sharing.read
+      - team_data.team_space
 

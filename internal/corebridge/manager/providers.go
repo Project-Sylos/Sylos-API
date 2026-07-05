@@ -13,7 +13,6 @@ import (
 	"codeberg.org/Sylos/Sylos-FS/pkg/cloud"
 	fslib "codeberg.org/Sylos/Sylos-FS/pkg/fs"
 	"codeberg.org/Sylos/Sylos-FS/pkg/credentials"
-	"codeberg.org/Sylos/Sylos-FS/pkg/fs/googledrive"
 	"github.com/oklog/ulid/v2"
 )
 
@@ -124,19 +123,8 @@ func (m *Manager) PostProviderTokens(ctx context.Context, providerID, connection
 }
 
 func buildStoredCredentials(providerID string, req corebridge.OAuthTokenRequest) ([]byte, error) {
-	switch providerID {
-	case cloud.ProviderGoogleDrive:
-		return googledrive.RegisterCredentialsPayload(req.RefreshToken, req.ClientID, req.ClientSecret, req.Scopes)
-	default:
-		stored := cloud.StoredCredentials{
-			Provider:     providerID,
-			RefreshToken: req.RefreshToken,
-			ClientID:     req.ClientID,
-			ClientSecret: req.ClientSecret,
-			Scopes:       req.Scopes,
-		}
-		return json.Marshal(stored)
-	}
+	stored := cloud.StoredCredentialsFromOAuth(providerID, req.RefreshToken, req.ClientID, req.ClientSecret, req.Scopes)
+	return json.Marshal(stored)
 }
 
 func (m *Manager) ProviderConnectionStatus(ctx context.Context, providerID, connectionID string) (corebridge.ConnectionStatus, error) {
@@ -169,9 +157,9 @@ func (m *Manager) ListProviderRoots(ctx context.Context, providerID, connectionI
 	return m.serviceMgr.ListCloudRoots(ctx, providerID, connectionID)
 }
 
-func (m *Manager) ListProviderChildren(ctx context.Context, providerID, connectionID, identifier, rootType string, offset, limit int, foldersOnly bool) (corebridge.ListChildrenResponse, error) {
+func (m *Manager) ListProviderChildren(ctx context.Context, providerID, connectionID, identifier, rootType, driveID string, offset, limit int, foldersOnly bool) (corebridge.ListChildrenResponse, error) {
 	_ = providerID
-	result, pagination, err := m.serviceMgr.ListCloudChildren(ctx, connectionID, identifier, rootType, offset, limit, foldersOnly)
+	result, pagination, err := m.serviceMgr.ListCloudChildren(ctx, connectionID, identifier, rootType, driveID, offset, limit, foldersOnly)
 	if err != nil {
 		return corebridge.ListChildrenResponse{}, err
 	}

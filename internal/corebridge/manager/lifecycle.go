@@ -144,10 +144,6 @@ func migrationService(def services.ServiceDefinition, adapter fstypes.FSAdapter,
 	return svc
 }
 
-func cloudMigrationService(def services.ServiceDefinition, adapter fstypes.FSAdapter, root fstypes.Folder, connectionID string) migration.Service {
-	return migrationService(def, adapter, root, connectionID)
-}
-
 func (m *Manager) ensureMigration(_ context.Context, requestedID string) (*migration.Migration, error) {
 	if requestedID != "" {
 		existing, err := m.GetMigration(context.TODO(), requestedID)

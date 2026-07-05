@@ -288,7 +288,7 @@ func (m *Manager) SetRoot(ctx context.Context, req SetRootRequest) (SetRootRespo
 	// Acquire adapter for the root being set (blocking I/O - do NOT hold lock)
 	// For Spectra: session must be registered first using RegisterSpectraSession()
 	// ServiceManager manages the session lifecycle - API just uses the sessionID
-	adapter, release, err := m.serviceMgr.AcquireAdapter(serviceDef, folder.ID(), sessionID)
+	adapter, release, err := m.serviceMgr.AcquireAdapter(serviceDef, folder, sessionID)
 	if err != nil {
 		return SetRootResponse{}, fmt.Errorf("failed to acquire %s adapter: %w", role, err)
 	}

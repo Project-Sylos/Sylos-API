@@ -47,6 +47,8 @@ type ListChildrenRequest struct {
 	Identifier   string
 	Role         string // "source" or "destination" - used to map "spectra" to the correct world
 	ConnectionID string // Cloud/Spectra session connection ID
+	RootType     string // Cloud browse root type when listing a virtual root
+	DriveID      string // Cloud namespace metadata (Dropbox team_folder, shared_folder)
 	Offset       int    // Pagination offset (default: 0)
 	Limit        int    // Pagination limit (default: 100, max: 1000)
 	FoldersOnly  bool   // If true, only return folders and apply limit to folders only
@@ -259,8 +261,8 @@ func (m *ServiceManager) ListCloudRoots(ctx context.Context, providerID, connect
 	return m.fsManager.ListCloudRoots(ctx, providerID, connectionID)
 }
 
-func (m *ServiceManager) ListCloudChildren(ctx context.Context, connectionID, identifier, rootType string, offset, limit int, foldersOnly bool) (fstypes.ListResult, PaginationInfo, error) {
-	result, pagination, err := m.fsManager.ListCloudChildren(ctx, connectionID, identifier, rootType, offset, limit, foldersOnly)
+func (m *ServiceManager) ListCloudChildren(ctx context.Context, connectionID, identifier, rootType, driveID string, offset, limit int, foldersOnly bool) (fstypes.ListResult, PaginationInfo, error) {
+	result, pagination, err := m.fsManager.ListCloudChildren(ctx, connectionID, identifier, rootType, driveID, offset, limit, foldersOnly)
 	if err != nil {
 		return fstypes.ListResult{}, PaginationInfo{}, err
 	}
@@ -288,6 +290,8 @@ func (m *ServiceManager) ListChildren(ctx context.Context, req ListChildrenReque
 		ServiceID:   req.ServiceID,
 		Identifier:  req.Identifier,
 		SessionID:   req.ConnectionID,
+		RootType:    req.RootType,
+		DriveID:     req.DriveID,
 		Offset:      req.Offset,
 		Limit:       req.Limit,
 		FoldersOnly: req.FoldersOnly,
@@ -340,6 +344,6 @@ func (m *ServiceManager) RegisterSpectraSession(configPath, connectionID string)
 	return m.fsManager.RegisterSpectraSession(configPath, connectionID)
 }
 
-func (m *ServiceManager) AcquireAdapter(def ServiceDefinition, rootID, sessionID string) (fstypes.FSAdapter, func(), error) {
-	return m.fsManager.AcquireAdapter(def, rootID, sessionID)
+func (m *ServiceManager) AcquireAdapter(def ServiceDefinition, root fstypes.Folder, sessionID string) (fstypes.FSAdapter, func(), error) {
+	return m.fsManager.AcquireAdapter(def, root, sessionID)
 }

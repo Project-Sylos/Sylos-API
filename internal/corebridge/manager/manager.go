@@ -57,10 +57,7 @@ func NewManager(logger zerolog.Logger, cfg config.Config) (*Manager, error) {
 	}
 
 	rootsMgr := roots.NewManager(logger, cfg.Runtime.DataDir, serviceMgr, resolveDBPath)
-	engineMgr, err := migration.NewMigrationManager(migration.DatabaseConfig{})
-	if err != nil {
-		return nil, err
-	}
+	engineMgr := migration.NewMigrationManager()
 	terminalMgr := terminal.NewManager(logger, cfg)
 	bgTaskMgr := corebridge.NewBackgroundTaskManager(logger)
 

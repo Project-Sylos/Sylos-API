@@ -19,6 +19,15 @@ func (h handler) listChildren(ctx *middleware.Context) {
 
 	identifier := ctx.Request().URL.Query().Get("identifier")
 	role := ctx.Request().URL.Query().Get("role")
+	rootType := ctx.Request().URL.Query().Get("rootType")
+	driveID := ctx.Request().URL.Query().Get("driveId")
+	if driveID == "" {
+		driveID = ctx.Request().URL.Query().Get("drive_id")
+	}
+	connectionID := ctx.Request().URL.Query().Get("connectionId")
+	if connectionID == "" {
+		connectionID = ctx.Request().URL.Query().Get("connection_id")
+	}
 
 	// Parse pagination parameters
 	offset := 0
@@ -43,12 +52,15 @@ func (h handler) listChildren(ctx *middleware.Context) {
 	}
 
 	children, err := h.core.ListChildren(ctx.Request().Context(), corebridge.ListChildrenRequest{
-		ServiceID:   serviceID,
-		Identifier:  identifier,
-		Role:        role,
-		Offset:      offset,
-		Limit:       limit,
-		FoldersOnly: foldersOnly,
+		ServiceID:    serviceID,
+		Identifier:   identifier,
+		Role:         role,
+		ConnectionID: connectionID,
+		RootType:     rootType,
+		DriveID:      driveID,
+		Offset:       offset,
+		Limit:        limit,
+		FoldersOnly:  foldersOnly,
 	})
 	if err != nil {
 		if err == corebridge.ErrServiceNotFound {

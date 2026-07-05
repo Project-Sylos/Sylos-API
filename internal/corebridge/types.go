@@ -36,12 +36,15 @@ type Source struct {
 }
 
 type ListChildrenRequest struct {
-	ServiceID   string
-	Identifier  string
-	Role        string // "source" or "destination" - used to map "spectra" to the correct world
-	Offset      int    // Pagination offset (default: 0)
-	Limit       int    // Pagination limit (default: 100, max: 1000)
-	FoldersOnly bool   // If true, only return folders and apply limit to folders only
+	ServiceID    string
+	Identifier   string
+	Role         string // "source" or "destination" - used to map "spectra" to the correct world
+	ConnectionID string // Cloud/Spectra session connection ID
+	RootType     string // Cloud browse root type when listing a virtual root
+	DriveID      string // Cloud namespace metadata (Dropbox team_folder, shared_folder)
+	Offset       int    // Pagination offset (default: 0)
+	Limit        int    // Pagination limit (default: 100, max: 1000)
+	FoldersOnly  bool   // If true, only return folders and apply limit to folders only
 }
 
 // ListChildrenResponse wraps the list result with pagination metadata

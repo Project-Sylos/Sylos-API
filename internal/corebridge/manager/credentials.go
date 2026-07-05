@@ -145,7 +145,7 @@ func (m *Manager) rehydrateFSAdaptersIfNeeded(migrationID string, mig *migration
 				m.logger.Warn().Err(err).Str("migration_id", migrationID).Str("role", b.Role).Msg("rehydrate: root folder json")
 				continue
 			}
-			adapter, release, err := m.serviceMgr.AcquireAdapter(def, folder.ID(), b.ConnectionID)
+			adapter, release, err := m.serviceMgr.AcquireAdapter(def, folder, b.ConnectionID)
 			if err != nil {
 				m.logger.Warn().Err(err).Str("migration_id", migrationID).Str("role", b.Role).Msg("rehydrate: AcquireAdapter")
 				continue

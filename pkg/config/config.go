@@ -214,6 +214,14 @@ func (p ProvidersConfig) applyDefaults() {
 			Enabled:     false,
 			DisplayName: "Dropbox",
 			ServiceID:   "dropbox",
+			Scopes: []string{
+				"files.metadata.read",
+				"files.content.read",
+				"files.content.write",
+				"account_info.read",
+				"sharing.read",
+				"team_data.team_space",
+			},
 		}
 	}
 	for id, cfg := range p {
