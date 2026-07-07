@@ -1,4 +1,5 @@
 #!/bin/bash
+# Deprecated: use Settings > Danger zone or POST /api/admin/clean-slate (admin JWT required).
 # This script will delete all data from the server and start fresh.
 
 echo "Cleaning api data..."
@@ -10,7 +11,7 @@ if [ -d "data/" ]; then
         # Get just the filename/dirname
         name=$(basename "$item")
         # Skip api-runtime.log and migrations.yaml
-        if [ "$name" != "api-runtime.log" ] && [ "$name" != "migrations.yaml" ] && [ "$name" != "preferences.json" ]; then
+        if [ "$name" != "api-runtime.log" ] && [ "$name" != "migrations.yaml" ] && [ "$name" != "sylos.duckdb" ]; then
             # Delete the item (file or directory)
             rm -rf "$item"
         fi

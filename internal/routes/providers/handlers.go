@@ -21,11 +21,14 @@ func Register(router chi.Router, logger zerolog.Logger, mgr *manager.Manager, mw
 	h := handler{logger: logger, mgr: mgr}
 	router.Get("/providers", middleware.NoBody(mw, h.listProviders))
 	router.Post("/providers/{providerID}/connections", middleware.JSON(mw, h.createConnection))
+	router.Post("/providers/{providerID}/connections/{connectionID}/oauth/exchange", middleware.JSON(mw, h.exchangeOAuth))
 	router.Post("/providers/{providerID}/connections/{connectionID}/tokens", middleware.JSON(mw, h.postTokens))
 	router.Get("/providers/{providerID}/connections/{connectionID}/status", middleware.NoBody(mw, h.connectionStatus))
 	router.Delete("/providers/{providerID}/connections/{connectionID}", middleware.NoBody(mw, h.revokeConnection))
 	router.Get("/providers/{providerID}/connections/{connectionID}/roots", middleware.NoBody(mw, h.listRoots))
 	router.Get("/providers/{providerID}/connections/{connectionID}/children", middleware.NoBody(mw, h.listChildren))
+	router.Post("/providers/{providerID}/connections/{connectionID}/folders", middleware.JSON(mw, h.createFolder))
+	router.Post("/providers/{providerID}/connections/{connectionID}/nodes/delete", middleware.JSON(mw, h.deleteNodes))
 }
 
 func (h handler) listProviders(ctx *middleware.Context) {
@@ -48,11 +51,26 @@ func (h handler) createConnection(ctx *middleware.Context, req corebridge.Create
 }
 
 func (h handler) postTokens(ctx *middleware.Context, req corebridge.OAuthTokenRequest) {
+	if req.ClientSecret != "" {
+		ctx.Error(http.StatusBadRequest, "direct token upload with client_secret is no longer supported; use oauth exchange", nil)
+		return
+	}
 	providerID := chi.URLParam(ctx.Request(), "providerID")
 	connectionID := chi.URLParam(ctx.Request(), "connectionID")
 	status, err := h.mgr.PostProviderTokens(ctx.Request().Context(), providerID, connectionID, req)
 	if err != nil {
 		ctx.Error(http.StatusBadRequest, "failed to store tokens", err)
+		return
+	}
+	ctx.Response(http.StatusOK, status)
+}
+
+func (h handler) exchangeOAuth(ctx *middleware.Context, req corebridge.OAuthExchangeRequest) {
+	providerID := chi.URLParam(ctx.Request(), "providerID")
+	connectionID := chi.URLParam(ctx.Request(), "connectionID")
+	status, err := h.mgr.ExchangeProviderOAuthCode(ctx.Request().Context(), providerID, connectionID, req)
+	if err != nil {
+		ctx.Error(http.StatusBadRequest, "failed to exchange oauth code", err)
 		return
 	}
 	ctx.Response(http.StatusOK, status)

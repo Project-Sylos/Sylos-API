@@ -4,15 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"path/filepath"
+	"strings"
 	"time"
 
+	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/connections"
-	"codeberg.org/Sylos/Sylos-API/internal/corebridge/database"
+	oauthpkg "codeberg.org/Sylos/Sylos-API/internal/corebridge/oauth"
 	"codeberg.org/Sylos/Sylos-FS/pkg/cloud"
 	fslib "codeberg.org/Sylos/Sylos-FS/pkg/fs"
-	"codeberg.org/Sylos/Sylos-FS/pkg/credentials"
 	"github.com/oklog/ulid/v2"
 )
 
@@ -23,11 +23,12 @@ func (m *Manager) ListProviders(_ context.Context) ([]corebridge.ProviderDescrip
 			continue
 		}
 		out = append(out, corebridge.ProviderDescriptor{
-			ID:          providerID,
-			DisplayName: cfg.DisplayName,
-			ServiceID:   cfg.ServiceID,
-			AuthType:    "oauth_ui_tokens",
-			Scopes:      cfg.Scopes,
+			ID:            providerID,
+			DisplayName:   cfg.DisplayName,
+			ServiceID:     cfg.ServiceID,
+			AuthType:      "oauth_server_exchange",
+			Scopes:        cfg.Scopes,
+			OAuthClientID: m.oauthClientID(providerID),
 		})
 	}
 	return out, nil
@@ -64,31 +65,10 @@ func (m *Manager) PostProviderTokens(ctx context.Context, providerID, connection
 		return corebridge.ConnectionStatus{}, err
 	}
 
-	var masterKey []byte
-	migrationDir := ""
+	var mig *migration.Migration
 	if rec.MigrationID != "" {
-		migrationDir, err = m.migrationDirFor(rec.MigrationID)
-		if err != nil {
-			return corebridge.ConnectionStatus{}, err
-		}
-		absDir, err := filepath.Abs(database.GetMigrationDir(m.cfg.Runtime.DataDir, rec.MigrationID))
-		if err != nil {
-			return corebridge.ConnectionStatus{}, err
-		}
-		mig, err := m.engineMgr.GetMigration(rec.MigrationID, absDir)
-		if err != nil {
-			return corebridge.ConnectionStatus{}, err
-		}
-		if mig != nil {
-			masterKey, err = mig.EnsureEnvelopeMasterKey()
-			if err != nil {
-				return corebridge.ConnectionStatus{}, err
-			}
-		}
-	}
-	if len(masterKey) == 0 {
-		masterKey, err = credentials.GenerateMasterKey()
-		if err != nil {
+		mig, err = m.getEngineMigration(rec.MigrationID)
+		if err != nil && err != corebridge.ErrMigrationNotFound {
 			return corebridge.ConnectionStatus{}, err
 		}
 	}
@@ -96,14 +76,18 @@ func (m *Manager) PostProviderTokens(ctx context.Context, providerID, connection
 	_, err = m.serviceMgr.RegisterCloudConnection(fslib.CloudConnectionOptions{
 		ProviderID:      providerID,
 		ConnectionID:    connectionID,
-		MigrationDir:    migrationDir,
-		MasterKey:       masterKey,
 		CredentialsJSON: credsJSON,
 		AccessToken:     req.AccessToken,
 		ExpiresInSec:    req.ExpiresIn,
 	})
 	if err != nil {
 		return corebridge.ConnectionStatus{}, err
+	}
+
+	if mig != nil {
+		if err := m.persistOAuthCredentials(mig, connectionID, credsJSON); err != nil {
+			return corebridge.ConnectionStatus{}, fmt.Errorf("persist oauth credentials: %w", err)
+		}
 	}
 
 	expiresAt := time.Time{}
@@ -120,6 +104,53 @@ func (m *Manager) PostProviderTokens(ctx context.Context, providerID, connection
 		Valid:        true,
 		ExpiresAt:    expiresAt,
 	}, nil
+}
+
+func (m *Manager) ExchangeProviderOAuthCode(ctx context.Context, providerID, connectionID string, req corebridge.OAuthExchangeRequest) (corebridge.ConnectionStatus, error) {
+	if req.Code == "" || req.RedirectURI == "" {
+		return corebridge.ConnectionStatus{}, fmt.Errorf("code and redirect_uri are required")
+	}
+
+	creds, err := m.oauthProviderCredentials(providerID)
+	if err != nil {
+		return corebridge.ConnectionStatus{}, err
+	}
+
+	tokens, err := oauthpkg.ExchangeAuthCode(providerID, creds, req.Code, req.RedirectURI)
+	if err != nil {
+		return corebridge.ConnectionStatus{}, err
+	}
+	if tokens.RefreshToken == "" {
+		return corebridge.ConnectionStatus{}, fmt.Errorf("provider did not return a refresh token")
+	}
+
+	scopes := req.Scopes
+	if tokens.Scope != "" {
+		scopes = splitScopes(tokens.Scope)
+	}
+
+	return m.PostProviderTokens(ctx, providerID, connectionID, corebridge.OAuthTokenRequest{
+		AccessToken:  tokens.AccessToken,
+		RefreshToken: tokens.RefreshToken,
+		ExpiresIn:    tokens.ExpiresIn,
+		Scopes:       scopes,
+		ClientID:     creds.ClientID,
+		ClientSecret: creds.ClientSecret,
+	})
+}
+
+func splitScopes(raw string) []string {
+	parts := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ' ' || r == ','
+	})
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }
 
 func buildStoredCredentials(providerID string, req corebridge.OAuthTokenRequest) ([]byte, error) {
@@ -142,15 +173,20 @@ func (m *Manager) ProviderConnectionStatus(ctx context.Context, providerID, conn
 }
 
 func (m *Manager) RevokeProviderConnection(ctx context.Context, providerID, connectionID string) error {
-	migrationDir := ""
+	migrationID := ""
 	if rec, ok := m.connMgr.Get(connectionID); ok && rec.MigrationID != "" {
-		dir, err := m.migrationDirFor(rec.MigrationID)
-		if err == nil {
-			migrationDir = dir
-		}
+		migrationID = rec.MigrationID
 	}
 	m.connMgr.Delete(connectionID)
-	return m.serviceMgr.RevokeCloudConnection(connectionID, migrationDir)
+	if err := m.serviceMgr.RevokeCloudConnection(connectionID, ""); err != nil {
+		return err
+	}
+	if migrationID != "" {
+		if mig, err := m.getEngineMigration(migrationID); err == nil && mig != nil {
+			_ = mig.DeleteOAuthCredentials(connectionID)
+		}
+	}
+	return nil
 }
 
 func (m *Manager) ListProviderRoots(ctx context.Context, providerID, connectionID string) ([]cloud.Root, error) {
@@ -175,4 +211,22 @@ func (m *Manager) ListProviderChildren(ctx context.Context, providerID, connecti
 			HasMore:      pagination.HasMore,
 		},
 	}, nil
+}
+
+func (m *Manager) CreateProviderFolder(ctx context.Context, providerID, connectionID string, req corebridge.CreateBrowseFolderRequest) (corebridge.FolderDescriptor, error) {
+	def, err := m.serviceMgr.GetServiceDefinitionByProvider(providerID)
+	if err != nil {
+		return corebridge.FolderDescriptor{}, corebridge.ErrServiceNotFound
+	}
+	req.ConnectionID = connectionID
+	return m.CreateBrowseFolder(ctx, def.ID, req)
+}
+
+func (m *Manager) DeleteProviderNodes(ctx context.Context, providerID, connectionID string, req corebridge.DeleteBrowseNodesRequest) (corebridge.DeleteBrowseNodesResponse, error) {
+	def, err := m.serviceMgr.GetServiceDefinitionByProvider(providerID)
+	if err != nil {
+		return corebridge.DeleteBrowseNodesResponse{}, corebridge.ErrServiceNotFound
+	}
+	req.ConnectionID = connectionID
+	return m.DeleteBrowseNodes(ctx, def.ID, req)
 }

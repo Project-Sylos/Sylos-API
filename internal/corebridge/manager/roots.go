@@ -7,8 +7,8 @@ import (
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge/apidb"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/database"
-	"codeberg.org/Sylos/Sylos-API/internal/corebridge/metadata"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/roots"
 )
 
@@ -24,6 +24,9 @@ func (m *Manager) SetRoot(ctx context.Context, req corebridge.SetRootRequest) (c
 			return corebridge.SetRootResponse{}, err
 		}
 		migrationID = created.ID
+		if _, err := m.apiDB.EnsureMigrationKey(migrationID); err != nil {
+			return corebridge.SetRootResponse{}, err
+		}
 		// Per-migration flow: create folder and materialize the migration (DB + row) so Start and polling never race on pending→persist.
 		migrationDir := database.GetMigrationDir(m.cfg.Runtime.DataDir, migrationID)
 		_ = os.MkdirAll(migrationDir, 0755)
@@ -39,15 +42,20 @@ func (m *Manager) SetRoot(ctx context.Context, req corebridge.SetRootRequest) (c
 		if err != nil {
 			return corebridge.SetRootResponse{}, err
 		}
-		engMig, err := m.engineMgr.GetMigration(migrationID, absDir)
-		if err != nil {
+		engMig, err := m.getEngineMigration(migrationID)
+		if err != nil && err != corebridge.ErrMigrationNotFound {
 			return corebridge.SetRootResponse{}, err
 		}
 		if engMig == nil {
+			key, keyErr := m.apiDB.EnsureMigrationKey(migrationID)
+			if keyErr != nil {
+				return corebridge.SetRootResponse{}, keyErr
+			}
 			if _, err := m.engineMgr.CreateMigration(migration.CreateMigrationConfig{
-				Name:         "migration",
-				MigrationDir: absDir,
-				MigrationID:  migrationID,
+				Name:          "migration",
+				MigrationDir:  absDir,
+				MigrationID:   migrationID,
+				EncryptionKey: key,
 			}); err != nil {
 				return corebridge.SetRootResponse{}, err
 			}
@@ -86,20 +94,19 @@ func (m *Manager) SetRoot(ctx context.Context, req corebridge.SetRootRequest) (c
 		m.logger.Warn().Err(err).Str("migration_id", resp.MigrationID).Msg("initialize fs adapters")
 	}
 
-	metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
-	existingMeta, err := metaMgr.GetMigrationMetadata(resp.MigrationID)
+	existingMeta, err := m.getMigrationRecord(resp.MigrationID)
 	isNewMigration := true
-	if err == nil {
+	if err == nil && existingMeta.ID != "" {
 		isNewMigration = existingMeta.IsNewMigration
 	}
 
-	meta := metadata.MigrationMetadata{
+	rec := apidb.MigrationRecord{
 		ID:             resp.MigrationID,
 		Name:           resp.MigrationID,
 		DatabasePath:   resp.DatabasePath,
 		IsNewMigration: isNewMigration,
 	}
-	if err := metaMgr.UpdateMigrationMetadata(meta); err != nil {
+	if err := m.upsertMigrationRecord(rec); err != nil {
 		m.logger.Warn().Err(err).Str("migration_id", resp.MigrationID).Msg("failed to update migration metadata when setting root")
 	}
 

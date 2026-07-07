@@ -3,36 +3,32 @@ package manager
 import (
 	"context"
 	"fmt"
-	"sort"
 	"time"
 
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
-	"codeberg.org/Sylos/Sylos-API/internal/corebridge/metadata"
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge/apidb"
 )
 
 func (m *Manager) GetMigrationMetadata(ctx context.Context, migrationID string) (corebridge.MigrationMetadata, error) {
-	metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
-	meta, err := metaMgr.GetMigrationMetadata(migrationID)
+	rec, err := m.getMigrationRecord(migrationID)
 	if err != nil {
 		return corebridge.MigrationMetadata{}, err
 	}
 	return corebridge.MigrationMetadata{
-		ID:           meta.ID,
-		Name:         meta.Name,
-		ConfigPath:   meta.ConfigPath,
-		DatabasePath: meta.DatabasePath,
-		CreatedAt:    meta.CreatedAt,
+		ID:           rec.ID,
+		Name:         rec.Name,
+		DatabasePath: rec.DatabasePath,
+		CreatedAt:    rec.CreatedAt,
 	}, nil
 }
 
 func (m *Manager) UpdateMigrationName(ctx context.Context, migrationID, name string) error {
-	metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
-	meta, err := metaMgr.GetMigrationMetadata(migrationID)
+	rec, err := m.getMigrationRecord(migrationID)
 	if err != nil {
 		return err
 	}
-	meta.Name = name
-	return metaMgr.UpdateMigrationMetadata(meta)
+	rec.Name = name
+	return m.upsertMigrationRecord(rec)
 }
 
 func (m *Manager) ListAllMigrations(ctx context.Context, req corebridge.ListMigrationsRequest) (corebridge.ListMigrationsResponse, error) {
@@ -48,24 +44,26 @@ func (m *Manager) ListAllMigrations(ctx context.Context, req corebridge.ListMigr
 		limit = 1000
 	}
 
-	metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
-	allMeta, err := metaMgr.LoadAllMetadata()
+	if m.apiDB == nil {
+		return corebridge.ListMigrationsResponse{}, fmt.Errorf("API database not configured")
+	}
+	allRecs, err := m.apiDB.ListMigrations()
 	if err != nil {
 		return corebridge.ListMigrationsResponse{}, fmt.Errorf("failed to load migration metadata: %w", err)
 	}
 
-	total := len(allMeta.Migrations)
+	total := len(allRecs)
 	statuses := make([]corebridge.Status, 0, total)
 
-	for id, meta := range allMeta.Migrations {
-		status, err := m.GetMigrationStatus(ctx, id)
+	for _, rec := range allRecs {
+		status, err := m.GetMigrationStatus(ctx, rec.ID)
 		if err != nil {
 			status = corebridge.Status{
 				Migration: corebridge.Migration{
-					ID:            meta.ID,
+					ID:            rec.ID,
 					SourceID:      "",
 					DestinationID: "",
-					StartedAt:     meta.CreatedAt,
+					StartedAt:     rec.CreatedAt,
 					Status:        "",
 				},
 				CompletedAt: nil,
@@ -73,7 +71,7 @@ func (m *Manager) ListAllMigrations(ctx context.Context, req corebridge.ListMigr
 				Result:      nil,
 			}
 
-			plan := m.rootsMgr.GetPlan(id)
+			plan := m.rootsMgr.GetPlan(rec.ID)
 			if plan != nil {
 				if plan.HasSource {
 					status.SourceID = plan.SourceDefinition.ID
@@ -92,17 +90,7 @@ func (m *Manager) ListAllMigrations(ctx context.Context, req corebridge.ListMigr
 		statuses = append(statuses, status)
 	}
 
-	sort.Slice(statuses, func(i, j int) bool {
-		timeI := statuses[i].StartedAt
-		timeJ := statuses[j].StartedAt
-		if timeI.IsZero() {
-			timeI = time.Time{}
-		}
-		if timeJ.IsZero() {
-			timeJ = time.Time{}
-		}
-		return timeI.After(timeJ)
-	})
+	sortStatusesByTime(statuses)
 
 	hasMore := offset+limit < total
 	end := offset + limit
@@ -124,4 +112,26 @@ func (m *Manager) ListAllMigrations(ctx context.Context, req corebridge.ListMigr
 		Limit:      limit,
 		HasMore:    hasMore,
 	}, nil
+}
+
+func sortStatusesByTime(statuses []corebridge.Status) {
+	for i := 0; i < len(statuses); i++ {
+		for j := i + 1; j < len(statuses); j++ {
+			timeI := statuses[i].StartedAt
+			timeJ := statuses[j].StartedAt
+			if timeI.IsZero() {
+				timeI = time.Time{}
+			}
+			if timeJ.IsZero() {
+				timeJ = time.Time{}
+			}
+			if timeJ.After(timeI) {
+				statuses[i], statuses[j] = statuses[j], statuses[i]
+			}
+		}
+	}
+}
+
+func (m *Manager) APIDB() *apidb.DB {
+	return m.apiDB
 }

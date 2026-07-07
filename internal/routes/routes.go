@@ -10,15 +10,20 @@ import (
 	"github.com/rs/zerolog"
 
 	"codeberg.org/Sylos/Sylos-API/internal/auth"
+	"codeberg.org/Sylos/Sylos-API/internal/auth/users"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/manager"
+	adminroutes "codeberg.org/Sylos/Sylos-API/internal/routes/admin"
 	authroutes "codeberg.org/Sylos/Sylos-API/internal/routes/auth"
 	healthroutes "codeberg.org/Sylos/Sylos-API/internal/routes/health"
 	middlewarepkg "codeberg.org/Sylos/Sylos-API/internal/routes/middleware"
 	migrationroutes "codeberg.org/Sylos/Sylos-API/internal/routes/migrations"
+	oauthappsroutes "codeberg.org/Sylos/Sylos-API/internal/routes/oauthapps"
 	preferencesroutes "codeberg.org/Sylos/Sylos-API/internal/routes/preferences"
 	providerroutes "codeberg.org/Sylos/Sylos-API/internal/routes/providers"
 	serviceroutes "codeberg.org/Sylos/Sylos-API/internal/routes/services"
+	setuproutes "codeberg.org/Sylos/Sylos-API/internal/routes/setup"
+	usersroutes "codeberg.org/Sylos/Sylos-API/internal/routes/users"
 )
 
 type Dependencies struct {
@@ -28,6 +33,7 @@ type Dependencies struct {
 	AuthManager *auth.Manager
 	Middleware  *middlewarepkg.Middleware
 	DataDir     string
+	UserStore   *users.Store
 }
 
 func New(deps Dependencies) chi.Router {
@@ -51,16 +57,21 @@ func New(deps Dependencies) chi.Router {
 	}
 
 	healthroutes.RegisterPublic(router)
-	authroutes.Register(router, deps.Logger, deps.AuthManager, mw)
+	setuproutes.RegisterPublic(router, deps.Logger, deps.UserStore, deps.AuthManager, mw)
+	authroutes.Register(router, deps.Logger, deps.AuthManager, deps.UserStore, mw)
 
 	apiRouter := chi.NewRouter()
 	apiRouter.Use(deps.AuthManager.Middleware)
 
 	healthroutes.RegisterProtected(apiRouter)
+	authroutes.RegisterProtected(apiRouter, deps.UserStore, mw)
+	usersroutes.Register(apiRouter, deps.Logger, deps.UserStore, mw)
 	serviceroutes.Register(apiRouter, deps.Logger, deps.CoreBridge, mw)
 	providerroutes.Register(apiRouter, deps.Logger, deps.Manager, mw)
+	oauthappsroutes.Register(apiRouter, deps.Logger, deps.Manager, mw)
+	adminroutes.Register(apiRouter, deps.Logger, deps.Manager, mw)
 	migrationroutes.Register(apiRouter, deps.Logger, deps.Manager, mw)
-	preferencesroutes.Register(apiRouter, deps.Logger, deps.DataDir, mw)
+	preferencesroutes.Register(apiRouter, deps.Logger, deps.UserStore, mw)
 
 	router.Mount("/api", apiRouter)
 

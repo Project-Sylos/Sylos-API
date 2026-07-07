@@ -4,8 +4,8 @@ import (
 	"context"
 
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge/apidb"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/database"
-	"codeberg.org/Sylos/Sylos-API/internal/corebridge/metadata"
 )
 
 func (m *Manager) UploadMigrationDB(ctx context.Context, migrationID string, data []byte, overwrite bool) (corebridge.UploadMigrationDBResponse, error) {
@@ -80,21 +80,20 @@ func (m *Manager) ListMigrationDBs(ctx context.Context) ([]corebridge.MigrationD
 }
 
 func (m *Manager) persistUploadedDBMetadata(migrationID, databasePath string) {
-	metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
-	meta, err := metaMgr.GetMigrationMetadata(migrationID)
-	if err != nil {
-		meta = metadata.MigrationMetadata{
+	rec, err := m.getMigrationRecord(migrationID)
+	if err != nil || rec.ID == "" {
+		rec = apidb.MigrationRecord{
 			ID:           migrationID,
 			Name:         migrationID,
 			DatabasePath: databasePath,
 		}
 	} else {
-		if meta.Name == "" {
-			meta.Name = migrationID
+		if rec.Name == "" {
+			rec.Name = migrationID
 		}
-		meta.DatabasePath = databasePath
+		rec.DatabasePath = databasePath
 	}
-	if err := metaMgr.UpdateMigrationMetadata(meta); err != nil {
+	if err := m.upsertMigrationRecord(rec); err != nil {
 		m.logger.Warn().Err(err).Str("migration_id", migrationID).Str("database_path", databasePath).Msg("failed to persist uploaded DB metadata")
 	}
 }

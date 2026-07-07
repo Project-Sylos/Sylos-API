@@ -1,35 +1,23 @@
 package manager
 
 import (
-	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"path/filepath"
 	"strings"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
-	"codeberg.org/Sylos/Sylos-API/internal/corebridge/database"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/services"
-	"codeberg.org/Sylos/Sylos-FS/pkg/cloud"
 	fstypes "codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
-// persistFSCredentialBinding writes envelope key (if needed) and one side's binding after SetRoot.
+// persistFSCredentialBinding writes one side's binding after SetRoot.
 func (m *Manager) persistFSCredentialBinding(migrationID, role string) error {
-	absDir, err := filepath.Abs(database.GetMigrationDir(m.cfg.Runtime.DataDir, migrationID))
-	if err != nil {
-		return err
-	}
-	mig, err := m.engineMgr.GetMigration(migrationID, absDir)
+	mig, err := m.getEngineMigration(migrationID)
 	if err != nil {
 		return err
 	}
 	if mig == nil {
 		return fmt.Errorf("migration %q not found for credential persist", migrationID)
-	}
-	if _, err := mig.EnsureEnvelopeMasterKey(); err != nil {
-		return err
 	}
 	plan := m.rootsMgr.GetPlan(migrationID)
 	if plan == nil {
@@ -51,9 +39,6 @@ func (m *Manager) persistFSCredentialBinding(migrationID, role string) error {
 				binding.CredsConfRelPath = "spectra-config.json"
 			}
 		}
-		if plan.SourceDefinition.Type == services.ServiceTypeCloud && plan.SourceConnectionID != "" {
-			binding.CredsConfRelPath = cloud.CredsRelPath(plan.SourceConnectionID)
-		}
 	case migration.FSCredentialRoleDestination:
 		binding.ConnectionID = plan.DestinationConnectionID
 		binding.ServiceID = plan.DestinationDefinition.ID
@@ -67,13 +52,19 @@ func (m *Manager) persistFSCredentialBinding(migrationID, role string) error {
 				binding.CredsConfRelPath = "spectra-config.json"
 			}
 		}
-		if plan.DestinationDefinition.Type == services.ServiceTypeCloud && plan.DestinationConnectionID != "" {
-			binding.CredsConfRelPath = cloud.CredsRelPath(plan.DestinationConnectionID)
-		}
 	default:
 		return nil
 	}
 	return mig.UpsertFSCredentialBinding(binding)
+}
+
+// ensureFSAdaptersRehydrated rebuilds in-memory FS adapters when a real filesystem operation is needed.
+func (m *Manager) ensureFSAdaptersRehydrated(migrationID string) error {
+	mig, err := m.getEngineMigration(migrationID)
+	if err != nil {
+		return err
+	}
+	return m.rehydrateFSAdaptersIfNeeded(migrationID, mig)
 }
 
 // rehydrateFSAdaptersIfNeeded rebuilds in-memory FS adapters from the migration DB after API restart.
@@ -84,13 +75,6 @@ func (m *Manager) rehydrateFSAdaptersIfNeeded(migrationID string, mig *migration
 	plan := m.rootsMgr.GetPlan(migrationID)
 	if plan != nil && plan.SourceAdapter != nil && plan.DestinationAdapter != nil {
 		return nil
-	}
-	masterKey, err := mig.GetEnvelopeMasterKey()
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil
-		}
-		return err
 	}
 	bindings, err := mig.ListFSCredentialBindings()
 	if err != nil || len(bindings) == 0 {
@@ -135,7 +119,7 @@ func (m *Manager) rehydrateFSAdaptersIfNeeded(migrationID string, mig *migration
 				}
 			}
 			if def.Type == services.ServiceTypeCloud {
-				if regErr := m.rehydrateCloudConnection(migrationID, b, def, masterKey); regErr != nil {
+				if regErr := m.rehydrateCloudConnection(migrationID, b, def, mig); regErr != nil {
 					m.logger.Warn().Err(regErr).Str("migration_id", migrationID).Str("connection_id", b.ConnectionID).Msg("rehydrate: cloud connection")
 					continue
 				}
@@ -150,7 +134,7 @@ func (m *Manager) rehydrateFSAdaptersIfNeeded(migrationID string, mig *migration
 				m.logger.Warn().Err(err).Str("migration_id", migrationID).Str("role", b.Role).Msg("rehydrate: AcquireAdapter")
 				continue
 			}
-			if err := adapter.Initialize(masterKey, b.ConnectionID); err != nil {
+			if err := adapter.Initialize(nil, b.ConnectionID); err != nil {
 				release()
 				m.logger.Warn().Err(err).Str("migration_id", migrationID).Str("role", b.Role).Msg("rehydrate: Initialize")
 				continue

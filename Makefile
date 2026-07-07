@@ -6,7 +6,7 @@ build:
 	go build ./...
 
 run:
-	go run ./cmd/server
+	go run .
 
 test:
 	go test ./...

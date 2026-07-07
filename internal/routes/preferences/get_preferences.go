@@ -3,37 +3,37 @@ package preferences
 import (
 	"encoding/json"
 	"net/http"
-	"os"
-	"path/filepath"
 
+	appauth "codeberg.org/Sylos/Sylos-API/internal/auth"
 	"codeberg.org/Sylos/Sylos-API/internal/routes/middleware"
 )
 
 func (h handler) getPreferences(ctx *middleware.Context) {
-	prefsPath := filepath.Join(h.dataDir, "preferences.json")
+	claims, ok := appauth.ClaimsFromContext(ctx.Request().Context())
+	if !ok {
+		ctx.Error(http.StatusUnauthorized, "unauthorized", nil)
+		return
+	}
 
-	// Read preferences file
-	data, err := os.ReadFile(prefsPath)
+	raw, err := h.userStore.GetPreferencesJSON(claims.Subject)
 	if err != nil {
-		if os.IsNotExist(err) {
-			// File doesn't exist, return default preferences
-			h.logger.Debug().Str("prefs_path", prefsPath).Msg("preferences file not found, returning defaults")
-			defaultPrefs := getDefaultPreferences()
-			ctx.Response(http.StatusOK, defaultPrefs)
-			return
-		}
-		h.logger.Error().Err(err).Str("prefs_path", prefsPath).Msg("failed to read preferences file")
+		h.logger.Error().Err(err).Str("user_id", claims.Subject).Msg("failed to read user preferences")
 		ctx.Error(http.StatusInternalServerError, "failed to read preferences", err)
 		return
 	}
 
-	var prefs Preferences
-	if err := json.Unmarshal(data, &prefs); err != nil {
-		h.logger.Error().Err(err).Str("prefs_path", prefsPath).Msg("failed to parse preferences JSON")
-		ctx.Error(http.StatusInternalServerError, "failed to parse preferences", err)
+	if raw == "" {
+		h.logger.Debug().Str("user_id", claims.Subject).Msg("no saved preferences, returning defaults")
+		ctx.Response(http.StatusOK, getDefaultPreferences())
 		return
 	}
 
-	h.logger.Debug().Str("prefs_path", prefsPath).Msg("preferences loaded successfully")
-	ctx.Response(http.StatusOK, prefs)
+	var prefs Preferences
+	if err := json.Unmarshal([]byte(raw), &prefs); err != nil {
+		h.logger.Warn().Err(err).Str("user_id", claims.Subject).Msg("invalid preferences JSON, returning defaults")
+		ctx.Response(http.StatusOK, getDefaultPreferences())
+		return
+	}
+
+	ctx.Response(http.StatusOK, mergeWithDefaults(prefs))
 }

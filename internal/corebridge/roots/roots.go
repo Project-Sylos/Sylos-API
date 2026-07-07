@@ -160,6 +160,12 @@ func (m *Manager) SetRoot(ctx context.Context, req SetRootRequest) (SetRootRespo
 		return SetRootResponse{}, fmt.Errorf("invalid %s root: %w", role, err)
 	}
 
+	if role == "source" {
+		if err := m.validateSourceRootNotEmpty(ctx, serviceID, folder, req.ConnectionID); err != nil {
+			return SetRootResponse{}, err
+		}
+	}
+
 	migrationID := req.MigrationID
 	if migrationID == "" {
 		// Generate ULID for migration run ID (lexicographically sortable); node IDs use engine's DeterministicNodeID
@@ -465,6 +471,43 @@ func (m *Manager) ClearAdapters(migrationID string) {
 	if dstRelease != nil {
 		dstRelease()
 	}
+}
+
+// ClearAllPlans releases adapters and removes all in-memory root plans.
+func (m *Manager) ClearAllPlans() {
+	m.mu.Lock()
+	plans := m.plans
+	m.plans = make(map[string]*RootPlan)
+	m.mu.Unlock()
+
+	for migrationID, plan := range plans {
+		if plan == nil {
+			continue
+		}
+		if plan.SourceAdapterRelease != nil {
+			plan.SourceAdapterRelease()
+		}
+		if plan.DestinationAdapterRelease != nil {
+			plan.DestinationAdapterRelease()
+		}
+		_ = migrationID
+	}
+}
+
+func (m *Manager) validateSourceRootNotEmpty(ctx context.Context, serviceID string, folder fstypes.Folder, connectionID string) error {
+	count, err := m.serviceMgr.CountChildren(ctx, services.ListChildrenRequest{
+		ServiceID:    serviceID,
+		Identifier:   folder.ServiceID,
+		Role:         "source",
+		ConnectionID: connectionID,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to validate source root: %w", err)
+	}
+	if count == 0 {
+		return fmt.Errorf("source root cannot be empty — there is nothing to migrate")
+	}
+	return nil
 }
 
 // getMapKeys returns the keys of a map for debugging purposes

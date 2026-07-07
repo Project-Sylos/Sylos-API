@@ -289,6 +289,7 @@ func (m *ServiceManager) ListChildren(ctx context.Context, req ListChildrenReque
 	fsReq := fstypes.ListChildrenRequest{
 		ServiceID:   req.ServiceID,
 		Identifier:  req.Identifier,
+		Role:        req.Role,
 		SessionID:   req.ConnectionID,
 		RootType:    req.RootType,
 		DriveID:     req.DriveID,
@@ -321,6 +322,66 @@ func (m *ServiceManager) MountDrive(ctx context.Context, serviceID string, req c
 		return fstypes.DriveInfo{}, fmt.Errorf("device is required")
 	}
 	return m.fsManager.MountDrive(ctx, serviceID, req.Device)
+}
+
+func (m *ServiceManager) CreateBrowseFolder(ctx context.Context, serviceID string, req corebridge.CreateBrowseFolderRequest) (fstypes.Folder, error) {
+	mutation := fstypes.BrowseMutationRequest{
+		ServiceID:    serviceID,
+		ConnectionID: req.ConnectionID,
+		Role:         req.Role,
+		RootType:     req.RootType,
+		DriveID:      req.DriveID,
+		ContextID:    req.ParentID,
+	}
+	return m.fsManager.CreateFolder(ctx, mutation, req.ParentID, req.Name)
+}
+
+func (m *ServiceManager) DeleteBrowseNodes(ctx context.Context, serviceID string, req corebridge.DeleteBrowseNodesRequest) (corebridge.DeleteBrowseNodesResponse, error) {
+	if strings.TrimSpace(req.ContextID) == "" {
+		return corebridge.DeleteBrowseNodesResponse{}, fmt.Errorf("contextId is required")
+	}
+	nodes := make([]fstypes.NodeRef, len(req.Nodes))
+	for i, n := range req.Nodes {
+		nodes[i] = fstypes.NodeRef{ID: n.ID, Type: n.Type}
+	}
+	mutation := fstypes.BrowseMutationRequest{
+		ServiceID:    serviceID,
+		ConnectionID: req.ConnectionID,
+		Role:         req.Role,
+		RootType:     req.RootType,
+		DriveID:      req.DriveID,
+		ContextID:    req.ContextID,
+	}
+	result, err := m.fsManager.DeleteNodes(ctx, mutation, nodes)
+	if err != nil {
+		return corebridge.DeleteBrowseNodesResponse{}, err
+	}
+	response := corebridge.DeleteBrowseNodesResponse{
+		Deleted: result.Deleted,
+		Errors:  make([]corebridge.DeleteBrowseNodeError, len(result.Errors)),
+	}
+	for i, delErr := range result.Errors {
+		response.Errors[i] = corebridge.DeleteBrowseNodeError{
+			ID:      delErr.ID,
+			Message: delErr.Message,
+		}
+	}
+	return response, nil
+}
+
+func (m *ServiceManager) CountChildren(ctx context.Context, req ListChildrenRequest) (int, error) {
+	fsReq := fstypes.ListChildrenRequest{
+		ServiceID:   req.ServiceID,
+		Identifier:  req.Identifier,
+		Role:        req.Role,
+		SessionID:   req.ConnectionID,
+		RootType:    req.RootType,
+		DriveID:     req.DriveID,
+		Limit:       1,
+		Offset:      0,
+		FoldersOnly: false,
+	}
+	return m.fsManager.CountChildren(ctx, fsReq)
 }
 
 func (m *ServiceManager) GetServiceDefinition(id string) (ServiceDefinition, error) {

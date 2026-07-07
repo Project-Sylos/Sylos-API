@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"strconv"
 
+	appauth "codeberg.org/Sylos/Sylos-API/internal/auth"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
 	"codeberg.org/Sylos/Sylos-API/internal/routes/middleware"
 )
@@ -31,6 +32,11 @@ func (h handler) list(ctx *middleware.Context) {
 	if err != nil {
 		ctx.Error(http.StatusInternalServerError, "failed to list migrations", err)
 		return
+	}
+
+	caps := appauth.CapabilitiesFromContext(ctx.Request().Context())
+	response.Capabilities = corebridge.UserCapabilities{
+		CleanSlate: caps.CleanSlate,
 	}
 
 	ctx.Response(http.StatusOK, response)

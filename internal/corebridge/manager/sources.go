@@ -5,6 +5,7 @@ import (
 
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/services"
+	fstypes "codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
 func (m *Manager) ListSources(ctx context.Context) ([]corebridge.Source, error) {
@@ -60,4 +61,29 @@ func (m *Manager) ListDrives(ctx context.Context, serviceID string) ([]corebridg
 
 func (m *Manager) MountDrive(ctx context.Context, serviceID string, req corebridge.MountDriveRequest) (corebridge.DriveInfo, error) {
 	return m.serviceMgr.MountDrive(ctx, serviceID, req)
+}
+
+func (m *Manager) CreateBrowseFolder(ctx context.Context, serviceID string, req corebridge.CreateBrowseFolderRequest) (corebridge.FolderDescriptor, error) {
+	folder, err := m.serviceMgr.CreateBrowseFolder(ctx, serviceID, req)
+	if err != nil {
+		return corebridge.FolderDescriptor{}, err
+	}
+	return folderDescriptorFromFS(folder), nil
+}
+
+func (m *Manager) DeleteBrowseNodes(ctx context.Context, serviceID string, req corebridge.DeleteBrowseNodesRequest) (corebridge.DeleteBrowseNodesResponse, error) {
+	return m.serviceMgr.DeleteBrowseNodes(ctx, serviceID, req)
+}
+
+func folderDescriptorFromFS(folder fstypes.Folder) corebridge.FolderDescriptor {
+	return corebridge.FolderDescriptor{
+		ID:           folder.ServiceID,
+		ParentID:     folder.ParentId,
+		ParentPath:   folder.ParentPath,
+		DisplayName:  folder.DisplayName,
+		LocationPath: folder.LocationPath,
+		LastUpdated:  folder.LastUpdated,
+		DepthLevel:   folder.DepthLevel,
+		Type:         folder.Type,
+	}
 }

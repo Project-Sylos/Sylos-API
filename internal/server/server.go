@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"net"
 	"net/http"
 
 	"github.com/rs/zerolog"
@@ -29,8 +30,24 @@ func New(cfg Config) *Server {
 }
 
 func (s *Server) Start() error {
-	s.logger.Info().Str("addr", s.httpServer.Addr).Msg("HTTP server listening")
-	if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	return s.serve(nil)
+}
+
+// StartWhenReady begins serving and closes ready once the TCP listener accepts connections.
+func (s *Server) StartWhenReady(ready chan<- struct{}) error {
+	return s.serve(ready)
+}
+
+func (s *Server) serve(ready chan<- struct{}) error {
+	ln, err := net.Listen("tcp", s.httpServer.Addr)
+	if err != nil {
+		return err
+	}
+	if ready != nil {
+		close(ready)
+	}
+	s.logger.Info().Str("addr", ln.Addr().String()).Msg("HTTP server listening")
+	if err := s.httpServer.Serve(ln); err != nil && err != http.ErrServerClosed {
 		return err
 	}
 	return nil

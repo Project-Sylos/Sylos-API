@@ -16,9 +16,14 @@ type Config struct {
 	Environment string
 	HTTP        HTTPConfig
 	JWT         JWTConfig
+	Auth        AuthConfig
 	Runtime     RuntimeConfig
 	Services    ServicesConfig
 	Providers   ProvidersConfig
+}
+
+type AuthConfig struct {
+	BcryptCost int `mapstructure:"bcrypt_cost"`
 }
 
 type HTTPConfig struct {
@@ -47,8 +52,9 @@ func Load() (Config, error) {
 	}
 
 	v.SetDefault("environment", "development")
-	v.SetDefault("http.port", 8080)
-	v.SetDefault("jwt.access_token_ttl", "15m")
+	v.SetDefault("http.port", 8086)
+	v.SetDefault("jwt.access_token_ttl", "24h")
+	v.SetDefault("auth.bcrypt_cost", 12)
 	v.SetDefault("runtime.data_dir", "data")
 	v.SetDefault("runtime.migration_db_storage_dir", "data/migration-dbs")
 	v.SetDefault("runtime.log_level", "info")
@@ -56,7 +62,11 @@ func Load() (Config, error) {
 	v.SetDefault("runtime.default_max_retries", 3)
 	v.SetDefault("runtime.default_coordinator_lead", 4)
 
+	v.SetDefault("runtime.oauth_creds_dir", "creds")
+
 	_ = v.ReadInConfig() // optional: ignore not found errors
+
+	configFile := v.ConfigFileUsed()
 
 	cfg := Config{
 		Environment: v.GetString("environment"),
@@ -73,7 +83,14 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("failed to parse runtime config: %w", err)
 	}
 
-	if err := cfg.normalizeRuntime(); err != nil {
+	if err := v.UnmarshalKey("auth", &cfg.Auth); err != nil {
+		return Config{}, fmt.Errorf("failed to parse auth config: %w", err)
+	}
+	if cfg.Auth.BcryptCost <= 0 {
+		cfg.Auth.BcryptCost = 12
+	}
+
+	if err := cfg.normalizeRuntime(configFile); err != nil {
 		return Config{}, err
 	}
 
@@ -89,19 +106,14 @@ func Load() (Config, error) {
 	}
 	cfg.Providers.applyDefaults()
 
-	if cfg.JWT.Secret == "" {
-		cfg.JWT.Secret = generateEphemeralSecret()
-		cfg.JWT.Generated = true
-	}
-
 	if cfg.JWT.AccessTokenTTL <= 0 {
-		cfg.JWT.AccessTokenTTL = 15 * time.Minute
+		cfg.JWT.AccessTokenTTL = 24 * time.Hour
 	}
 
 	return cfg, nil
 }
 
-func (c *Config) normalizeRuntime() error {
+func (c *Config) normalizeRuntime(configFile string) error {
 	dataDir := c.Runtime.DataDir
 	if dataDir == "" {
 		dataDir = "data"
@@ -135,6 +147,22 @@ func (c *Config) normalizeRuntime() error {
 
 	c.Runtime.MigrationDBStorageDir = absMigrationDBDir
 
+	oauthCredsDir := c.Runtime.OAuthCredsDir
+	if oauthCredsDir == "" {
+		if configFile != "" {
+			oauthCredsDir = filepath.Join(filepath.Dir(configFile), "creds")
+		} else {
+			oauthCredsDir = "creds"
+		}
+	}
+
+	absOAuthCredsDir, err := filepath.Abs(oauthCredsDir)
+	if err != nil {
+		return fmt.Errorf("failed to determine absolute oauth creds dir: %w", err)
+	}
+
+	c.Runtime.OAuthCredsDir = absOAuthCredsDir
+
 	return nil
 }
 
@@ -150,6 +178,7 @@ func generateEphemeralSecret() string {
 type RuntimeConfig struct {
 	DataDir                string `mapstructure:"data_dir"`
 	MigrationDBStorageDir  string `mapstructure:"migration_db_storage_dir"`
+	OAuthCredsDir          string `mapstructure:"oauth_creds_dir"`
 	LogAddress             string `mapstructure:"log_address"`
 	LogLevel               string `mapstructure:"log_level"`
 	EnableLoggingTerminal  bool   `mapstructure:"enable_logging_terminal"`

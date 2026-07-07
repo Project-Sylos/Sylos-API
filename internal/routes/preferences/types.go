@@ -21,12 +21,11 @@ type DevPrefs struct {
 	ShowSpectraService bool `json:"showSpectraService"`
 }
 
-// getDefaultPreferences returns default preferences values.
 func getDefaultPreferences() Preferences {
 	return Preferences{
-		Theme:            "dark",
-		SidebarCollapsed: false,
-		PreSplashEnabled: true,
+		Theme:            "obsidian",
+		SidebarCollapsed: true,
+		PreSplashEnabled: false,
 		Tips: TipsPrefs{
 			Enabled:    true,
 			Categories: make(map[string]interface{}),
@@ -36,4 +35,17 @@ func getDefaultPreferences() Preferences {
 			ShowSpectraService: false,
 		},
 	}
+}
+
+func mergeWithDefaults(stored Preferences) Preferences {
+	defaults := getDefaultPreferences()
+
+	if stored.Theme == "" {
+		stored.Theme = defaults.Theme
+	}
+	if stored.Tips.Categories == nil {
+		stored.Tips.Categories = defaults.Tips.Categories
+	}
+
+	return stored
 }

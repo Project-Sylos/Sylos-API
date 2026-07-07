@@ -6,7 +6,6 @@ import (
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
-	"codeberg.org/Sylos/Sylos-API/internal/corebridge/metadata"
 )
 
 // getMigrationPhase maps the engine phase to a coarse API phase for locking/UX.
@@ -83,11 +82,10 @@ func (m *Manager) CheckPendingWork(ctx context.Context, migrationID string) (cor
 	}
 	retriesCount := len(srcPending) + len(dstPending)
 
-	metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
-	meta, err := metaMgr.GetMigrationMetadata(migrationID)
+	rec, err := m.getMigrationRecord(migrationID)
 	hasUnsavedChanges := false
 	if err == nil {
-		hasUnsavedChanges = meta.HasPathReviewChanges
+		hasUnsavedChanges = rec.HasPathReviewChanges
 	}
 
 	return corebridge.PendingWorkResponse{

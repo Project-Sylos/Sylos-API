@@ -51,3 +51,12 @@ func (m *Manager) Delete(connectionID string) {
 	defer m.mu.Unlock()
 	delete(m.records, connectionID)
 }
+
+func (m *Manager) ClearAll() {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.records = make(map[string]Record)
+}

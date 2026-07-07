@@ -2,19 +2,24 @@ package manager
 
 import (
 	"context"
+	"database/sql"
+	"errors"
+	"fmt"
 	"path/filepath"
 	"sync"
 	"time"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge/apidb"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/connections"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/database"
-	"codeberg.org/Sylos/Sylos-API/internal/corebridge/metadata"
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge/migrationaccess"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/roots"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/services"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/terminal"
 	"codeberg.org/Sylos/Sylos-API/pkg/config"
+	"codeberg.org/Sylos/Sylos-API/pkg/oauthcreds"
 	"github.com/rs/zerolog"
 )
 
@@ -28,11 +33,14 @@ type Manager struct {
 	engineMgr   *migration.MigrationManager
 	terminalMgr *terminal.Manager
 	bgTaskMgr   *corebridge.BackgroundTaskManager
+	apiDB       *apidb.DB
+	migAccess   *migrationaccess.Opener
 
 	mu              sync.RWMutex
 	runtimeByID     map[string]*runtimeMigration
 	progressByID    map[string]map[string]chan corebridge.ProgressEvent
 	progressCounter uint64
+	oauthCreds      oauthcreds.Config
 }
 
 type runtimeMigration struct {
@@ -46,7 +54,7 @@ type runtimeMigration struct {
 }
 
 // NewManager creates a new Manager implementing corebridge.Bridge.
-func NewManager(logger zerolog.Logger, cfg config.Config) (*Manager, error) {
+func NewManager(logger zerolog.Logger, cfg config.Config, apiDB *apidb.DB) (*Manager, error) {
 	serviceMgr := services.NewServiceManager()
 	if err := serviceMgr.LoadServices(cfg); err != nil {
 		return nil, err
@@ -70,11 +78,63 @@ func NewManager(logger zerolog.Logger, cfg config.Config) (*Manager, error) {
 		engineMgr:    engineMgr,
 		terminalMgr:  terminalMgr,
 		bgTaskMgr:    bgTaskMgr,
+		apiDB:        apiDB,
 		runtimeByID:  make(map[string]*runtimeMigration),
 		progressByID: make(map[string]map[string]chan corebridge.ProgressEvent),
 	}
+	if apiDB != nil {
+		mgr.migAccess = &migrationaccess.Opener{
+			APIDB:   apiDB,
+			Engine:  engineMgr,
+			DataDir: cfg.Runtime.DataDir,
+		}
+	}
 
 	return mgr, nil
+}
+
+func (m *Manager) SetOAuthCreds(creds oauthcreds.Config) {
+	m.oauthCreds = creds
+}
+
+func (m *Manager) oauthClientID(providerID string) string {
+	switch providerID {
+	case "google_drive":
+		if m.oauthCreds.GoogleDrive != nil {
+			return m.oauthCreds.GoogleDrive.ClientID
+		}
+	case "dropbox":
+		if m.oauthCreds.Dropbox != nil {
+			return m.oauthCreds.Dropbox.ClientID
+		}
+	}
+	return ""
+}
+
+func (m *Manager) oauthProviderCredentials(providerID string) (oauthcreds.ProviderCredentials, error) {
+	if m.apiDB != nil {
+		app, err := m.apiDB.GetProviderOAuthApp(providerID)
+		if err == nil && app.ClientID != "" {
+			return oauthcreds.ProviderCredentials{
+				ClientID:     app.ClientID,
+				ClientSecret: app.ClientSecret,
+			}, nil
+		}
+	}
+	switch providerID {
+	case "google_drive":
+		if m.oauthCreds.GoogleDrive == nil {
+			return oauthcreds.ProviderCredentials{}, fmt.Errorf("google oauth not configured: add credentials in Settings → Cloud providers")
+		}
+		return *m.oauthCreds.GoogleDrive, nil
+	case "dropbox":
+		if m.oauthCreds.Dropbox == nil {
+			return oauthcreds.ProviderCredentials{}, fmt.Errorf("dropbox oauth not configured: add credentials in Settings → Cloud providers")
+		}
+		return *m.oauthCreds.Dropbox, nil
+	default:
+		return oauthcreds.ProviderCredentials{}, fmt.Errorf("unsupported provider %q", providerID)
+	}
 }
 
 // migrationDirFor returns the absolute path to the folder for the given migration (e.g. dataDir/{id}).
@@ -85,38 +145,47 @@ func (m *Manager) migrationDirFor(migrationID string) (string, error) {
 
 // GetMigration returns the engine *Migration for the given ID, or ErrMigrationNotFound.
 // When using per-migration DBs, the engine expects the migration folder path (e.g. data/{id}) so it can open or create the DB there.
+// FS adapters are not rehydrated here; call ensureFSAdaptersRehydrated before traversal, copy, or live FS browse.
 func (m *Manager) GetMigration(_ context.Context, migrationID string) (*migration.Migration, error) {
-	migrationDir, err := m.migrationDirFor(migrationID)
+	return m.getEngineMigration(migrationID)
+}
+
+func (m *Manager) getEngineMigration(migrationID string) (*migration.Migration, error) {
+	if m.migAccess == nil {
+		return nil, fmt.Errorf("API database not configured")
+	}
+	return m.migAccess.OpenMigrationDB(context.Background(), migrationID, "")
+}
+
+func (m *Manager) upsertMigrationRecord(rec apidb.MigrationRecord) error {
+	if m.apiDB == nil {
+		return fmt.Errorf("API database not configured")
+	}
+	return m.apiDB.UpsertMigration(rec)
+}
+
+func (m *Manager) getMigrationRecord(migrationID string) (apidb.MigrationRecord, error) {
+	if m.apiDB == nil {
+		return apidb.MigrationRecord{}, fmt.Errorf("API database not configured")
+	}
+	rec, err := m.apiDB.GetMigration(migrationID)
 	if err != nil {
-		return nil, err
+		if errors.Is(err, sql.ErrNoRows) {
+			return apidb.MigrationRecord{ID: migrationID, Name: migrationID}, nil
+		}
+		return apidb.MigrationRecord{}, err
 	}
-	mig, err := m.engineMgr.GetMigration(migrationID, migrationDir)
-	if err != nil {
-		return nil, err
-	}
-	if mig == nil {
-		return nil, corebridge.ErrMigrationNotFound
-	}
-	if err := m.rehydrateFSAdaptersIfNeeded(migrationID, mig); err != nil {
-		m.logger.Warn().Err(err).Str("migration_id", migrationID).Msg("rehydrate FS adapters from migration DB")
-	}
-	return mig, nil
+	return rec, nil
 }
 
 // MarkPathReviewChanges updates metadata after exclusion or retry mark/unmark.
 func (m *Manager) MarkPathReviewChanges(_ context.Context, migrationID string, hasChanges bool) error {
-	metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
-	meta, err := metaMgr.GetMigrationMetadata(migrationID)
+	rec, err := m.getMigrationRecord(migrationID)
 	if err != nil {
-		meta = metadata.MigrationMetadata{
-			ID:                   migrationID,
-			Name:                 migrationID,
-			HasPathReviewChanges: hasChanges,
-		}
-	} else {
-		meta.HasPathReviewChanges = hasChanges
+		return err
 	}
-	return metaMgr.UpdateMigrationMetadata(meta)
+	rec.HasPathReviewChanges = hasChanges
+	return m.upsertMigrationRecord(rec)
 }
 
 // Ensure Manager implements corebridge.Bridge at compile time.

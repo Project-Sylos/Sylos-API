@@ -107,7 +107,7 @@ services:
 
 Important notes:
 
-- **JWT secret**: if omitted, the server generates a random ephemeral secret on startup (valid only for that process). Set `SYLOS_JWT_SECRET` or `jwt.secret` if you need stable tokens across restarts or multiple instances.
+- **JWT secret**: if omitted, the server generates a random secret on first startup and stores it in the encrypted `sylos.duckdb` `install_config` table. Set `SYLOS_JWT_SECRET` or `jwt.secret` in config to override.
 - **Local services**: users can only browse within the configured `root_path` (the service enforces prefix checks).
 - **Spectra services**: each entry identifies a config file and world; the API spawns a temporary Spectra SDK client per request.
 - **Runtime data**: migration databases and log buffers are written to `${runtime.data_dir}/${migrationID}.db`. The directory is created automatically.

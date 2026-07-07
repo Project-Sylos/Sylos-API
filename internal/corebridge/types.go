@@ -47,6 +47,48 @@ type ListChildrenRequest struct {
 	FoldersOnly  bool   // If true, only return folders and apply limit to folders only
 }
 
+type BrowseNodeRef struct {
+	ID   string `json:"id"`
+	Type string `json:"type"` // "file" | "folder"
+}
+
+type BrowseMutationRequest struct {
+	ServiceID    string
+	ConnectionID string
+	Role         string
+	RootType     string
+	DriveID      string
+	ContextID    string
+}
+
+type CreateBrowseFolderRequest struct {
+	ParentID     string `json:"parentId"`
+	Name         string `json:"name"`
+	ConnectionID string `json:"connectionId,omitempty"`
+	Role         string `json:"role,omitempty"`
+	RootType     string `json:"rootType,omitempty"`
+	DriveID      string `json:"driveId,omitempty"`
+}
+
+type DeleteBrowseNodesRequest struct {
+	Nodes        []BrowseNodeRef `json:"nodes"`
+	ConnectionID string          `json:"connectionId,omitempty"`
+	Role         string          `json:"role,omitempty"`
+	RootType     string          `json:"rootType,omitempty"`
+	DriveID      string          `json:"driveId,omitempty"`
+	ContextID    string          `json:"contextId,omitempty"`
+}
+
+type DeleteBrowseNodeError struct {
+	ID      string `json:"id"`
+	Message string `json:"message"`
+}
+
+type DeleteBrowseNodesResponse struct {
+	Deleted []string                `json:"deleted"`
+	Errors  []DeleteBrowseNodeError `json:"errors"`
+}
+
 // ListChildrenResponse wraps the list result with pagination metadata
 type ListChildrenResponse struct {
 	Folders    []fstypes.Folder `json:"folders"`
@@ -69,11 +111,12 @@ type PaginationInfo struct {
 type DriveInfo = fstypes.DriveInfo
 
 type ProviderDescriptor struct {
-	ID          string   `json:"id"`
-	DisplayName string   `json:"displayName"`
-	ServiceID   string   `json:"serviceId"`
-	AuthType    string   `json:"authType"`
-	Scopes      []string `json:"scopes,omitempty"`
+	ID            string   `json:"id"`
+	DisplayName   string   `json:"displayName"`
+	ServiceID     string   `json:"serviceId"`
+	AuthType      string   `json:"authType"`
+	Scopes        []string `json:"scopes,omitempty"`
+	OAuthClientID string   `json:"oauthClientId,omitempty"`
 }
 
 type ConnectionResponse struct {
@@ -88,6 +131,12 @@ type OAuthTokenRequest struct {
 	Scopes       []string `json:"scopes,omitempty"`
 	ClientID     string   `json:"client_id,omitempty"`
 	ClientSecret string   `json:"client_secret,omitempty"`
+}
+
+type OAuthExchangeRequest struct {
+	Code        string   `json:"code"`
+	RedirectURI string   `json:"redirect_uri"`
+	Scopes      []string `json:"scopes,omitempty"`
 }
 
 type ConnectionStatus struct {
@@ -505,16 +554,24 @@ type ListMigrationsRequest struct {
 
 // ListMigrationsResponse represents the response containing paginated migrations
 type ListMigrationsResponse struct {
-	Migrations []Status `json:"migrations"`
-	Total      int      `json:"total"`   // Total number of migrations
-	Offset     int      `json:"offset"`  // Current offset
-	Limit      int      `json:"limit"`   // Current limit
-	HasMore    bool     `json:"hasMore"` // True if there are more migrations
+	Migrations   []Status         `json:"migrations"`
+	Total        int              `json:"total"`   // Total number of migrations
+	Offset       int              `json:"offset"`  // Current offset
+	Limit        int              `json:"limit"`   // Current limit
+	HasMore      bool             `json:"hasMore"` // True if there are more migrations
+	Capabilities UserCapabilities `json:"capabilities"`
+}
+
+// UserCapabilities describes admin-only actions available to the current user.
+type UserCapabilities struct {
+	CleanSlate bool `json:"cleanSlate"`
 }
 
 type Bridge interface {
 	ListSources(ctx context.Context) ([]Source, error)
 	ListChildren(ctx context.Context, req ListChildrenRequest) (ListChildrenResponse, error)
+	CreateBrowseFolder(ctx context.Context, serviceID string, req CreateBrowseFolderRequest) (FolderDescriptor, error)
+	DeleteBrowseNodes(ctx context.Context, serviceID string, req DeleteBrowseNodesRequest) (DeleteBrowseNodesResponse, error)
 	ListDrives(ctx context.Context, serviceID string) ([]DriveInfo, error)
 	MountDrive(ctx context.Context, serviceID string, req MountDriveRequest) (DriveInfo, error)
 	SetRoot(ctx context.Context, req SetRootRequest) (SetRootResponse, error)

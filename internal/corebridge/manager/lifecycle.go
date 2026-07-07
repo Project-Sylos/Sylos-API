@@ -8,7 +8,7 @@ import (
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
-	"codeberg.org/Sylos/Sylos-API/internal/corebridge/metadata"
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge/apidb"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/roots"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/services"
 	fstypes "codeberg.org/Sylos/Sylos-FS/pkg/types"
@@ -18,6 +18,9 @@ func (m *Manager) StartMigration(ctx context.Context, req corebridge.StartMigrat
 	mig, err := m.ensureMigration(ctx, req.MigrationID)
 	if err != nil {
 		return corebridge.Migration{}, err
+	}
+	if err := m.ensureFSAdaptersRehydrated(mig.ID); err != nil {
+		return corebridge.Migration{}, fmt.Errorf("restore filesystem credentials: %w", err)
 	}
 
 	plan := m.rootsMgr.GetPlan(mig.ID)
@@ -169,6 +172,9 @@ func (m *Manager) ensureMigration(_ context.Context, requestedID string) (*migra
 		return nil, err
 	}
 	_ = os.MkdirAll(dir, 0755)
+	if _, err := m.apiDB.EnsureMigrationKey(created.ID); err != nil {
+		return nil, err
+	}
 	loaded, err := m.GetMigration(context.TODO(), created.ID)
 	if err != nil {
 		return nil, err
@@ -177,24 +183,23 @@ func (m *Manager) ensureMigration(_ context.Context, requestedID string) (*migra
 }
 
 func (m *Manager) updateMetadataForMigrationID(migrationID string) error {
-	metaMgr := metadata.NewManager(m.cfg.Runtime.DataDir)
-	meta, err := metaMgr.GetMigrationMetadata(migrationID)
+	rec, err := m.getMigrationRecord(migrationID)
 	plan := m.rootsMgr.GetPlan(migrationID)
 	dbPath := ""
 	if plan != nil {
 		dbPath = plan.DatabasePath
 	}
-	if err != nil {
-		meta = metadata.MigrationMetadata{
+	if err != nil || rec.ID == "" {
+		rec = apidb.MigrationRecord{
 			ID:             migrationID,
 			Name:           migrationID,
 			DatabasePath:   dbPath,
 			IsNewMigration: false,
 		}
-	} else if meta.DatabasePath == "" && dbPath != "" {
-		meta.DatabasePath = dbPath
+	} else if rec.DatabasePath == "" && dbPath != "" {
+		rec.DatabasePath = dbPath
 	}
-	return metaMgr.UpdateMigrationMetadata(meta)
+	return m.upsertMigrationRecord(rec)
 }
 
 func (m *Manager) ChangePhase(ctx context.Context, migrationID string, phase string, req corebridge.StartMigrationRequest) (corebridge.Migration, error) {
@@ -204,6 +209,9 @@ func (m *Manager) ChangePhase(ctx context.Context, migrationID string, phase str
 	mig, err := m.GetMigration(context.TODO(), migrationID)
 	if err != nil {
 		return corebridge.Migration{}, err
+	}
+	if err := m.ensureFSAdaptersRehydrated(migrationID); err != nil {
+		return corebridge.Migration{}, fmt.Errorf("restore filesystem credentials: %w", err)
 	}
 	plan := m.rootsMgr.GetPlan(migrationID)
 
