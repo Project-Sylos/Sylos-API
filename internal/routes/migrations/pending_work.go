@@ -12,8 +12,8 @@ import (
 	"codeberg.org/Sylos/Sylos-API/internal/routes/middleware"
 )
 
-// contains is a helper function to check if a string contains a substring (case-insensitive)
-func contains(s, substr string) bool {
+// containsInsensitive reports whether substr appears in s, case-insensitively.
+func containsInsensitive(s, substr string) bool {
 	return strings.Contains(strings.ToLower(s), strings.ToLower(substr))
 }
 
@@ -43,46 +43,24 @@ func (h handler) checkPendingWork(ctx *middleware.Context) {
 	ctx.Response(http.StatusOK, response)
 }
 
-// markNodeForRetryDiscovery handles POST /api/migrations/{migrationID}/node/{nodeID}/mark-retry-discovery
-func (h handler) markNodeForRetryDiscovery(ctx *middleware.Context) {
-	migrationID := chi.URLParam(ctx.Request(), "migrationID")
-	if migrationID == "" {
-		ctx.Error(http.StatusBadRequest, "migration id is required", nil)
-		return
-	}
-
-	nodeID := chi.URLParam(ctx.Request(), "nodeID")
-	if nodeID == "" {
-		ctx.Error(http.StatusBadRequest, "node id is required", nil)
-		return
-	}
-
-	// unescape node id
-	unescapedNodeID, err := url.QueryUnescape(nodeID)
-	if err != nil {
-		ctx.Error(http.StatusBadRequest, "failed to unescape node id", err)
+func (h handler) handleMarkNodeForRetry(ctx *middleware.Context, kind corebridge.RetryKind) {
+	migrationID, unescapedNodeID, ok := h.loadMigrationNode(ctx)
+	if !ok {
 		return
 	}
 
 	mig, err := h.mgr.GetMigration(ctx.Request().Context(), migrationID)
 	if err != nil {
-		if errors.Is(err, corebridge.ErrMigrationNotFound) {
-			ctx.Error(http.StatusNotFound, "migration not found", err)
-			return
-		}
-		if errors.Is(err, corebridge.ErrDatabaseNotAvailable) {
-			ctx.Error(http.StatusServiceUnavailable, "database not available", err)
-			return
-		}
-		ctx.Error(http.StatusInternalServerError, "failed to get migration", err)
+		h.writeMigrationLoadError(ctx, err)
 		return
 	}
-	result, err := corebridge.MarkNodesForRetryDiscovery(mig, corebridge.MarkRetryRequest{
+
+	result, err := corebridge.MarkNodesForRetry(mig, kind, corebridge.MarkRetryRequest{
 		NodeIDs: []string{unescapedNodeID},
 	})
 	if err != nil {
 		errMsg := err.Error()
-		if contains(errMsg, "not found") || contains(errMsg, "not in failed status") {
+		if isMarkRetryBenignError(kind, errMsg) {
 			ctx.Response(http.StatusOK, &corebridge.MarkRetryResponse{
 				Success: false,
 				Error:   errMsg,
@@ -90,7 +68,7 @@ func (h handler) markNodeForRetryDiscovery(ctx *middleware.Context) {
 			})
 			return
 		}
-		ctx.Error(http.StatusInternalServerError, "failed to mark node for discovery retry", err)
+		ctx.Error(http.StatusInternalServerError, markRetryErrorLabel(kind), err)
 		return
 	}
 	if result.Success {
@@ -99,46 +77,22 @@ func (h handler) markNodeForRetryDiscovery(ctx *middleware.Context) {
 	ctx.Response(http.StatusOK, result)
 }
 
-// markNodeForRetryCopy handles POST /api/migrations/{migrationID}/node/{nodeID}/mark-retry-copy
-func (h handler) markNodeForRetryCopy(ctx *middleware.Context) {
-	migrationID := chi.URLParam(ctx.Request(), "migrationID")
-	if migrationID == "" {
-		ctx.Error(http.StatusBadRequest, "migration id is required", nil)
-		return
-	}
-
-	nodeID := chi.URLParam(ctx.Request(), "nodeID")
-	if nodeID == "" {
-		ctx.Error(http.StatusBadRequest, "node id is required", nil)
-		return
-	}
-
-	// unescape node id
-	unescapedNodeID, err := url.QueryUnescape(nodeID)
-	if err != nil {
-		ctx.Error(http.StatusBadRequest, "failed to unescape node id", err)
+func (h handler) handleUnmarkNodeForRetry(ctx *middleware.Context, kind corebridge.RetryKind) {
+	migrationID, unescapedNodeID, ok := h.loadMigrationNode(ctx)
+	if !ok {
 		return
 	}
 
 	mig, err := h.mgr.GetMigration(ctx.Request().Context(), migrationID)
 	if err != nil {
-		if errors.Is(err, corebridge.ErrMigrationNotFound) {
-			ctx.Error(http.StatusNotFound, "migration not found", err)
-			return
-		}
-		if errors.Is(err, corebridge.ErrDatabaseNotAvailable) {
-			ctx.Error(http.StatusServiceUnavailable, "database not available", err)
-			return
-		}
-		ctx.Error(http.StatusInternalServerError, "failed to get migration", err)
+		h.writeMigrationLoadError(ctx, err)
 		return
 	}
-	result, err := corebridge.MarkNodesForRetryCopy(mig, corebridge.MarkRetryRequest{
-		NodeIDs: []string{unescapedNodeID},
-	})
+
+	result, err := corebridge.UnmarkNodeForRetry(mig, kind, unescapedNodeID)
 	if err != nil {
 		errMsg := err.Error()
-		if contains(errMsg, "not found") || contains(errMsg, "not in failed status") || contains(errMsg, "copy retry only applies to src nodes") {
+		if isUnmarkRetryBenignError(kind, errMsg) {
 			ctx.Response(http.StatusOK, &corebridge.MarkRetryResponse{
 				Success: false,
 				Error:   errMsg,
@@ -146,7 +100,7 @@ func (h handler) markNodeForRetryCopy(ctx *middleware.Context) {
 			})
 			return
 		}
-		ctx.Error(http.StatusInternalServerError, "failed to mark node for copy retry", err)
+		ctx.Error(http.StatusInternalServerError, unmarkRetryErrorLabel(kind), err)
 		return
 	}
 	if result.Success {
@@ -155,110 +109,64 @@ func (h handler) markNodeForRetryCopy(ctx *middleware.Context) {
 	ctx.Response(http.StatusOK, result)
 }
 
-// unmarkNodeForRetryDiscovery handles POST /api/migrations/{migrationID}/node/{nodeID}/unmark-retry-discovery
-func (h handler) unmarkNodeForRetryDiscovery(ctx *middleware.Context) {
-	migrationID := chi.URLParam(ctx.Request(), "migrationID")
+func (h handler) loadMigrationNode(ctx *middleware.Context) (migrationID, unescapedNodeID string, ok bool) {
+	migrationID = chi.URLParam(ctx.Request(), "migrationID")
 	if migrationID == "" {
 		ctx.Error(http.StatusBadRequest, "migration id is required", nil)
-		return
+		return "", "", false
 	}
 
 	nodeID := chi.URLParam(ctx.Request(), "nodeID")
 	if nodeID == "" {
 		ctx.Error(http.StatusBadRequest, "node id is required", nil)
-		return
+		return "", "", false
 	}
 
-	// unescape node id
 	unescapedNodeID, err := url.QueryUnescape(nodeID)
 	if err != nil {
 		ctx.Error(http.StatusBadRequest, "failed to unescape node id", err)
-		return
+		return "", "", false
 	}
 
-	mig, err := h.mgr.GetMigration(ctx.Request().Context(), migrationID)
-	if err != nil {
-		if errors.Is(err, corebridge.ErrMigrationNotFound) {
-			ctx.Error(http.StatusNotFound, "migration not found", err)
-			return
-		}
-		if errors.Is(err, corebridge.ErrDatabaseNotAvailable) {
-			ctx.Error(http.StatusServiceUnavailable, "database not available", err)
-			return
-		}
-		ctx.Error(http.StatusInternalServerError, "failed to get migration", err)
-		return
-	}
-	result, err := corebridge.UnmarkNodeForRetryDiscovery(mig, unescapedNodeID)
-	if err != nil {
-		errMsg := err.Error()
-		if contains(errMsg, "not found") || contains(errMsg, "not in pending status") {
-			ctx.Response(http.StatusOK, &corebridge.MarkRetryResponse{
-				Success: false,
-				Error:   errMsg,
-				Deltas:  map[string]int64{},
-			})
-			return
-		}
-		ctx.Error(http.StatusInternalServerError, "failed to unmark node for discovery retry", err)
-		return
-	}
-	if result.Success {
-		_ = h.mgr.MarkPathReviewChanges(ctx.Request().Context(), migrationID, true)
-	}
-	ctx.Response(http.StatusOK, result)
+	return migrationID, unescapedNodeID, true
 }
 
-// unmarkNodeForRetryCopy handles POST /api/migrations/{migrationID}/node/{nodeID}/unmark-retry-copy
-func (h handler) unmarkNodeForRetryCopy(ctx *middleware.Context) {
-	migrationID := chi.URLParam(ctx.Request(), "migrationID")
-	if migrationID == "" {
-		ctx.Error(http.StatusBadRequest, "migration id is required", nil)
+func (h handler) writeMigrationLoadError(ctx *middleware.Context, err error) {
+	if errors.Is(err, corebridge.ErrMigrationNotFound) {
+		ctx.Error(http.StatusNotFound, "migration not found", err)
 		return
 	}
+	if errors.Is(err, corebridge.ErrDatabaseNotAvailable) {
+		ctx.Error(http.StatusServiceUnavailable, "database not available", err)
+		return
+	}
+	ctx.Error(http.StatusInternalServerError, "failed to get migration", err)
+}
 
-	nodeID := chi.URLParam(ctx.Request(), "nodeID")
-	if nodeID == "" {
-		ctx.Error(http.StatusBadRequest, "node id is required", nil)
-		return
+func isMarkRetryBenignError(kind corebridge.RetryKind, errMsg string) bool {
+	if containsInsensitive(errMsg, "not found") || containsInsensitive(errMsg, "not in failed status") {
+		return true
 	}
+	return kind == corebridge.RetryKindCopy && containsInsensitive(errMsg, "copy retry only applies to src nodes")
+}
 
-	// unescape node id
-	unescapedNodeID, err := url.QueryUnescape(nodeID)
-	if err != nil {
-		ctx.Error(http.StatusBadRequest, "failed to unescape node id", err)
-		return
+func isUnmarkRetryBenignError(kind corebridge.RetryKind, errMsg string) bool {
+	if containsInsensitive(errMsg, "not found") || containsInsensitive(errMsg, "not in pending status") {
+		return true
 	}
+	return kind == corebridge.RetryKindCopy && containsInsensitive(errMsg, "copy retry only applies to src nodes")
+}
 
-	mig, err := h.mgr.GetMigration(ctx.Request().Context(), migrationID)
-	if err != nil {
-		if errors.Is(err, corebridge.ErrMigrationNotFound) {
-			ctx.Error(http.StatusNotFound, "migration not found", err)
-			return
-		}
-		if errors.Is(err, corebridge.ErrDatabaseNotAvailable) {
-			ctx.Error(http.StatusServiceUnavailable, "database not available", err)
-			return
-		}
-		ctx.Error(http.StatusInternalServerError, "failed to get migration", err)
-		return
+func markRetryErrorLabel(kind corebridge.RetryKind) string {
+	if kind == corebridge.RetryKindCopy {
+		return "failed to mark node for copy retry"
 	}
-	result, err := corebridge.UnmarkNodeForRetryCopy(mig, unescapedNodeID)
-	if err != nil {
-		errMsg := err.Error()
-		if contains(errMsg, "not found") || contains(errMsg, "not in pending status") || contains(errMsg, "copy retry only applies to src nodes") {
-			ctx.Response(http.StatusOK, &corebridge.MarkRetryResponse{
-				Success: false,
-				Error:   errMsg,
-				Deltas:  map[string]int64{},
-			})
-			return
-		}
-		ctx.Error(http.StatusInternalServerError, "failed to unmark node for copy retry", err)
-		return
+	return "failed to mark node for discovery retry"
+}
+
+func unmarkRetryErrorLabel(kind corebridge.RetryKind) string {
+	if kind == corebridge.RetryKindCopy {
+		return "failed to unmark node for copy retry"
 	}
-	if result.Success {
-		_ = h.mgr.MarkPathReviewChanges(ctx.Request().Context(), migrationID, true)
-	}
-	ctx.Response(http.StatusOK, result)
+	return "failed to unmark node for discovery retry"
 }

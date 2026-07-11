@@ -62,7 +62,7 @@ func UploadMigrationDB(ctx context.Context, logger zerolog.Logger, dataDir, migr
 		}, nil
 	}
 
-	migrationDir := GetMigrationDir(dataDir, migrationID)
+	migrationDir := filepath.Join(dataDir, migrationID)
 	dbPath := filepath.Join(migrationDir, migrationID+".db")
 
 	if _, err := os.Stat(dbPath); err == nil {
@@ -113,7 +113,7 @@ func UploadMigrationYAML(ctx context.Context, logger zerolog.Logger, dataDir, mi
 		}, nil
 	}
 
-	migrationDir := GetMigrationDir(dataDir, migrationID)
+	migrationDir := filepath.Join(dataDir, migrationID)
 	yamlPath := filepath.Join(migrationDir, migrationID+".yaml")
 
 	if _, err := os.Stat(yamlPath); err == nil {
@@ -164,7 +164,7 @@ func UploadMigrationData(ctx context.Context, logger zerolog.Logger, dataDir, mi
 		}, nil
 	}
 
-	migrationDir := GetMigrationDir(dataDir, migrationID)
+	migrationDir := filepath.Join(dataDir, migrationID)
 
 	if info, err := os.Stat(migrationDir); err == nil && info.IsDir() {
 		entries, err := os.ReadDir(migrationDir)

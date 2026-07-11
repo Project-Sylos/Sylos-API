@@ -64,7 +64,7 @@ func (m *Manager) TriggerRetrySweep(ctx context.Context, migrationID string, con
 
 	opts := m.buildRetrySweepOptions(config)
 
-	taskID := m.bgTaskMgr.StartTask(migrationID, corebridge.BackgroundTaskTypeRetrySweep)
+	taskID := m.bgTaskMgr.StartTaskWithPath(migrationID, corebridge.BackgroundTaskTypeRetrySweep, "")
 	go func() {
 		_, runErr := mig.RunRetrySweep(runCfg, opts)
 		doneAt := time.Now().UTC()

@@ -20,6 +20,8 @@ func (m *Manager) preparePathReviewContext(_ context.Context, migrationID string
 	reviewPhase := "traversal"
 	if mig.Phase() == migration.PhaseCopying || mig.Phase() == migration.PhaseCopySuspended || mig.Phase() == migration.PhaseCopyReview {
 		reviewPhase = "copy"
+	} else if mig.Phase() == migration.PhaseDeleting || mig.Phase() == migration.PhaseDeleteSuspended || mig.Phase() == migration.PhaseDeleteReview {
+		reviewPhase = "delete"
 	}
 
 	return &PathReviewContext{

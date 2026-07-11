@@ -45,4 +45,8 @@ providers:
       - account_info.read
       - sharing.read
       - team_data.team_space
+  sftp:
+    enabled: true
+    display_name: "SFTP"
+    service_id: sftp
 

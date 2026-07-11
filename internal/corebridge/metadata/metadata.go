@@ -41,17 +41,12 @@ func NewManager(dataDir string) *Manager {
 	}
 }
 
-// metadataFilePath returns the path to the migrations.yaml file
-func (m *Manager) metadataFilePath() string {
-	return filepath.Join(m.dataDir, "migrations.yaml")
-}
-
 // LoadAllMetadata loads all migration metadata from the YAML file
 func (m *Manager) LoadAllMetadata() (MigrationsMetadata, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	filePath := m.metadataFilePath()
+	filePath := filepath.Join(m.dataDir, "migrations.yaml")
 
 	// If file doesn't exist, return empty structure
 	if _, err := os.Stat(filePath); os.IsNotExist(err) {
@@ -88,7 +83,7 @@ func (m *Manager) SaveAllMetadata(meta MigrationsMetadata) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	filePath := m.metadataFilePath()
+	filePath := filepath.Join(m.dataDir, "migrations.yaml")
 
 	// Ensure directory exists
 	if err := os.MkdirAll(filepath.Dir(filePath), 0o755); err != nil {

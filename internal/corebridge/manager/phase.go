@@ -23,6 +23,8 @@ func (m *Manager) getMigrationPhase(migrationID string) (string, error) {
 		return "traversal", nil
 	case migration.PhaseCopying, migration.PhaseCopySuspended, migration.PhaseCopyReview:
 		return "copy", nil
+	case migration.PhaseDeleting, migration.PhaseDeleteSuspended, migration.PhaseDeleteReview:
+		return "delete", nil
 	default:
 		return "unknown", nil
 	}
@@ -37,7 +39,7 @@ func (m *Manager) checkPhaseLock(migrationID string, operation string) error {
 			if err != nil {
 				return fmt.Errorf("failed to determine migration phase: %w", err)
 			}
-			if phase == "traversal" || phase == "copy" {
+			if phase == "traversal" || phase == "copy" || phase == "delete" {
 				return fmt.Errorf("root selection is locked: migration is in %s phase", phase)
 			}
 		}
@@ -48,11 +50,11 @@ func (m *Manager) checkPhaseLock(migrationID string, operation string) error {
 			return fmt.Errorf("failed to determine migration phase: %w", err)
 		}
 		if operation == "exclude" || operation == "unexclude" {
-			if phase == "copy" {
-				return fmt.Errorf("exclusion operations are locked: migration is in copy phase (exclusion only applies to traversal)")
+			if phase == "copy" || phase == "delete" {
+				return fmt.Errorf("exclusion operations are locked: migration is in %s phase (exclusion only applies to traversal)", phase)
 			}
-		} else if phase == "copy" {
-			return fmt.Errorf("traversal operations are locked: migration is in copy phase")
+		} else if phase == "copy" || phase == "delete" {
+			return fmt.Errorf("traversal operations are locked: migration is in %s phase", phase)
 		}
 	}
 

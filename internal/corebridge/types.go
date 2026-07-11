@@ -139,6 +139,26 @@ type OAuthExchangeRequest struct {
 	Scopes      []string `json:"scopes,omitempty"`
 }
 
+type SFTPCredentialsRequest struct {
+	Host                   string `json:"host"`
+	Port                   int    `json:"port,omitempty"`
+	Username               string `json:"username"`
+	Password               string `json:"password,omitempty"`
+	PrivateKey             string `json:"privateKey,omitempty"`
+	KeyPassphrase          string `json:"keyPassphrase,omitempty"`
+	HostKey string `json:"hostKey,omitempty"`
+}
+
+type SFTPHostKeyProbeRequest struct {
+	Host string `json:"host"`
+	Port int    `json:"port,omitempty"`
+}
+
+type SFTPHostKeyProbeResponse struct {
+	HostKey     string `json:"hostKey"`
+	Fingerprint string `json:"fingerprint"`
+}
+
 type ConnectionStatus struct {
 	ConnectionID string    `json:"connectionId"`
 	ProviderID   string    `json:"providerId"`
@@ -220,6 +240,7 @@ type SetRootResponse struct {
 
 type Migration struct {
 	ID            string    `json:"id"`
+	Name          string    `json:"name,omitempty"` // Human-friendly name; defaults to "{source} -> {destination}"
 	SourceID      string    `json:"sourceId"`
 	DestinationID string    `json:"destinationId"`
 	StartedAt     time.Time `json:"startedAt"`
@@ -227,17 +248,42 @@ type Migration struct {
 	Success       bool      `json:"success,omitempty"` // Indicates if operation succeeded
 }
 
+// RootInfo describes a persisted source/destination root so the UI can rehydrate the
+// setup screen (service, connection, and the selected folder) without relying on sessionStorage.
+type RootInfo struct {
+	ServiceID    string `json:"serviceId"`
+	ServiceName  string `json:"serviceName,omitempty"`
+	ServiceType  string `json:"serviceType,omitempty"`
+	ConnectionID string `json:"connectionId,omitempty"`
+	Name         string `json:"name,omitempty"`         // Folder display name (e.g. drive label or folder name)
+	LocationPath string `json:"locationPath,omitempty"` // Root-relative path ("/" for a drive/service root)
+	NativePath   string `json:"nativePath,omitempty"`   // OS-native absolute path/id (e.g. "C:\\Users\\Logan", "/mnt/2tb-ssd")
+	Type         string `json:"type,omitempty"`
+}
+
+// RenameMigrationRequest sets a migration's display name.
+type RenameMigrationRequest struct {
+	Name string `json:"name"`
+}
+
 type Status struct {
 	Migration
 	CompletedAt *time.Time  `json:"completedAt,omitempty"`
 	Error       string      `json:"error,omitempty"`
 	Result      *ResultView `json:"result,omitempty"`
+	// SourceRoot/DestinationRoot are the persisted roots (service + folder), used to rehydrate setup.
+	SourceRoot      *RootInfo `json:"sourceRoot,omitempty"`
+	DestinationRoot *RootInfo `json:"destinationRoot,omitempty"`
 	// Live is true when the engine migration has an active run (traversal, copy, sweep, etc.).
 	Live bool `json:"live,omitempty"`
 	// SoftSuspendRequested is true after Stop() accepted a soft suspend; poll until phase is traversal-suspended or copy-suspended and live is false.
 	SoftSuspendRequested bool `json:"softSuspendRequested,omitempty"`
 	// Stopped is set only by StopMigration: true if the engine considered a run active when Stop() was called.
 	Stopped bool `json:"stopped,omitempty"`
+	// AlreadyStopped is true when StopMigration was called but the migration was not in a stoppable live phase.
+	AlreadyStopped bool `json:"alreadyStopped,omitempty"`
+	// PossibleStall is true when a queue watchdog recently detected no progress while the migration was live.
+	PossibleStall bool `json:"possibleStall,omitempty"`
 	// Status field in Migration is the lifecycle phase (engine lowercase-with-hyphens, e.g. traversal-in-progress, traversal-suspended).
 }
 
@@ -321,6 +367,7 @@ type ExternalQueueMetrics struct {
 	TotalPending int    `json:"total_pending,omitempty"` // Total pending from DB (copy phase)
 	TotalFailed  int    `json:"total_failed,omitempty"`  // Total failed from DB (copy phase)
 	Name         string `json:"name,omitempty"`          // Queue name ("copy", "src-traversal", etc.)
+	PossibleStall bool  `json:"possible_stall,omitempty"`
 }
 
 // QueueMetricsResponse represents all queue metrics for a migration
@@ -331,6 +378,8 @@ type QueueMetricsResponse struct {
 	SrcTraversal *ExternalQueueMetrics `json:"srcTraversal,omitempty"`
 	DstTraversal *ExternalQueueMetrics `json:"dstTraversal,omitempty"`
 	Copy         *ExternalQueueMetrics `json:"copy,omitempty"`
+	Delete       *ExternalQueueMetrics `json:"delete,omitempty"`
+	PossibleStall bool                 `json:"possibleStall,omitempty"`
 }
 
 // LogEntry represents a single log entry from the database
@@ -415,6 +464,7 @@ type PathNodeItem struct {
 	Size            int64  `json:"size,omitempty"`
 	TraversalStatus string `json:"traversalStatus"`
 	CopyStatus      string `json:"copyStatus,omitempty"`
+	DeleteStatus    string `json:"deleteStatus,omitempty"`
 	FailureLogID    string `json:"failureLogId,omitempty"`
 	FailureMessage  string `json:"failureMessage,omitempty"`
 }
@@ -430,12 +480,29 @@ type FileSizeStats struct {
 	Dst int64 `json:"dst"`
 }
 
+// DeleteSummaryResponse is returned by GET /migrations/{id}/delete-summary for the confirmation modal.
+type DeleteSummaryResponse struct {
+	SourceRootPath string `json:"sourceRootPath"`
+	SourceHost     string `json:"sourceHost,omitempty"`
+	Pending        int64  `json:"pending"`
+	Failed         int64  `json:"failed"`
+	Deleted        int64  `json:"deleted"`
+}
+
+// PrepareSourceCleanupRequest selects SRC nodes to remove from source after copy.
+// Pass nodeIds to keep pending, or deselectedNodeIds to skip those (default: all successful copies are selected).
+type PrepareSourceCleanupRequest struct {
+	NodeIDs           []string `json:"nodeIds,omitempty"`
+	DeselectedNodeIDs []string `json:"deselectedNodeIds,omitempty"`
+}
+
 // PathReviewStats is the phase-aware path review stats from the engine (GetPathReviewStats). Returned as JSON for GET /migrations/{id}/stats.
 type PathReviewStats struct {
 	PendingCount        int           `json:"pendingCount"`
 	FailedCount         int           `json:"failedCount"`
 	ExcludedCount       int           `json:"excludedCount"`
 	PendingRetriesCount int           `json:"pendingRetriesCount"`
+	SuccessfulCount     int           `json:"successfulCount"`
 	FoldersCount        int           `json:"foldersCount"`
 	FilesCount          int           `json:"filesCount"`
 	FoldersRatio        float64      `json:"foldersRatio"`
@@ -593,6 +660,7 @@ type Bridge interface {
 	GetRunningBackgroundTasks(ctx context.Context, migrationID string) ([]BackgroundTask, error)
 	GetBackgroundTask(ctx context.Context, migrationID, taskID string) (*BackgroundTask, error)
 	TriggerRetrySweep(ctx context.Context, migrationID string, config SweepConfigRequest) (SweepResponse, error)
+	GetDeleteSummary(ctx context.Context, migrationID string) (DeleteSummaryResponse, error)
 }
 
 const (

@@ -17,6 +17,8 @@ const (
 	BackgroundTaskTypeUnexclusionPropagate BackgroundTaskType = "unexclusion_propagate"
 	BackgroundTaskTypeExclusionSweep       BackgroundTaskType = "exclusion_sweep"
 	BackgroundTaskTypeRetrySweep           BackgroundTaskType = "retry_sweep"
+	BackgroundTaskTypeCopyResume           BackgroundTaskType = "copy_resume"
+	BackgroundTaskTypeCopyRetry            BackgroundTaskType = "copy_retry"
 	BackgroundTaskTypeRetryAll             BackgroundTaskType = "retry_all"
 )
 
@@ -56,12 +58,7 @@ func NewBackgroundTaskManager(logger zerolog.Logger) *BackgroundTaskManager {
 	}
 }
 
-// StartTask starts a new background task
-func (m *BackgroundTaskManager) StartTask(migrationID string, taskType BackgroundTaskType) string {
-	return m.StartTaskWithPath(migrationID, taskType, "")
-}
-
-// StartTaskWithPath starts a new background task with an associated path
+// StartTaskWithPath starts a new background task with an associated path.
 func (m *BackgroundTaskManager) StartTaskWithPath(migrationID string, taskType BackgroundTaskType, path string) string {
 	m.mu.Lock()
 	defer m.mu.Unlock()

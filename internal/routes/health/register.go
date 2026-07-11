@@ -6,13 +6,8 @@ import (
 	"github.com/go-chi/chi/v5"
 )
 
-// RegisterPublic wires unauthenticated health checks (e.g., GET /health).
-func RegisterPublic(router chi.Router) {
-	router.Get("/health", handleHealth)
-}
-
-// RegisterProtected wires authenticated health checks under /api.
-func RegisterProtected(router chi.Router) {
+// Register wires GET /health on the given router.
+func Register(router chi.Router) {
 	router.Get("/health", handleHealth)
 }
 

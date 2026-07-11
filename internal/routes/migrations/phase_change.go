@@ -26,12 +26,12 @@ func (h handler) changePhase(ctx *middleware.Context, payload PhaseChangeRequest
 
 	// Validate phase
 	if payload.Phase == "" {
-		ctx.Error(http.StatusBadRequest, "phase is required (must be 'traversal' or 'copy')", nil)
+		ctx.Error(http.StatusBadRequest, "phase is required (must be 'traversal', 'copy', or 'delete')", nil)
 		return
 	}
 
-	if payload.Phase != "traversal" && payload.Phase != "copy" {
-		ctx.Error(http.StatusBadRequest, "invalid phase (must be 'traversal' or 'copy')", nil)
+	if payload.Phase != "traversal" && payload.Phase != "copy" && payload.Phase != "delete" {
+		ctx.Error(http.StatusBadRequest, "invalid phase (must be 'traversal', 'copy', or 'delete')", nil)
 		return
 	}
 

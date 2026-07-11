@@ -14,6 +14,7 @@ import (
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/apidb"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/masterkey"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/manager"
+	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
 	"codeberg.org/Sylos/Sylos-API/internal/routes"
 	"codeberg.org/Sylos/Sylos-API/internal/routes/middleware"
 	"codeberg.org/Sylos/Sylos-API/internal/server"
@@ -97,6 +98,10 @@ func Run(ctx context.Context, opts Options) error {
 	}
 	coreBridge.SetOAuthCreds(oauthCfg)
 
+	monitorCtx, monitorCancel := context.WithCancel(context.Background())
+	defer monitorCancel()
+	coreBridge.StartOAuthHealthMonitor(monitorCtx)
+
 	authManager, err := auth.NewManager(auth.Config{
 		Secret:         cfg.JWT.Secret,
 		TTL:            cfg.JWT.AccessTokenTTL,
@@ -147,6 +152,10 @@ func Run(ctx context.Context, opts Options) error {
 	case <-ctx.Done():
 		log.Info().Msg("shutdown signal received")
 	}
+
+	migrationShutdownCtx, migrationShutdownCancel := context.WithTimeout(context.Background(), migration.DefaultStopGracePeriod+5*time.Second)
+	coreBridge.Shutdown(migrationShutdownCtx)
+	migrationShutdownCancel()
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

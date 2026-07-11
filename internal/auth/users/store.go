@@ -31,21 +31,19 @@ const (
 )
 
 type User struct {
-	ID        string    `json:"id"`
-	Username  string    `json:"username"`
-	Role      Role      `json:"role"`
-	CreatedAt time.Time `json:"createdAt"`
-	Disabled  bool      `json:"disabled"`
+	ID           string     `json:"id"`
+	Username     string     `json:"username"`
+	Role         Role       `json:"role"`
+	CreatedAt    time.Time  `json:"createdAt"`
+	Disabled     bool       `json:"disabled"`
+	LastLoginAt  *time.Time `json:"lastLoginAt,omitempty"`
+	LastLogoutAt *time.Time `json:"lastLogoutAt,omitempty"`
 }
 
 type Store struct {
 	db         *sql.DB
 	bcryptCost int
 	ownsDB     bool
-}
-
-func Open(path string, bcryptCost int) (*Store, error) {
-	return OpenConn(nil, path, bcryptCost)
 }
 
 // OpenConn opens a user store on an existing connection or a new plaintext file at path.
@@ -110,7 +108,48 @@ ON users (lower(username));`)
 			return err
 		}
 	}
-	return nil
+	if _, err := s.db.Exec(`ALTER TABLE users ADD COLUMN recovery_code_hash VARCHAR`); err != nil {
+		if !strings.Contains(strings.ToLower(err.Error()), "already exists") {
+			return err
+		}
+	}
+	if _, err := s.db.Exec(`ALTER TABLE users ADD COLUMN recovery_reissue_on_login BOOLEAN`); err != nil {
+		if !strings.Contains(strings.ToLower(err.Error()), "already exists") {
+			return err
+		}
+	}
+	if _, err := s.db.Exec(`ALTER TABLE users ADD COLUMN recovery_ack_pending BOOLEAN`); err != nil {
+		if !strings.Contains(strings.ToLower(err.Error()), "already exists") {
+			return err
+		}
+	}
+	_, _ = s.db.Exec(`UPDATE users SET recovery_reissue_on_login = false WHERE recovery_reissue_on_login IS NULL`)
+	_, _ = s.db.Exec(`UPDATE users SET recovery_ack_pending = false WHERE recovery_ack_pending IS NULL`)
+
+	if _, err := s.db.Exec(`ALTER TABLE users ADD COLUMN last_login_at VARCHAR`); err != nil {
+		if !strings.Contains(strings.ToLower(err.Error()), "already exists") {
+			return err
+		}
+	}
+	if _, err := s.db.Exec(`ALTER TABLE users ADD COLUMN last_logout_at VARCHAR`); err != nil {
+		if !strings.Contains(strings.ToLower(err.Error()), "already exists") {
+			return err
+		}
+	}
+
+	if _, err := s.db.Exec(`
+CREATE TABLE IF NOT EXISTS user_audit_events (
+  id VARCHAR PRIMARY KEY,
+  occurred_at VARCHAR NOT NULL,
+  actor_user_id VARCHAR,
+  target_user_id VARCHAR,
+  action VARCHAR NOT NULL,
+  metadata VARCHAR
+);`); err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`CREATE INDEX IF NOT EXISTS user_audit_events_occurred_at ON user_audit_events (occurred_at)`)
+	return err
 }
 
 func (s *Store) Count() (int, error) {
@@ -183,12 +222,17 @@ func (s *Store) Authenticate(username, password string) (User, error) {
 }
 
 func (s *Store) GetByID(id string) (User, error) {
-	row := s.db.QueryRow(`SELECT id, username, role, created_at, disabled FROM users WHERE id = ?`, id)
+	row := s.db.QueryRow(
+		`SELECT id, username, role, created_at, disabled, last_login_at, last_logout_at FROM users WHERE id = ?`,
+		id,
+	)
 	return scanUser(row)
 }
 
 func (s *Store) List() ([]User, error) {
-	rows, err := s.db.Query(`SELECT id, username, role, created_at, disabled FROM users ORDER BY lower(username)`)
+	rows, err := s.db.Query(
+		`SELECT id, username, role, created_at, disabled, last_login_at, last_logout_at FROM users ORDER BY lower(username)`,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -265,6 +309,27 @@ func (s *Store) Delete(id string) error {
 	return nil
 }
 
+// DeleteMany deletes users by id, skipping actorID and applying the same last-admin rules as Delete.
+func (s *Store) DeleteMany(ids []string, actorID string) (deleted []string, err error) {
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" || id == actorID {
+			continue
+		}
+		if delErr := s.Delete(id); delErr != nil {
+			if err == nil {
+				err = delErr
+			}
+			continue
+		}
+		deleted = append(deleted, id)
+	}
+	if len(deleted) == 0 && err != nil {
+		return nil, err
+	}
+	return deleted, err
+}
+
 func (s *Store) ensureNotLastAdmin(id string) error {
 	var count int
 	err := s.db.QueryRow(
@@ -282,7 +347,7 @@ func (s *Store) ensureNotLastAdmin(id string) error {
 
 func (s *Store) findByUsername(username string) (User, string, error) {
 	row := s.db.QueryRow(
-		`SELECT id, username, role, created_at, disabled, password_hash FROM users WHERE lower(username) = lower(?)`,
+		`SELECT id, username, role, created_at, disabled, last_login_at, last_logout_at, password_hash FROM users WHERE lower(username) = lower(?)`,
 		strings.TrimSpace(username),
 	)
 	var hash string
@@ -292,7 +357,7 @@ func (s *Store) findByUsername(username string) (User, string, error) {
 
 func (s *Store) findByID(id string) (User, string, error) {
 	row := s.db.QueryRow(
-		`SELECT id, username, role, created_at, disabled, password_hash FROM users WHERE id = ?`,
+		`SELECT id, username, role, created_at, disabled, last_login_at, last_logout_at, password_hash FROM users WHERE id = ?`,
 		id,
 	)
 	var hash string
@@ -306,12 +371,14 @@ type rowScanner interface {
 
 func scanUser(row rowScanner) (User, error) {
 	var (
-		user      User
-		role      string
-		createdAt string
-		disabled  bool
+		user         User
+		role         string
+		createdAt    string
+		disabled     bool
+		lastLogin    sql.NullString
+		lastLogout   sql.NullString
 	)
-	if err := row.Scan(&user.ID, &user.Username, &role, &createdAt, &disabled); err != nil {
+	if err := row.Scan(&user.ID, &user.Username, &role, &createdAt, &disabled, &lastLogin, &lastLogout); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return User{}, ErrNotFound
 		}
@@ -322,17 +389,21 @@ func scanUser(row rowScanner) (User, error) {
 	if t, err := time.Parse(time.RFC3339, createdAt); err == nil {
 		user.CreatedAt = t
 	}
+	user.LastLoginAt = parseOptionalTime(lastLogin)
+	user.LastLogoutAt = parseOptionalTime(lastLogout)
 	return user, nil
 }
 
 func scanUserWithHash(row rowScanner, hash *string) (User, error) {
 	var (
-		user      User
-		role      string
-		createdAt string
-		disabled  bool
+		user         User
+		role         string
+		createdAt    string
+		disabled     bool
+		lastLogin    sql.NullString
+		lastLogout   sql.NullString
 	)
-	if err := row.Scan(&user.ID, &user.Username, &role, &createdAt, &disabled, hash); err != nil {
+	if err := row.Scan(&user.ID, &user.Username, &role, &createdAt, &disabled, &lastLogin, &lastLogout, hash); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return User{}, ErrNotFound
 		}
@@ -343,7 +414,24 @@ func scanUserWithHash(row rowScanner, hash *string) (User, error) {
 	if t, err := time.Parse(time.RFC3339, createdAt); err == nil {
 		user.CreatedAt = t
 	}
+	user.LastLoginAt = parseOptionalTime(lastLogin)
+	user.LastLogoutAt = parseOptionalTime(lastLogout)
 	return user, nil
+}
+
+func parseOptionalTime(value sql.NullString) *time.Time {
+	if !value.Valid {
+		return nil
+	}
+	raw := strings.TrimSpace(value.String)
+	if raw == "" {
+		return nil
+	}
+	t, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return nil
+	}
+	return &t
 }
 
 func isUniqueViolation(err error) bool {

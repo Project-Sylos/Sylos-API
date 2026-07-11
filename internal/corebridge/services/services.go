@@ -9,7 +9,6 @@ import (
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
 	"codeberg.org/Sylos/Sylos-API/pkg/config"
 	fslib "codeberg.org/Sylos/Sylos-FS/pkg/fs"
-	"codeberg.org/Sylos/Sylos-FS/pkg/cloud"
 	fstypes "codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
@@ -64,18 +63,19 @@ type PaginationInfo struct {
 	HasMore      bool `json:"hasMore"`
 }
 
-// ServiceManager handles service-related operations
+// ServiceManager handles service-related operations.
+// FS is the Sylos-FS runtime; methods on ServiceManager add API-layer validation and type mapping.
 type ServiceManager struct {
-	fsManager *fslib.ServiceManager
-	services  map[string]ServiceDefinition
+	FS       *fslib.ServiceManager
+	services map[string]ServiceDefinition
 }
 
 var ErrServiceNotFound = fmt.Errorf("service not found")
 
 func NewServiceManager() *ServiceManager {
 	return &ServiceManager{
-		fsManager: fslib.NewServiceManager(),
-		services:  make(map[string]ServiceDefinition),
+		FS:       fslib.NewServiceManager(),
+		services: make(map[string]ServiceDefinition),
 	}
 }
 
@@ -205,7 +205,7 @@ func (m *ServiceManager) LoadServices(cfg config.Config) error {
 		}
 	}
 
-	return m.fsManager.LoadServices(localServices, spectraServices, cloudServices)
+	return m.FS.LoadServices(localServices, spectraServices, cloudServices)
 }
 
 func cloneLocalConfig(c fstypes.LocalServiceConfig) *fstypes.LocalServiceConfig {
@@ -224,7 +224,7 @@ func cloneCloudConfig(c fstypes.CloudServiceConfig) *fstypes.CloudServiceConfig 
 }
 
 func (m *ServiceManager) ListSources(ctx context.Context) ([]Source, error) {
-	sources, err := m.fsManager.ListSources(ctx)
+	sources, err := m.FS.ListSources(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -241,28 +241,8 @@ func (m *ServiceManager) ListSources(ctx context.Context) ([]Source, error) {
 	return result, nil
 }
 
-func (m *ServiceManager) FSManager() *fslib.ServiceManager {
-	return m.fsManager
-}
-
-func (m *ServiceManager) RegisterCloudConnection(opts fslib.CloudConnectionOptions) (string, error) {
-	return m.fsManager.RegisterCloudConnection(opts)
-}
-
-func (m *ServiceManager) HasCloudConnection(connectionID string) bool {
-	return m.fsManager.HasConnection(connectionID)
-}
-
-func (m *ServiceManager) RevokeCloudConnection(connectionID, migrationDir string) error {
-	return m.fsManager.RevokeCloudConnection(connectionID, migrationDir)
-}
-
-func (m *ServiceManager) ListCloudRoots(ctx context.Context, providerID, connectionID string) ([]cloud.Root, error) {
-	return m.fsManager.ListCloudRoots(ctx, providerID, connectionID)
-}
-
 func (m *ServiceManager) ListCloudChildren(ctx context.Context, connectionID, identifier, rootType, driveID string, offset, limit int, foldersOnly bool) (fstypes.ListResult, PaginationInfo, error) {
-	result, pagination, err := m.fsManager.ListCloudChildren(ctx, connectionID, identifier, rootType, driveID, offset, limit, foldersOnly)
+	result, pagination, err := m.FS.ListCloudChildren(ctx, connectionID, identifier, rootType, driveID, offset, limit, foldersOnly)
 	if err != nil {
 		return fstypes.ListResult{}, PaginationInfo{}, err
 	}
@@ -298,7 +278,7 @@ func (m *ServiceManager) ListChildren(ctx context.Context, req ListChildrenReque
 		FoldersOnly: req.FoldersOnly,
 	}
 
-	result, pagination, err := m.fsManager.ListChildren(ctx, fsReq)
+	result, pagination, err := m.FS.ListChildren(ctx, fsReq)
 	if err != nil {
 		return fstypes.ListResult{}, PaginationInfo{}, err
 	}
@@ -313,15 +293,11 @@ func (m *ServiceManager) ListChildren(ctx context.Context, req ListChildrenReque
 	}, nil
 }
 
-func (m *ServiceManager) ListDrives(ctx context.Context, serviceID string) ([]fstypes.DriveInfo, error) {
-	return m.fsManager.ListDrives(ctx, serviceID)
-}
-
 func (m *ServiceManager) MountDrive(ctx context.Context, serviceID string, req corebridge.MountDriveRequest) (fstypes.DriveInfo, error) {
 	if strings.TrimSpace(req.Device) == "" {
 		return fstypes.DriveInfo{}, fmt.Errorf("device is required")
 	}
-	return m.fsManager.MountDrive(ctx, serviceID, req.Device)
+	return m.FS.MountDrive(ctx, serviceID, req.Device)
 }
 
 func (m *ServiceManager) CreateBrowseFolder(ctx context.Context, serviceID string, req corebridge.CreateBrowseFolderRequest) (fstypes.Folder, error) {
@@ -333,7 +309,7 @@ func (m *ServiceManager) CreateBrowseFolder(ctx context.Context, serviceID strin
 		DriveID:      req.DriveID,
 		ContextID:    req.ParentID,
 	}
-	return m.fsManager.CreateFolder(ctx, mutation, req.ParentID, req.Name)
+	return m.FS.CreateFolder(ctx, mutation, req.ParentID, req.Name)
 }
 
 func (m *ServiceManager) DeleteBrowseNodes(ctx context.Context, serviceID string, req corebridge.DeleteBrowseNodesRequest) (corebridge.DeleteBrowseNodesResponse, error) {
@@ -352,7 +328,7 @@ func (m *ServiceManager) DeleteBrowseNodes(ctx context.Context, serviceID string
 		DriveID:      req.DriveID,
 		ContextID:    req.ContextID,
 	}
-	result, err := m.fsManager.DeleteNodes(ctx, mutation, nodes)
+	result, err := m.FS.DeleteNodes(ctx, mutation, nodes)
 	if err != nil {
 		return corebridge.DeleteBrowseNodesResponse{}, err
 	}
@@ -381,7 +357,7 @@ func (m *ServiceManager) CountChildren(ctx context.Context, req ListChildrenRequ
 		Offset:      0,
 		FoldersOnly: false,
 	}
-	return m.fsManager.CountChildren(ctx, fsReq)
+	return m.FS.CountChildren(ctx, fsReq)
 }
 
 func (m *ServiceManager) GetServiceDefinition(id string) (ServiceDefinition, error) {
@@ -401,10 +377,3 @@ func (m *ServiceManager) GetServiceDefinitionByWorld(world string) (ServiceDefin
 	return ServiceDefinition{}, ErrServiceNotFound
 }
 
-func (m *ServiceManager) RegisterSpectraSession(configPath, connectionID string) (string, error) {
-	return m.fsManager.RegisterSpectraSession(configPath, connectionID)
-}
-
-func (m *ServiceManager) AcquireAdapter(def ServiceDefinition, root fstypes.Folder, sessionID string) (fstypes.FSAdapter, func(), error) {
-	return m.fsManager.AcquireAdapter(def, root, sessionID)
-}

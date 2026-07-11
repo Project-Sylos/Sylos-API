@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "github.com/duckdb/duckdb-go/v2"
@@ -116,6 +117,35 @@ func (d *DB) migrate() error {
 			return fmt.Errorf("api db migrate: %w", err)
 		}
 	}
+	return d.migrateProviderOAuthHealthColumns()
+}
+
+func (d *DB) migrateProviderOAuthHealthColumns() error {
+	for _, col := range []struct{ name, ddl string }{
+		{"health_status", `ALTER TABLE provider_oauth_apps ADD COLUMN health_status VARCHAR`},
+		{"health_checked_at", `ALTER TABLE provider_oauth_apps ADD COLUMN health_checked_at TIMESTAMP`},
+		{"health_error", `ALTER TABLE provider_oauth_apps ADD COLUMN health_error VARCHAR`},
+		{"health_monitor_enabled", `ALTER TABLE provider_oauth_apps ADD COLUMN health_monitor_enabled BOOLEAN`},
+	} {
+		var exists int64
+		err := d.sql.QueryRow(
+			`SELECT COUNT(*) FROM information_schema.columns WHERE table_name = 'provider_oauth_apps' AND column_name = ?`,
+			col.name,
+		).Scan(&exists)
+		if err != nil {
+			return err
+		}
+		if exists > 0 {
+			continue
+		}
+		if _, err := d.sql.Exec(col.ddl); err != nil {
+			if !strings.Contains(strings.ToLower(err.Error()), "already exists") {
+				return err
+			}
+		}
+	}
+	_, _ = d.sql.Exec(`UPDATE provider_oauth_apps SET health_monitor_enabled = false WHERE health_monitor_enabled IS NULL`)
+	_, _ = d.sql.Exec(`UPDATE provider_oauth_apps SET health_monitor_enabled = true WHERE health_status = 'healthy'`)
 	return nil
 }
 
@@ -213,6 +243,24 @@ func (d *DB) DeleteAllMigrationRegistry() error {
 	return nil
 }
 
+// WipeInstallUserData removes users, cloud provider OAuth apps, and install config from the API database.
+// Migration registry rows should be cleared separately via DeleteAllMigrationRegistry.
+func (d *DB) WipeInstallUserData() error {
+	if _, err := d.sql.Exec(`DELETE FROM users`); err != nil {
+		return fmt.Errorf("delete users: %w", err)
+	}
+	if _, err := d.sql.Exec(`DELETE FROM user_audit_events`); err != nil {
+		return fmt.Errorf("delete user audit events: %w", err)
+	}
+	if _, err := d.sql.Exec(`DELETE FROM provider_oauth_apps`); err != nil {
+		return fmt.Errorf("delete provider oauth apps: %w", err)
+	}
+	if _, err := d.sql.Exec(`DELETE FROM install_config`); err != nil {
+		return fmt.Errorf("delete install config: %w", err)
+	}
+	return nil
+}
+
 func (d *DB) EnsureMigrationKey(migrationID string) ([]byte, error) {
 	var key []byte
 	err := d.sql.QueryRow(
@@ -254,12 +302,16 @@ func (d *DB) MigrationKey(migrationID string) ([]byte, error) {
 }
 
 type ProviderOAuthApp struct {
-	ProviderID   string
-	ClientID     string
-	ClientSecret string
-	DisplayName  string
-	IsDefault    bool
-	UpdatedAt    time.Time
+	ProviderID      string
+	ClientID        string
+	ClientSecret    string
+	DisplayName     string
+	IsDefault       bool
+	UpdatedAt       time.Time
+	HealthStatus          string
+	HealthCheckedAt       *time.Time
+	HealthError           string
+	HealthMonitorEnabled  bool
 }
 
 func (d *DB) UpsertProviderOAuthApp(app ProviderOAuthApp) error {
@@ -282,16 +334,59 @@ func (d *DB) UpsertProviderOAuthApp(app ProviderOAuthApp) error {
 
 func (d *DB) GetProviderOAuthApp(providerID string) (ProviderOAuthApp, error) {
 	var app ProviderOAuthApp
+	var checkedAt sql.NullTime
+	var healthStatus, healthError sql.NullString
+	var healthMonitor bool
 	err := d.sql.QueryRow(
-		`SELECT provider_id, client_id, client_secret, display_name, is_default, updated_at
+		`SELECT provider_id, client_id, client_secret, display_name, is_default, updated_at,
+		        health_status, health_checked_at, health_error, COALESCE(health_monitor_enabled, false)
 		 FROM provider_oauth_apps WHERE provider_id = ?`, providerID,
-	).Scan(&app.ProviderID, &app.ClientID, &app.ClientSecret, &app.DisplayName, &app.IsDefault, &app.UpdatedAt)
-	return app, err
+	).Scan(
+		&app.ProviderID, &app.ClientID, &app.ClientSecret, &app.DisplayName, &app.IsDefault, &app.UpdatedAt,
+		&healthStatus, &checkedAt, &healthError, &healthMonitor,
+	)
+	if err != nil {
+		return ProviderOAuthApp{}, err
+	}
+	if healthStatus.Valid {
+		app.HealthStatus = healthStatus.String
+	}
+	if healthError.Valid {
+		app.HealthError = healthError.String
+	}
+	if checkedAt.Valid {
+		t := checkedAt.Time
+		app.HealthCheckedAt = &t
+	}
+	app.HealthMonitorEnabled = healthMonitor
+	return app, nil
+}
+
+func (d *DB) UpdateProviderOAuthHealth(providerID, status string, checkedAt time.Time, healthError string) error {
+	_, err := d.sql.Exec(
+		`UPDATE provider_oauth_apps SET health_status = ?, health_checked_at = ?, health_error = ? WHERE provider_id = ?`,
+		status, checkedAt, healthError, providerID,
+	)
+	return err
+}
+
+func (d *DB) SetProviderOAuthHealthMonitor(providerID string, enabled bool) error {
+	_, err := d.sql.Exec(
+		`UPDATE provider_oauth_apps SET health_monitor_enabled = ? WHERE provider_id = ?`,
+		enabled, providerID,
+	)
+	return err
+}
+
+func (d *DB) DeleteProviderOAuthApp(providerID string) error {
+	_, err := d.sql.Exec(`DELETE FROM provider_oauth_apps WHERE provider_id = ?`, providerID)
+	return err
 }
 
 func (d *DB) ListProviderOAuthApps() ([]ProviderOAuthApp, error) {
 	rows, err := d.sql.Query(
-		`SELECT provider_id, client_id, client_secret, display_name, is_default, updated_at
+		`SELECT provider_id, client_id, client_secret, display_name, is_default, updated_at,
+		        health_status, health_checked_at, health_error, COALESCE(health_monitor_enabled, false)
 		 FROM provider_oauth_apps ORDER BY provider_id`,
 	)
 	if err != nil {
@@ -301,9 +396,26 @@ func (d *DB) ListProviderOAuthApps() ([]ProviderOAuthApp, error) {
 	var out []ProviderOAuthApp
 	for rows.Next() {
 		var app ProviderOAuthApp
-		if err := rows.Scan(&app.ProviderID, &app.ClientID, &app.ClientSecret, &app.DisplayName, &app.IsDefault, &app.UpdatedAt); err != nil {
+		var checkedAt sql.NullTime
+		var healthStatus, healthError sql.NullString
+		var healthMonitor bool
+		if err := rows.Scan(
+			&app.ProviderID, &app.ClientID, &app.ClientSecret, &app.DisplayName, &app.IsDefault, &app.UpdatedAt,
+			&healthStatus, &checkedAt, &healthError, &healthMonitor,
+		); err != nil {
 			return nil, err
 		}
+		if healthStatus.Valid {
+			app.HealthStatus = healthStatus.String
+		}
+		if healthError.Valid {
+			app.HealthError = healthError.String
+		}
+		if checkedAt.Valid {
+			t := checkedAt.Time
+			app.HealthCheckedAt = &t
+		}
+		app.HealthMonitorEnabled = healthMonitor
 		out = append(out, app)
 	}
 	return out, rows.Err()

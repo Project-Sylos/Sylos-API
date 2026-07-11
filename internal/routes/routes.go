@@ -56,15 +56,15 @@ func New(deps Dependencies) chi.Router {
 		mw, _ = middlewarepkg.New(deps.Logger, "")
 	}
 
-	healthroutes.RegisterPublic(router)
+	healthroutes.Register(router)
 	setuproutes.RegisterPublic(router, deps.Logger, deps.UserStore, deps.AuthManager, mw)
 	authroutes.Register(router, deps.Logger, deps.AuthManager, deps.UserStore, mw)
 
 	apiRouter := chi.NewRouter()
 	apiRouter.Use(deps.AuthManager.Middleware)
 
-	healthroutes.RegisterProtected(apiRouter)
-	authroutes.RegisterProtected(apiRouter, deps.UserStore, mw)
+	healthroutes.Register(apiRouter)
+	authroutes.RegisterProtected(apiRouter, deps.Logger, deps.UserStore, mw)
 	usersroutes.Register(apiRouter, deps.Logger, deps.UserStore, mw)
 	serviceroutes.Register(apiRouter, deps.Logger, deps.CoreBridge, mw)
 	providerroutes.Register(apiRouter, deps.Logger, deps.Manager, mw)

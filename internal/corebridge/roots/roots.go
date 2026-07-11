@@ -260,7 +260,7 @@ func (m *Manager) SetRoot(ctx context.Context, req SetRootRequest) (SetRootRespo
 
 			// Register session with ServiceManager (ServiceManager creates it internally)
 			fmt.Printf("Registering Spectra session for migration %s with config: %s, connectionID: %s\n", migrationID, overridePath, connectionID)
-			sessionID, err = m.serviceMgr.RegisterSpectraSession(overridePath, connectionID)
+			sessionID, err = m.serviceMgr.FS.RegisterSpectraSession(overridePath, connectionID)
 			if err != nil {
 				return SetRootResponse{}, fmt.Errorf("failed to register Spectra session: %w", err)
 			}
@@ -294,7 +294,7 @@ func (m *Manager) SetRoot(ctx context.Context, req SetRootRequest) (SetRootRespo
 	// Acquire adapter for the root being set (blocking I/O - do NOT hold lock)
 	// For Spectra: session must be registered first using RegisterSpectraSession()
 	// ServiceManager manages the session lifecycle - API just uses the sessionID
-	adapter, release, err := m.serviceMgr.AcquireAdapter(serviceDef, folder, sessionID)
+	adapter, release, err := m.serviceMgr.FS.AcquireAdapter(serviceDef, folder, sessionID)
 	if err != nil {
 		return SetRootResponse{}, fmt.Errorf("failed to acquire %s adapter: %w", role, err)
 	}

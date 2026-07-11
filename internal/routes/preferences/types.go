@@ -1,5 +1,7 @@
 package preferences
 
+import "fmt"
+
 // Preferences represents the application preferences structure.
 type Preferences struct {
 	Theme            string    `json:"theme"`
@@ -48,4 +50,24 @@ func mergeWithDefaults(stored Preferences) Preferences {
 	}
 
 	return stored
+}
+
+func themeSupportsPreSplash(theme string) bool {
+	return theme == "neon-dark" || theme == "neon-light"
+}
+
+func sanitizePreferences(prefs Preferences) Preferences {
+	prefs = mergeWithDefaults(prefs)
+	if !themeSupportsPreSplash(prefs.Theme) {
+		prefs.PreSplashEnabled = false
+	}
+	return prefs
+}
+
+func validatePreferences(prefs Preferences) (Preferences, error) {
+	prefs = mergeWithDefaults(prefs)
+	if !themeSupportsPreSplash(prefs.Theme) && prefs.PreSplashEnabled {
+		return prefs, fmt.Errorf("preSplashEnabled is only allowed with neon-dark or neon-light theme")
+	}
+	return sanitizePreferences(prefs), nil
 }

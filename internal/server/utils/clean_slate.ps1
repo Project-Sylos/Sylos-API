@@ -1,4 +1,4 @@
-# Deprecated: use Settings > Danger zone or POST /api/admin/clean-slate (admin JWT required).
+# Deprecated: use POST /api/admin/clear-migrations or POST /api/admin/wipe-install (admin JWT required).
 # This script will delete all data from the server and start fresh.
 
 Write-Output "Cleaning api data..."

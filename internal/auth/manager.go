@@ -55,10 +55,6 @@ func NewManager(cfg Config) (*Manager, error) {
 	}, nil
 }
 
-func (m *Manager) GenerateToken(subject string, roles []string) (string, error) {
-	return m.GenerateTokenWithTTL(subject, roles, m.ttl)
-}
-
 func (m *Manager) GenerateTokenWithTTL(subject string, roles []string, ttl time.Duration) (string, error) {
 	if ttl <= 0 {
 		ttl = m.ttl

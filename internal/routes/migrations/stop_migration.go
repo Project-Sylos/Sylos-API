@@ -28,15 +28,21 @@ func (h handler) stop(ctx *middleware.Context) {
 	}
 
 	response := map[string]any{
-		"id":                     migrationID,
-		"status":                 status.Status,
+		"id":                   migrationID,
+		"status":               status.Status,
+		"success":              status.Success,
+		"alreadyStopped":       status.AlreadyStopped,
 		"result":                 status.Result,
 		"live":                   status.Live,
 		"stopped":                status.Stopped,
 		"softSuspendRequested":   status.SoftSuspendRequested,
 		"completedAt":            status.CompletedAt,
 		"error":                  status.Error,
-		"message":                "Stop requested. If softSuspendRequested is true, poll status until phase is traversal-suspended or copy-suspended and live is false.",
+	}
+	if status.AlreadyStopped {
+		response["message"] = "Migration is already stopped."
+	} else {
+		response["message"] = "Stop requested. If softSuspendRequested is true, poll status until phase is traversal-suspended or copy-suspended and live is false."
 	}
 
 	ctx.Response(http.StatusOK, response)

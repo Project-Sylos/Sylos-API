@@ -16,8 +16,9 @@ type loginRequest struct {
 }
 
 type loginResponse struct {
-	Token string     `json:"token"`
-	User  users.User `json:"user"`
+	Token        string     `json:"token"`
+	User         users.User `json:"user"`
+	RecoveryCode string     `json:"recoveryCode,omitempty"`
 }
 
 func (h handler) login(ctx *middleware.Context, req loginRequest) {
@@ -25,13 +26,22 @@ func (h handler) login(ctx *middleware.Context, req loginRequest) {
 	if err != nil {
 		switch {
 		case errors.Is(err, users.ErrInvalidCreds):
+			_ = h.userStore.RecordLoginFailed(req.Username)
 			ctx.Error(http.StatusUnauthorized, "invalid credentials", err)
 		case errors.Is(err, users.ErrDisabled):
+			_ = h.userStore.RecordLoginFailed(req.Username)
 			ctx.Error(http.StatusUnauthorized, "account disabled", err)
 		default:
 			ctx.Error(http.StatusInternalServerError, "login failed", err)
 		}
 		return
+	}
+
+	if err := h.userStore.RecordLogin(user.ID); err != nil {
+		h.logger.Warn().Err(err).Str("user_id", user.ID).Msg("record login audit")
+	} else {
+		now := time.Now().UTC()
+		user.LastLoginAt = &now
 	}
 
 	ttl := 24 * time.Hour
@@ -45,5 +55,10 @@ func (h handler) login(ctx *middleware.Context, req loginRequest) {
 		return
 	}
 
-	ctx.Response(http.StatusOK, loginResponse{Token: token, User: user})
+	resp := loginResponse{Token: token, User: user}
+	if code, issued, err := h.userStore.TakePendingRecoveryReissue(user.ID); err == nil && issued {
+		resp.RecoveryCode = code
+	}
+
+	ctx.Response(http.StatusOK, resp)
 }

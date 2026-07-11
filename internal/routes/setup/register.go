@@ -42,8 +42,9 @@ type setupRequest struct {
 }
 
 type setupResponse struct {
-	Token string     `json:"token"`
-	User  users.User `json:"user"`
+	Token        string     `json:"token"`
+	User         users.User `json:"user"`
+	RecoveryCode string     `json:"recoveryCode,omitempty"`
 }
 
 func (h handler) setup(ctx *middleware.Context, req setupRequest) {
@@ -60,11 +61,16 @@ func (h handler) setup(ctx *middleware.Context, req setupRequest) {
 		return
 	}
 
-	token, err := h.authManager.GenerateToken(user.ID, []string{string(user.Role)})
+	token, err := h.authManager.GenerateTokenWithTTL(user.ID, []string{string(user.Role)}, 0)
 	if err != nil {
 		ctx.Error(http.StatusInternalServerError, "failed to generate token", err)
 		return
 	}
 
-	ctx.Response(http.StatusCreated, setupResponse{Token: token, User: user})
+	resp := setupResponse{Token: token, User: user}
+	if code, err := h.users.IssueRecoveryCode(user.ID, true); err == nil {
+		resp.RecoveryCode = code
+	}
+
+	ctx.Response(http.StatusCreated, resp)
 }

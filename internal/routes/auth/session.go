@@ -39,7 +39,3 @@ func (h sessionHandler) Me(ctx *middleware.Context) {
 		Capabilities: appauth.CapabilitiesFromContext(ctx.Request().Context()),
 	})
 }
-
-func (h sessionHandler) Logout(ctx *middleware.Context) {
-	ctx.Response(http.StatusNoContent, nil)
-}

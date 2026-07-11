@@ -8,7 +8,6 @@ import (
 	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/apidb"
-	"codeberg.org/Sylos/Sylos-API/internal/corebridge/database"
 )
 
 // Opener resolves per-migration encryption keys and opens migration DuckDBs through the engine.
@@ -36,7 +35,7 @@ func (o *Opener) OpenMigrationDB(ctx context.Context, migrationID, userID string
 	if err != nil {
 		return nil, fmt.Errorf("migration key for %q: %w", migrationID, err)
 	}
-	migrationDir, err := filepath.Abs(database.GetMigrationDir(o.DataDir, migrationID))
+	migrationDir, err := filepath.Abs(filepath.Join(o.DataDir, migrationID))
 	if err != nil {
 		return nil, err
 	}
@@ -48,9 +47,4 @@ func (o *Opener) OpenMigrationDB(ctx context.Context, migrationID, userID string
 		return nil, corebridge.ErrMigrationNotFound
 	}
 	return mig, nil
-}
-
-// MigrationKey returns the per-migration encryption key, creating one if needed.
-func (o *Opener) MigrationKey(migrationID string) ([]byte, error) {
-	return o.APIDB.EnsureMigrationKey(migrationID)
 }

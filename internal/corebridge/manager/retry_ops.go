@@ -58,7 +58,7 @@ func (m *Manager) MarkAllFailedAsExcluded(ctx context.Context, migrationID strin
 			Status string `json:"status,omitempty"`
 		}{Status: "failed"},
 	}
-	resp, err := corebridge.ExcludeNodes(mig, req)
+	resp, err := corebridge.SetNodesExcluded(mig, req, true)
 	if err != nil {
 		return resp, err
 	}

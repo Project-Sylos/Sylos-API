@@ -1,6 +1,7 @@
 package manager
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -12,7 +13,7 @@ import (
 
 // persistFSCredentialBinding writes one side's binding after SetRoot.
 func (m *Manager) persistFSCredentialBinding(migrationID, role string) error {
-	mig, err := m.getEngineMigration(migrationID)
+	mig, err := m.GetMigration(context.Background(), migrationID)
 	if err != nil {
 		return err
 	}
@@ -60,7 +61,7 @@ func (m *Manager) persistFSCredentialBinding(migrationID, role string) error {
 
 // ensureFSAdaptersRehydrated rebuilds in-memory FS adapters when a real filesystem operation is needed.
 func (m *Manager) ensureFSAdaptersRehydrated(migrationID string) error {
-	mig, err := m.getEngineMigration(migrationID)
+	mig, err := m.GetMigration(context.Background(), migrationID)
 	if err != nil {
 		return err
 	}
@@ -111,7 +112,7 @@ func (m *Manager) rehydrateFSAdaptersIfNeeded(migrationID string, mig *migration
 						m.logger.Warn().Str("migration_id", migrationID).Msg("rehydrate: missing spectra-config.json for Spectra binding")
 						continue
 					}
-					if _, regErr := m.serviceMgr.RegisterSpectraSession(path, b.ConnectionID); regErr != nil {
+					if _, regErr := m.serviceMgr.FS.RegisterSpectraSession(path, b.ConnectionID); regErr != nil {
 						m.logger.Warn().Err(regErr).Str("migration_id", migrationID).Str("connection_id", b.ConnectionID).Msg("rehydrate: RegisterSpectraSession")
 						continue
 					}
@@ -129,7 +130,7 @@ func (m *Manager) rehydrateFSAdaptersIfNeeded(migrationID string, mig *migration
 				m.logger.Warn().Err(err).Str("migration_id", migrationID).Str("role", b.Role).Msg("rehydrate: root folder json")
 				continue
 			}
-			adapter, release, err := m.serviceMgr.AcquireAdapter(def, folder, b.ConnectionID)
+			adapter, release, err := m.serviceMgr.FS.AcquireAdapter(def, folder, b.ConnectionID)
 			if err != nil {
 				m.logger.Warn().Err(err).Str("migration_id", migrationID).Str("role", b.Role).Msg("rehydrate: AcquireAdapter")
 				continue

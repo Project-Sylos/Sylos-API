@@ -6,16 +6,18 @@ import (
 
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/database"
+	"codeberg.org/Sylos/Sylos-API/pkg/oauthcreds"
 )
 
-// CleanSlateResponse summarizes what was cleared.
-type CleanSlateResponse struct {
+// AdminActionResponse summarizes a destructive admin operation.
+type AdminActionResponse struct {
 	Message string `json:"message"`
 }
 
-// CleanSlate stops active migrations and removes all recorded migration data from disk and the API database.
-// User accounts, provider OAuth app configuration, and the install master key are preserved.
-func (m *Manager) CleanSlate(ctx context.Context) (CleanSlateResponse, error) {
+// CleanSlateResponse is kept for backward compatibility with older clients.
+type CleanSlateResponse = AdminActionResponse
+
+func (m *Manager) clearMigrationRuntimeAndDisk(ctx context.Context) error {
 	m.mu.Lock()
 	runningIDs := make([]string, 0, len(m.runtimeByID))
 	for id := range m.runtimeByID {
@@ -25,13 +27,13 @@ func (m *Manager) CleanSlate(ctx context.Context) (CleanSlateResponse, error) {
 
 	for _, id := range runningIDs {
 		if _, err := m.StopMigration(ctx, id); err != nil {
-			m.logger.Warn().Err(err).Str("migration_id", id).Msg("clean slate: stop migration")
+			m.logger.Warn().Err(err).Str("migration_id", id).Msg("clear migrations: stop migration")
 		}
 	}
 
 	m.rootsMgr.ClearAllPlans()
 	if err := m.engineMgr.ResetState(); err != nil {
-		return CleanSlateResponse{}, fmt.Errorf("reset migration engine: %w", err)
+		return fmt.Errorf("reset migration engine: %w", err)
 	}
 
 	m.mu.Lock()
@@ -43,17 +45,54 @@ func (m *Manager) CleanSlate(ctx context.Context) (CleanSlateResponse, error) {
 
 	if m.apiDB != nil {
 		if err := m.apiDB.DeleteAllMigrationRegistry(); err != nil {
-			return CleanSlateResponse{}, fmt.Errorf("clear migration registry: %w", err)
+			return fmt.Errorf("clear migration registry: %w", err)
 		}
 	}
 
 	if err := database.CleanMigrationData(m.cfg.Runtime.DataDir); err != nil {
-		return CleanSlateResponse{}, fmt.Errorf("clean migration data files: %w", err)
+		return fmt.Errorf("clean migration data files: %w", err)
 	}
 
-	m.logger.Warn().Msg("clean slate: all migration data removed by admin request")
+	return nil
+}
 
-	return CleanSlateResponse{
+// ClearAllMigrations stops active migrations and removes all migration folders, migration DB files,
+// and registry entries. User accounts, cloud provider app settings, and the install master key are preserved.
+func (m *Manager) ClearAllMigrations(ctx context.Context) (AdminActionResponse, error) {
+	if err := m.clearMigrationRuntimeAndDisk(ctx); err != nil {
+		return AdminActionResponse{}, err
+	}
+
+	m.logger.Warn().Msg("clear migrations: all migration data removed by admin request")
+
+	return AdminActionResponse{
 		Message: "All migration data has been removed. User accounts and cloud provider settings were kept.",
+	}, nil
+}
+
+// CleanSlate is an alias for ClearAllMigrations.
+func (m *Manager) CleanSlate(ctx context.Context) (CleanSlateResponse, error) {
+	return m.ClearAllMigrations(ctx)
+}
+
+// WipeInstall removes all migration data plus users, cloud provider OAuth apps, and install config.
+// The install master key and encrypted sylos.duckdb file are preserved; complete initial setup again afterward.
+func (m *Manager) WipeInstall(ctx context.Context) (AdminActionResponse, error) {
+	if err := m.clearMigrationRuntimeAndDisk(ctx); err != nil {
+		return AdminActionResponse{}, err
+	}
+
+	if m.apiDB != nil {
+		if err := m.apiDB.WipeInstallUserData(); err != nil {
+			return AdminActionResponse{}, fmt.Errorf("wipe install user data: %w", err)
+		}
+	}
+
+	m.SetOAuthCreds(oauthcreds.Config{})
+
+	m.logger.Warn().Msg("wipe install: all migration and user data removed by admin request")
+
+	return AdminActionResponse{
+		Message: "All migration data, user accounts, and cloud provider settings have been removed. Complete setup again to continue using Sylos.",
 	}, nil
 }

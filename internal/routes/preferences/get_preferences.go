@@ -24,16 +24,16 @@ func (h handler) getPreferences(ctx *middleware.Context) {
 
 	if raw == "" {
 		h.logger.Debug().Str("user_id", claims.Subject).Msg("no saved preferences, returning defaults")
-		ctx.Response(http.StatusOK, getDefaultPreferences())
+		ctx.Response(http.StatusOK, sanitizePreferences(getDefaultPreferences()))
 		return
 	}
 
 	var prefs Preferences
 	if err := json.Unmarshal([]byte(raw), &prefs); err != nil {
 		h.logger.Warn().Err(err).Str("user_id", claims.Subject).Msg("invalid preferences JSON, returning defaults")
-		ctx.Response(http.StatusOK, getDefaultPreferences())
+		ctx.Response(http.StatusOK, sanitizePreferences(getDefaultPreferences()))
 		return
 	}
 
-	ctx.Response(http.StatusOK, mergeWithDefaults(prefs))
+	ctx.Response(http.StatusOK, sanitizePreferences(prefs))
 }

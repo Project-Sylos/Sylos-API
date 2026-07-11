@@ -31,7 +31,7 @@ type Manager struct {
 	connMgr     *connections.Manager
 	rootsMgr    *roots.Manager
 	engineMgr   *migration.MigrationManager
-	terminalMgr *terminal.Manager
+	*terminal.Manager
 	bgTaskMgr   *corebridge.BackgroundTaskManager
 	apiDB       *apidb.DB
 	migAccess   *migrationaccess.Opener
@@ -41,6 +41,9 @@ type Manager struct {
 	progressByID    map[string]map[string]chan corebridge.ProgressEvent
 	progressCounter uint64
 	oauthCreds      oauthcreds.Config
+
+	oauthHealthReschedule   func()
+	oauthHealthRescheduleMu sync.Mutex
 }
 
 type runtimeMigration struct {
@@ -76,7 +79,7 @@ func NewManager(logger zerolog.Logger, cfg config.Config, apiDB *apidb.DB) (*Man
 		connMgr:      connections.NewManager(),
 		rootsMgr:     rootsMgr,
 		engineMgr:    engineMgr,
-		terminalMgr:  terminalMgr,
+		Manager:      terminalMgr,
 		bgTaskMgr:    bgTaskMgr,
 		apiDB:        apiDB,
 		runtimeByID:  make(map[string]*runtimeMigration),
@@ -139,7 +142,7 @@ func (m *Manager) oauthProviderCredentials(providerID string) (oauthcreds.Provid
 
 // migrationDirFor returns the absolute path to the folder for the given migration (e.g. dataDir/{id}).
 func (m *Manager) migrationDirFor(migrationID string) (string, error) {
-	dir := database.GetMigrationDir(m.cfg.Runtime.DataDir, migrationID)
+	dir := filepath.Join(m.cfg.Runtime.DataDir, migrationID)
 	return filepath.Abs(dir)
 }
 
@@ -147,10 +150,6 @@ func (m *Manager) migrationDirFor(migrationID string) (string, error) {
 // When using per-migration DBs, the engine expects the migration folder path (e.g. data/{id}) so it can open or create the DB there.
 // FS adapters are not rehydrated here; call ensureFSAdaptersRehydrated before traversal, copy, or live FS browse.
 func (m *Manager) GetMigration(_ context.Context, migrationID string) (*migration.Migration, error) {
-	return m.getEngineMigration(migrationID)
-}
-
-func (m *Manager) getEngineMigration(migrationID string) (*migration.Migration, error) {
 	if m.migAccess == nil {
 		return nil, fmt.Errorf("API database not configured")
 	}

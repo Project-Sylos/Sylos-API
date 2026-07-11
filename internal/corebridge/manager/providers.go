@@ -13,6 +13,7 @@ import (
 	oauthpkg "codeberg.org/Sylos/Sylos-API/internal/corebridge/oauth"
 	"codeberg.org/Sylos/Sylos-FS/pkg/cloud"
 	fslib "codeberg.org/Sylos/Sylos-FS/pkg/fs"
+	sftpfs "codeberg.org/Sylos/Sylos-FS/pkg/fs/sftp"
 	"github.com/oklog/ulid/v2"
 )
 
@@ -26,7 +27,7 @@ func (m *Manager) ListProviders(_ context.Context) ([]corebridge.ProviderDescrip
 			ID:            providerID,
 			DisplayName:   cfg.DisplayName,
 			ServiceID:     cfg.ServiceID,
-			AuthType:      "oauth_server_exchange",
+			AuthType:      authTypeForProvider(providerID),
 			Scopes:        cfg.Scopes,
 			OAuthClientID: m.oauthClientID(providerID),
 		})
@@ -48,6 +49,88 @@ func (m *Manager) CreateProviderConnection(ctx context.Context, providerID, migr
 	return corebridge.ConnectionResponse{ConnectionID: connectionID, ProviderID: providerID}, nil
 }
 
+func authTypeForProvider(providerID string) string {
+	if providerID == cloud.ProviderSFTP {
+		return "credentials_form"
+	}
+	return "oauth_server_exchange"
+}
+
+func (m *Manager) ProbeSFTPHostKey(_ context.Context, providerID string, req corebridge.SFTPHostKeyProbeRequest) (corebridge.SFTPHostKeyProbeResponse, error) {
+	if providerID != cloud.ProviderSFTP {
+		return corebridge.SFTPHostKeyProbeResponse{}, fmt.Errorf("provider %q does not support host key probe", providerID)
+	}
+	result, err := sftpfs.FetchServerHostKey(req.Host, req.Port)
+	if err != nil {
+		return corebridge.SFTPHostKeyProbeResponse{}, err
+	}
+	return corebridge.SFTPHostKeyProbeResponse{
+		HostKey:     result.HostKey,
+		Fingerprint: result.Fingerprint,
+	}, nil
+}
+
+func (m *Manager) PostProviderCredentials(ctx context.Context, providerID, connectionID string, req corebridge.SFTPCredentialsRequest) (corebridge.ConnectionStatus, error) {
+	if providerID != cloud.ProviderSFTP {
+		return corebridge.ConnectionStatus{}, fmt.Errorf("provider %q does not accept form credentials", providerID)
+	}
+	rec, ok := m.connMgr.Get(connectionID)
+	if !ok {
+		return corebridge.ConnectionStatus{}, fmt.Errorf("connection %q not found", connectionID)
+	}
+	if rec.ProviderID != providerID {
+		return corebridge.ConnectionStatus{}, fmt.Errorf("connection provider mismatch")
+	}
+
+	stored := cloud.StoredCredentialsFromSFTP(
+		req.Host,
+		req.Username,
+		req.Password,
+		req.PrivateKey,
+		req.KeyPassphrase,
+		req.HostKey,
+		req.Port,
+	)
+	if err := stored.ValidateSFTP(); err != nil {
+		return corebridge.ConnectionStatus{}, err
+	}
+	credsJSON, err := json.Marshal(stored)
+	if err != nil {
+		return corebridge.ConnectionStatus{}, err
+	}
+
+	var mig *migration.Migration
+	if rec.MigrationID != "" {
+		mig, err = m.GetMigration(context.Background(), rec.MigrationID)
+		if err != nil && err != corebridge.ErrMigrationNotFound {
+			return corebridge.ConnectionStatus{}, err
+		}
+	}
+
+	_, err = m.serviceMgr.FS.RegisterCloudConnection(fslib.CloudConnectionOptions{
+		ProviderID:      providerID,
+		ConnectionID:    connectionID,
+		CredentialsJSON: credsJSON,
+	})
+	if err != nil {
+		return corebridge.ConnectionStatus{}, err
+	}
+
+	if mig != nil {
+		if err := m.persistOAuthCredentials(mig, connectionID, credsJSON); err != nil {
+			return corebridge.ConnectionStatus{}, fmt.Errorf("persist sftp credentials: %w", err)
+		}
+	}
+
+	m.connMgr.Set(connectionID, rec)
+
+	return corebridge.ConnectionStatus{
+		ConnectionID: connectionID,
+		ProviderID:   providerID,
+		Valid:        true,
+	}, nil
+}
+
 func (m *Manager) PostProviderTokens(ctx context.Context, providerID, connectionID string, req corebridge.OAuthTokenRequest) (corebridge.ConnectionStatus, error) {
 	rec, ok := m.connMgr.Get(connectionID)
 	if !ok {
@@ -67,13 +150,13 @@ func (m *Manager) PostProviderTokens(ctx context.Context, providerID, connection
 
 	var mig *migration.Migration
 	if rec.MigrationID != "" {
-		mig, err = m.getEngineMigration(rec.MigrationID)
+		mig, err = m.GetMigration(context.Background(), rec.MigrationID)
 		if err != nil && err != corebridge.ErrMigrationNotFound {
 			return corebridge.ConnectionStatus{}, err
 		}
 	}
 
-	_, err = m.serviceMgr.RegisterCloudConnection(fslib.CloudConnectionOptions{
+	_, err = m.serviceMgr.FS.RegisterCloudConnection(fslib.CloudConnectionOptions{
 		ProviderID:      providerID,
 		ConnectionID:    connectionID,
 		CredentialsJSON: credsJSON,
@@ -163,7 +246,10 @@ func (m *Manager) ProviderConnectionStatus(ctx context.Context, providerID, conn
 	if !ok {
 		return corebridge.ConnectionStatus{ConnectionID: connectionID, ProviderID: providerID, Valid: false}, nil
 	}
-	valid := m.serviceMgr.HasCloudConnection(connectionID)
+	if rec.ProviderID != providerID {
+		return corebridge.ConnectionStatus{ConnectionID: connectionID, ProviderID: providerID, Valid: false}, nil
+	}
+	valid := m.cloudConnectionValid(providerID, connectionID)
 	return corebridge.ConnectionStatus{
 		ConnectionID: connectionID,
 		ProviderID:   providerID,
@@ -172,17 +258,27 @@ func (m *Manager) ProviderConnectionStatus(ctx context.Context, providerID, conn
 	}, nil
 }
 
+func (m *Manager) cloudConnectionValid(providerID, connectionID string) bool {
+	if !m.serviceMgr.FS.HasConnection(connectionID) {
+		return false
+	}
+	if connProvider, ok := m.serviceMgr.FS.CloudConnectionProvider(connectionID); ok && connProvider != providerID {
+		return false
+	}
+	return true
+}
+
 func (m *Manager) RevokeProviderConnection(ctx context.Context, providerID, connectionID string) error {
 	migrationID := ""
 	if rec, ok := m.connMgr.Get(connectionID); ok && rec.MigrationID != "" {
 		migrationID = rec.MigrationID
 	}
 	m.connMgr.Delete(connectionID)
-	if err := m.serviceMgr.RevokeCloudConnection(connectionID, ""); err != nil {
+	if err := m.serviceMgr.FS.RevokeCloudConnection(connectionID, ""); err != nil {
 		return err
 	}
 	if migrationID != "" {
-		if mig, err := m.getEngineMigration(migrationID); err == nil && mig != nil {
+		if mig, err := m.GetMigration(context.Background(), migrationID); err == nil && mig != nil {
 			_ = mig.DeleteOAuthCredentials(connectionID)
 		}
 	}
@@ -190,7 +286,10 @@ func (m *Manager) RevokeProviderConnection(ctx context.Context, providerID, conn
 }
 
 func (m *Manager) ListProviderRoots(ctx context.Context, providerID, connectionID string) ([]cloud.Root, error) {
-	return m.serviceMgr.ListCloudRoots(ctx, providerID, connectionID)
+	if rec, ok := m.connMgr.Get(connectionID); ok && rec.ProviderID != providerID {
+		return nil, fmt.Errorf("connection %s belongs to provider %q, not %q", connectionID, rec.ProviderID, providerID)
+	}
+	return m.serviceMgr.FS.ListCloudRoots(ctx, providerID, connectionID)
 }
 
 func (m *Manager) ListProviderChildren(ctx context.Context, providerID, connectionID, identifier, rootType, driveID string, offset, limit int, foldersOnly bool) (corebridge.ListChildrenResponse, error) {

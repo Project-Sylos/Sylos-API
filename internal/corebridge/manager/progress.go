@@ -46,7 +46,3 @@ func (m *Manager) SubscribeProgress(ctx context.Context, id string) (<-chan core
 	}()
 	return ch, cancel, nil
 }
-
-func (m *Manager) ToggleLogTerminal(ctx context.Context, enable bool, logAddress string) error {
-	return m.terminalMgr.ToggleLogTerminal(ctx, enable, logAddress)
-}

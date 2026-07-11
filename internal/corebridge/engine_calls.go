@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"codeberg.org/Sylos/Migration-Engine/pkg/convert"
 	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
 )
 
@@ -27,6 +28,7 @@ func PathReviewStatsFromMigration(mig *migration.Migration) (*PathReviewStats, e
 		FailedCount:         stats.FailedCount,
 		ExcludedCount:       stats.ExcludedCount,
 		PendingRetriesCount: stats.PendingRetriesCount,
+		SuccessfulCount:     stats.SuccessfulCount,
 		FoldersCount:        stats.FoldersCount,
 		FilesCount:          stats.FilesCount,
 		FoldersRatio:        stats.FoldersRatio,
@@ -36,6 +38,38 @@ func PathReviewStatsFromMigration(mig *migration.Migration) (*PathReviewStats, e
 			Dst: stats.TotalFileSize.Dst,
 		},
 	}, nil
+}
+
+// resolveSort extracts sort field and direction from an optional SortOption, defaulting to ascending.
+func resolveSort(sort *SortOption) (sortBy, sortDirection string) {
+	sortDirection = "asc"
+	if sort != nil {
+		sortBy = sort.Field
+		if sort.Direction != "" {
+			sortDirection = strings.ToLower(sort.Direction)
+		}
+	}
+	return sortBy, sortDirection
+}
+
+// diffListResponse builds the paginated API response from engine diff items.
+func diffListResponse(items []migration.DiffItem, offset, limit, total int) ListChildrenDiffsResponse {
+	out := make(map[string]PathNodes, len(items))
+	order := make([]string, 0, len(items))
+	for _, item := range items {
+		out[item.Path] = diffItemToPathNodes(item)
+		order = append(order, item.Path)
+	}
+	return ListChildrenDiffsResponse{
+		Items:     out,
+		ItemOrder: order,
+		Pagination: PaginationInfo{
+			Offset:  offset,
+			Limit:   limit,
+			Total:   total,
+			HasMore: offset+limit < total,
+		},
+	}
 }
 
 func diffItemToPathNodes(item migration.DiffItem) PathNodes {
@@ -51,6 +85,7 @@ func diffItemToPathNodes(item migration.DiffItem) PathNodes {
 			Size:            item.Size,
 			TraversalStatus: item.SrcTraversalStatus,
 			CopyStatus:      item.CopyStatus,
+			DeleteStatus:    item.DeleteStatus,
 			FailureLogID:    item.SrcFailureLogID,
 			FailureMessage:  item.SrcFailureMessage,
 		}
@@ -65,7 +100,6 @@ func diffItemToPathNodes(item migration.DiffItem) PathNodes {
 			Type:            item.Type,
 			Size:            item.Size,
 			TraversalStatus: item.DstTraversalStatus,
-			CopyStatus:      item.CopyStatus,
 			FailureLogID:    item.DstFailureLogID,
 			FailureMessage:  item.DstFailureMessage,
 		}
@@ -78,14 +112,7 @@ func ListChildrenDiffs(mig *migration.Migration, req ListChildrenDiffsRequest) (
 	if mig == nil {
 		return ListChildrenDiffsResponse{}, fmt.Errorf("migration is nil")
 	}
-	sortBy := ""
-	sortDirection := "asc"
-	if req.Sort != nil {
-		sortBy = req.Sort.Field
-		if req.Sort.Direction != "" {
-			sortDirection = strings.ToLower(req.Sort.Direction)
-		}
-	}
+	sortBy, sortDirection := resolveSort(req.Sort)
 	result, err := mig.ListChildrenDiffs(migration.ListChildrenDiffsRequest{
 		Path:          req.Path,
 		Limit:         req.Limit,
@@ -97,23 +124,7 @@ func ListChildrenDiffs(mig *migration.Migration, req ListChildrenDiffsRequest) (
 	if err != nil {
 		return ListChildrenDiffsResponse{}, fmt.Errorf("failed to list children diffs: %w", err)
 	}
-	items := make(map[string]PathNodes)
-	order := make([]string, 0, len(result.Items))
-	for _, item := range result.Items {
-		items[item.Path] = diffItemToPathNodes(item)
-		order = append(order, item.Path)
-	}
-	hasMore := result.Offset+result.Limit < result.Total
-	return ListChildrenDiffsResponse{
-		Items:     items,
-		ItemOrder: order,
-		Pagination: PaginationInfo{
-			Offset:  result.Offset,
-			Limit:   result.Limit,
-			Total:   result.Total,
-			HasMore: hasMore,
-		},
-	}, nil
+	return diffListResponse(result.Items, result.Offset, result.Limit, result.Total), nil
 }
 
 // GetChildrenDiffsStats calls the engine and converts to API response.
@@ -152,20 +163,10 @@ func enginePathReviewConditions(req SearchRequest) []migration.PathReviewSearchC
 	return out
 }
 
-// SearchPathReviewItems calls the engine and converts to API response.
-func SearchPathReviewItems(mig *migration.Migration, req SearchRequest, offset, limit int) (ListChildrenDiffsResponse, error) {
-	if mig == nil {
-		return ListChildrenDiffsResponse{}, fmt.Errorf("migration is nil")
-	}
-	sortBy := ""
-	sortDirection := "asc"
-	if req.Sort != nil {
-		sortBy = req.Sort.Field
-		if req.Sort.Direction != "" {
-			sortDirection = strings.ToLower(req.Sort.Direction)
-		}
-	}
-	result, err := mig.SearchPathReviewItems(migration.SearchRequest{
+// engineSearchRequest builds the engine search request shared by search and search-stats calls.
+func engineSearchRequest(req SearchRequest, offset, limit int) migration.SearchRequest {
+	sortBy, sortDirection := resolveSort(req.Sort)
+	return migration.SearchRequest{
 		Path:             "",
 		Limit:            limit,
 		Offset:           offset,
@@ -173,26 +174,19 @@ func SearchPathReviewItems(mig *migration.Migration, req SearchRequest, offset, 
 		SortDirection:    sortDirection,
 		Conditions:       enginePathReviewConditions(req),
 		StatusSearchType: req.StatusSearchType,
-	})
+	}
+}
+
+// SearchPathReviewItems calls the engine and converts to API response.
+func SearchPathReviewItems(mig *migration.Migration, req SearchRequest, offset, limit int) (ListChildrenDiffsResponse, error) {
+	if mig == nil {
+		return ListChildrenDiffsResponse{}, fmt.Errorf("migration is nil")
+	}
+	result, err := mig.SearchPathReviewItems(engineSearchRequest(req, offset, limit))
 	if err != nil {
 		return ListChildrenDiffsResponse{}, fmt.Errorf("failed to search path review items: %w", err)
 	}
-	items := make(map[string]PathNodes)
-	order := make([]string, 0, len(result.Items))
-	for _, item := range result.Items {
-		items[item.Path] = diffItemToPathNodes(item)
-		order = append(order, item.Path)
-	}
-	return ListChildrenDiffsResponse{
-		Items:     items,
-		ItemOrder: order,
-		Pagination: PaginationInfo{
-			Offset:  result.Offset,
-			Limit:   result.Limit,
-			Total:   result.Total,
-			HasMore: result.Offset+result.Limit < result.Total,
-		},
-	}, nil
+	return diffListResponse(result.Items, result.Offset, result.Limit, result.Total), nil
 }
 
 // GetSearchStats calls the engine and converts to API response.
@@ -200,24 +194,7 @@ func GetSearchStats(mig *migration.Migration, req SearchRequest) (DiffsStatsResp
 	if mig == nil {
 		return DiffsStatsResponse{}, fmt.Errorf("migration is nil")
 	}
-	sortBy := ""
-	sortDirection := "asc"
-	if req.Sort != nil {
-		sortBy = req.Sort.Field
-		if req.Sort.Direction != "" {
-			sortDirection = strings.ToLower(req.Sort.Direction)
-		}
-	}
-	engineReq := migration.SearchRequest{
-		Path:             "",
-		Limit:            10000,
-		Offset:           0,
-		SortBy:           sortBy,
-		SortDirection:    sortDirection,
-		Conditions:       enginePathReviewConditions(req),
-		StatusSearchType: req.StatusSearchType,
-	}
-	stats, err := mig.GetSearchStats(engineReq)
+	stats, err := mig.GetSearchStats(engineSearchRequest(req, 0, 10000))
 	if err != nil {
 		return DiffsStatsResponse{}, fmt.Errorf("failed to get search stats: %w", err)
 	}
@@ -228,49 +205,51 @@ func GetSearchStats(mig *migration.Migration, req SearchRequest) (DiffsStatsResp
 	}, nil
 }
 
-func asInt(v any) int {
-	switch t := v.(type) {
-	case int:
-		return t
-	case int32:
-		return int(t)
-	case int64:
-		return int(t)
-	case float64:
-		return int(t)
-	default:
-		return 0
-	}
+// commonQueueState fills the state fields shared by traversal and copy queues.
+func commonQueueState(m *ExternalQueueMetrics, name string, q map[string]any) {
+	m.Name = name
+	m.Round = convert.ToNumber[int](q["round"])
+	m.Pending = convert.ToNumber[int](q["pending"])
+	m.InProgress = convert.ToNumber[int](q["in_progress"])
+	m.Workers = convert.ToNumber[int](q["workers"])
+	m.TotalPending = convert.ToNumber[int](q["total_pending"])
+	m.TotalFailed = convert.ToNumber[int](q["total_failed"])
+	m.PossibleStall = convert.ToBool(q["possible_stall"])
 }
 
-func asInt64(v any) int64 {
-	switch t := v.(type) {
-	case int:
-		return int64(t)
-	case int32:
-		return int64(t)
-	case int64:
-		return t
-	case float64:
-		return int64(t)
-	default:
-		return 0
+func traversalQueueMetrics(name string, q map[string]any) *ExternalQueueMetrics {
+	m := &ExternalQueueMetrics{
+		FilesDiscoveredTotal:     convert.ToNumber[int64](q["files_discovered_total"]),
+		FoldersDiscoveredTotal:   convert.ToNumber[int64](q["folders_discovered_total"]),
+		DiscoveryRateItemsPerSec: convert.ToNumber[float64](q["discovery_rate_items_per_sec"]),
+		TotalDiscovered:          convert.ToNumber[int64](q["total_discovered"]),
 	}
+	commonQueueState(m, name, q)
+	return m
 }
 
-func asFloat64(v any) float64 {
-	switch t := v.(type) {
-	case float64:
-		return t
-	case float32:
-		return float64(t)
-	case int:
-		return float64(t)
-	case int64:
-		return float64(t)
-	default:
-		return 0
+func copyQueueMetrics(q map[string]any) *ExternalQueueMetrics {
+	m := &ExternalQueueMetrics{
+		Folders:        convert.ToNumber[int64](q["folders"]),
+		Files:          convert.ToNumber[int64](q["files"]),
+		Total:          convert.ToNumber[int64](q["total"]),
+		Bytes:          convert.ToNumber[int64](q["bytes"]),
+		ItemsPerSecond: convert.ToNumber[float64](q["items_per_second"]),
+		BytesPerSecond: convert.ToNumber[float64](q["bytes_per_second"]),
 	}
+	commonQueueState(m, "copy", q)
+	return m
+}
+
+func deleteQueueMetrics(q map[string]any) *ExternalQueueMetrics {
+	m := &ExternalQueueMetrics{
+		Folders:        convert.ToNumber[int64](q["folders"]),
+		Files:          convert.ToNumber[int64](q["files"]),
+		Total:          convert.ToNumber[int64](q["total"]),
+		ItemsPerSecond: convert.ToNumber[float64](q["items_per_second"]),
+	}
+	commonQueueState(m, "delete", q)
+	return m
 }
 
 // QueueMetricsFromMigration calls the engine and converts to API response.
@@ -282,53 +261,21 @@ func QueueMetricsFromMigration(mig *migration.Migration) (*QueueMetricsResponse,
 	if err != nil {
 		return nil, fmt.Errorf("failed to query queue metrics: %w", err)
 	}
-	resp := &QueueMetricsResponse{Success: true}
+	resp := &QueueMetricsResponse{Success: true, PossibleStall: mig.PossibleStall()}
 	if q, ok := metrics.Queues["src-traversal"]; ok {
-		resp.SrcTraversal = &ExternalQueueMetrics{
-			Name:                     "src-traversal",
-			FilesDiscoveredTotal:     asInt64(q["files_discovered_total"]),
-			FoldersDiscoveredTotal:   asInt64(q["folders_discovered_total"]),
-			DiscoveryRateItemsPerSec: asFloat64(q["discovery_rate_items_per_sec"]),
-			TotalDiscovered:          asInt64(q["total_discovered"]),
-			Round:                    asInt(q["round"]),
-			Pending:                  asInt(q["pending"]),
-			InProgress:               asInt(q["in_progress"]),
-			Workers:                  asInt(q["workers"]),
-			TotalPending:             asInt(q["total_pending"]),
-			TotalFailed:              asInt(q["total_failed"]),
-		}
+		resp.SrcTraversal = traversalQueueMetrics("src-traversal", q)
 	}
 	if q, ok := metrics.Queues["dst-traversal"]; ok {
-		resp.DstTraversal = &ExternalQueueMetrics{
-			Name:                     "dst-traversal",
-			FilesDiscoveredTotal:     asInt64(q["files_discovered_total"]),
-			FoldersDiscoveredTotal:   asInt64(q["folders_discovered_total"]),
-			DiscoveryRateItemsPerSec: asFloat64(q["discovery_rate_items_per_sec"]),
-			TotalDiscovered:          asInt64(q["total_discovered"]),
-			Round:                    asInt(q["round"]),
-			Pending:                  asInt(q["pending"]),
-			InProgress:               asInt(q["in_progress"]),
-			Workers:                  asInt(q["workers"]),
-			TotalPending:             asInt(q["total_pending"]),
-			TotalFailed:              asInt(q["total_failed"]),
-		}
+		resp.DstTraversal = traversalQueueMetrics("dst-traversal", q)
 	}
 	if q, ok := metrics.Queues["copy"]; ok {
-		resp.Copy = &ExternalQueueMetrics{
-			Name:           "copy",
-			Folders:        asInt64(q["folders"]),
-			Files:          asInt64(q["files"]),
-			Total:          asInt64(q["total"]),
-			Bytes:          asInt64(q["bytes"]),
-			ItemsPerSecond: asFloat64(q["items_per_second"]),
-			BytesPerSecond: asFloat64(q["bytes_per_second"]),
-			Round:          asInt(q["round"]),
-			Pending:        asInt(q["pending"]),
-			InProgress:     asInt(q["in_progress"]),
-			Workers:        asInt(q["workers"]),
-			TotalPending:   asInt(q["total_pending"]),
-			TotalFailed:    asInt(q["total_failed"]),
-		}
+		resp.Copy = copyQueueMetrics(q)
+	}
+	if q, ok := metrics.Queues["delete"]; ok {
+		resp.Delete = deleteQueueMetrics(q)
+	} else if q, ok := metrics.Queues["delete-traversal"]; ok {
+		// Legacy key from before delete queue used its own stats key.
+		resp.Delete = deleteQueueMetrics(q)
 	}
 	return resp, nil
 }
@@ -384,28 +331,30 @@ func mergePathReviewResults(a, b migration.PathReviewActionResult) migration.Pat
 	return out
 }
 
-// isCopyPhaseFamily is true when exclusion must be blocked (copy running, suspended mid-copy, or copy review).
+// isCopyPhaseFamily is true when exclusion must be blocked (copy or delete phase families).
 func isCopyPhaseFamily(phase string) bool {
 	switch phase {
-	case migration.PhaseCopying, migration.PhaseCopySuspended, migration.PhaseCopyReview:
+	case migration.PhaseCopying, migration.PhaseCopySuspended, migration.PhaseCopyReview,
+		migration.PhaseDeleting, migration.PhaseDeleteSuspended, migration.PhaseDeleteReview:
 		return true
 	default:
 		return false
 	}
 }
 
-// ExcludeNodes runs exclusion on the engine. Caller must call MarkPathReviewChanges after success if needed.
-// Returns error if migration is in copy phase. Response includes affectedCount and deltas for UI to update local stats.
-func ExcludeNodes(mig *migration.Migration, req ExclusionRequest) (*ExclusionResponse, error) {
+// SetNodesExcluded runs exclusion (excluded=true) or unexclusion (excluded=false) on the engine.
+// Caller must call MarkPathReviewChanges after success if needed. Returns error if migration is in
+// copy phase. Response includes affectedCount and deltas for UI to update local stats.
+func SetNodesExcluded(mig *migration.Migration, req ExclusionRequest, excluded bool) (*ExclusionResponse, error) {
 	if mig == nil {
-		return &ExclusionResponse{Success: false, Error: "migration is nil", Deltas: map[string]int64{}}, nil
+		return exclusionFromOutcome(nilMigrationOutcome()), nil
 	}
 	if isCopyPhaseFamily(mig.Phase()) {
-		return &ExclusionResponse{
-			Success: false,
-			Error:   "exclusion operations are not available in copy phase (exclusion only applies to traversal)",
-			Deltas:  map[string]int64{},
-		}, fmt.Errorf("exclusion operations are locked in copy phase")
+		resp, err := exclusionFromOutcome(pathReviewOutcome{
+			errMsg: "exclusion operations are not available in copy phase (exclusion only applies to traversal)",
+			deltas: emptyDeltas(),
+		}), fmt.Errorf("exclusion operations are locked in copy phase")
+		return resp, err
 	}
 	if req.All {
 		filter := migration.NodeQueryFilter{
@@ -413,136 +362,102 @@ func ExcludeNodes(mig *migration.Migration, req ExclusionRequest) (*ExclusionRes
 			Limit:  1000,
 			Offset: 0,
 		}
-		if req.Filter != nil && req.Filter.Status != "" {
-			filter.Status = req.Filter.Status
+		if excluded {
+			if req.Filter != nil && req.Filter.Status != "" {
+				filter.Status = req.Filter.Status
+			}
+		} else {
+			filter.Excluded = ptrBool(true)
 		}
-		res, err := mig.BulkExcludeWithPropagation(filter, true)
-		if err != nil {
-			return &ExclusionResponse{Success: false, Error: err.Error(), Deltas: map[string]int64{}}, err
-		}
-		aff, deltas := pathReviewResultToResponse(res)
-		return &ExclusionResponse{Success: true, AffectedCount: aff, Deltas: deltas}, nil
+		res, err := mig.BulkExcludeWithPropagation(filter, excluded)
+		resp := exclusionFromOutcome(outcomeFromSingle(res, err))
+		return resp, err
 	}
-	var merged migration.PathReviewActionResult
-	for _, nodeID := range req.NodeIDs {
-		r1, err := mig.SetNodeExcludedWithPropagation("SRC", nodeID, true)
+	merged, err := runPathReviewBatch(req.NodeIDs, func(nodeID string) (migration.PathReviewActionResult, error) {
+		r1, err := mig.SetNodeExcludedWithPropagation("SRC", nodeID, excluded)
 		if err != nil {
-			aff, deltas := pathReviewResultToResponse(merged)
-			return &ExclusionResponse{Success: false, Error: err.Error(), AffectedCount: aff, Deltas: deltas}, err
+			return migration.PathReviewActionResult{}, err
 		}
-		r2, err := mig.SetNodeExcludedWithPropagation("DST", nodeID, true)
+		r2, err := mig.SetNodeExcludedWithPropagation("DST", nodeID, excluded)
 		if err != nil {
-			aff, deltas := pathReviewResultToResponse(merged)
-			return &ExclusionResponse{Success: false, Error: err.Error(), AffectedCount: aff, Deltas: deltas}, err
+			return migration.PathReviewActionResult{}, err
 		}
-		merged = mergePathReviewResults(mergePathReviewResults(merged, r1), r2)
-	}
-	aff, deltas := pathReviewResultToResponse(merged)
-	return &ExclusionResponse{Success: true, AffectedCount: aff, Deltas: deltas}, nil
-}
-
-// UnexcludeNodes runs unexclude on the engine. Caller must call MarkPathReviewChanges after success if needed.
-func UnexcludeNodes(mig *migration.Migration, req ExclusionRequest) (*ExclusionResponse, error) {
-	if mig == nil {
-		return &ExclusionResponse{Success: false, Error: "migration is nil", Deltas: map[string]int64{}}, nil
-	}
-	if isCopyPhaseFamily(mig.Phase()) {
-		return &ExclusionResponse{
-			Success: false,
-			Error:   "exclusion operations are not available in copy phase (exclusion only applies to traversal)",
-			Deltas:  map[string]int64{},
-		}, fmt.Errorf("exclusion operations are locked in copy phase")
-	}
-	if req.All {
-		res, err := mig.BulkExcludeWithPropagation(migration.NodeQueryFilter{
-			Queue:    "SRC",
-			Excluded: ptrBool(true),
-			Limit:    1000,
-		}, false)
-		if err != nil {
-			return &ExclusionResponse{Success: false, Error: err.Error(), Deltas: map[string]int64{}}, err
-		}
-		aff, deltas := pathReviewResultToResponse(res)
-		return &ExclusionResponse{Success: true, AffectedCount: aff, Deltas: deltas}, nil
-	}
-	var merged migration.PathReviewActionResult
-	for _, nodeID := range req.NodeIDs {
-		r1, err := mig.SetNodeExcludedWithPropagation("SRC", nodeID, false)
-		if err != nil {
-			aff, deltas := pathReviewResultToResponse(merged)
-			return &ExclusionResponse{Success: false, Error: err.Error(), AffectedCount: aff, Deltas: deltas}, err
-		}
-		r2, err := mig.SetNodeExcludedWithPropagation("DST", nodeID, false)
-		if err != nil {
-			aff, deltas := pathReviewResultToResponse(merged)
-			return &ExclusionResponse{Success: false, Error: err.Error(), AffectedCount: aff, Deltas: deltas}, err
-		}
-		merged = mergePathReviewResults(mergePathReviewResults(merged, r1), r2)
-	}
-	aff, deltas := pathReviewResultToResponse(merged)
-	return &ExclusionResponse{Success: true, AffectedCount: aff, Deltas: deltas}, nil
+		return mergePathReviewResults(r1, r2), nil
+	})
+	resp := exclusionFromOutcome(outcomeFromBatch(merged, err, true))
+	return resp, err
 }
 
 func ptrBool(v bool) *bool { return &v }
 
-// MarkNodesForRetryDiscovery calls the engine. Caller should call MarkPathReviewChanges after success.
-func MarkNodesForRetryDiscovery(mig *migration.Migration, req MarkRetryRequest) (*MarkRetryResponse, error) {
+// MarkNodesForRetry calls the engine for discovery or copy retry marking.
+// Caller should call MarkPathReviewChanges after success.
+func MarkNodesForRetry(mig *migration.Migration, kind RetryKind, req MarkRetryRequest) (*MarkRetryResponse, error) {
 	if mig == nil {
-		return &MarkRetryResponse{Success: false, Error: "migration is nil", Deltas: map[string]int64{}}, nil
+		return markRetryFromOutcome(nilMigrationOutcome()), nil
 	}
-	var merged migration.PathReviewActionResult
-	for _, nodeID := range req.NodeIDs {
-		res, err := mig.MarkNodeForRetryDiscovery(nodeID)
-		if err != nil {
-			aff, deltas := pathReviewResultToResponse(merged)
-			return &MarkRetryResponse{Success: false, Error: err.Error(), AffectedCount: aff, Deltas: deltas}, err
-		}
-		merged = mergePathReviewResults(merged, res)
-	}
-	aff, deltas := pathReviewResultToResponse(merged)
-	return &MarkRetryResponse{Success: true, AffectedCount: aff, Deltas: deltas}, nil
+	merged, err := runPathReviewBatch(req.NodeIDs, func(nodeID string) (migration.PathReviewActionResult, error) {
+		return retryNode(mig, kind, nodeID, true)
+	})
+	resp := markRetryFromOutcome(outcomeFromBatch(merged, err, true))
+	return resp, err
 }
 
-// MarkNodesForRetryCopy calls the engine. Caller should call MarkPathReviewChanges after success.
-func MarkNodesForRetryCopy(mig *migration.Migration, req MarkRetryRequest) (*MarkRetryResponse, error) {
+// UnmarkNodeForRetry calls the engine for discovery or copy retry unmarking.
+// Caller should call MarkPathReviewChanges after success.
+func UnmarkNodeForRetry(mig *migration.Migration, kind RetryKind, nodeID string) (*MarkRetryResponse, error) {
 	if mig == nil {
-		return &MarkRetryResponse{Success: false, Error: "migration is nil", Deltas: map[string]int64{}}, nil
+		return markRetryFromOutcome(nilMigrationOutcome()), nil
 	}
-	var merged migration.PathReviewActionResult
-	for _, nodeID := range req.NodeIDs {
-		res, err := mig.MarkNodeForRetryCopy(nodeID)
-		if err != nil {
-			aff, deltas := pathReviewResultToResponse(merged)
-			return &MarkRetryResponse{Success: false, Error: err.Error(), AffectedCount: aff, Deltas: deltas}, err
-		}
-		merged = mergePathReviewResults(merged, res)
-	}
-	aff, deltas := pathReviewResultToResponse(merged)
-	return &MarkRetryResponse{Success: true, AffectedCount: aff, Deltas: deltas}, nil
+	res, err := retryNode(mig, kind, nodeID, false)
+	resp := markRetryFromOutcome(outcomeFromSingle(res, err))
+	return resp, err
 }
 
-// UnmarkNodeForRetryDiscovery calls the engine. Caller should call MarkPathReviewChanges after success.
-func UnmarkNodeForRetryDiscovery(mig *migration.Migration, nodeID string) (*MarkRetryResponse, error) {
-	if mig == nil {
-		return &MarkRetryResponse{Success: false, Error: "migration is nil", Deltas: map[string]int64{}}, nil
+// retryNode dispatches to the engine's mark/unmark retry method for the given kind.
+func retryNode(mig *migration.Migration, kind RetryKind, nodeID string, mark bool) (migration.PathReviewActionResult, error) {
+	switch {
+	case mark && kind == RetryKindCopy:
+		return mig.MarkNodeForRetryCopy(nodeID)
+	case mark && kind == RetryKindDelete:
+		return mig.MarkNodeForRetryDelete(nodeID)
+	case mark:
+		return mig.MarkNodeForRetryDiscovery(nodeID)
+	case kind == RetryKindCopy:
+		return mig.UnmarkNodeForRetryCopy(nodeID)
+	case kind == RetryKindDelete:
+		return mig.UnmarkNodeForRetryDelete(nodeID)
+	default:
+		return mig.UnmarkNodeForRetryDiscovery(nodeID)
 	}
-	res, err := mig.UnmarkNodeForRetryDiscovery(nodeID)
-	if err != nil {
-		return &MarkRetryResponse{Success: false, Error: err.Error(), Deltas: map[string]int64{}}, err
-	}
-	aff, deltas := pathReviewResultToResponse(res)
-	return &MarkRetryResponse{Success: true, AffectedCount: aff, Deltas: deltas}, nil
 }
 
-// UnmarkNodeForRetryCopy calls the engine. Caller should call MarkPathReviewChanges after success.
-func UnmarkNodeForRetryCopy(mig *migration.Migration, nodeID string) (*MarkRetryResponse, error) {
+// PrepareSourceCleanup aligns delete_status with selected SRC nodes before source removal.
+func PrepareSourceCleanup(mig *migration.Migration, req PrepareSourceCleanupRequest) (*MarkRetryResponse, error) {
 	if mig == nil {
-		return &MarkRetryResponse{Success: false, Error: "migration is nil", Deltas: map[string]int64{}}, nil
+		return markRetryFromOutcome(nilMigrationOutcome()), nil
 	}
-	res, err := mig.UnmarkNodeForRetryCopy(nodeID)
-	if err != nil {
-		return &MarkRetryResponse{Success: false, Error: err.Error(), Deltas: map[string]int64{}}, err
+	res, err := mig.PrepareSourceCleanup(req.NodeIDs, req.DeselectedNodeIDs)
+	resp := markRetryFromOutcome(outcomeFromSingle(res, err))
+	return resp, err
+}
+
+// SkipNodeDelete opts a node out of source removal during cleanup planning.
+func SkipNodeDelete(mig *migration.Migration, nodeID string) (*MarkRetryResponse, error) {
+	if mig == nil {
+		return markRetryFromOutcome(nilMigrationOutcome()), nil
 	}
-	aff, deltas := pathReviewResultToResponse(res)
-	return &MarkRetryResponse{Success: true, AffectedCount: aff, Deltas: deltas}, nil
+	res, err := mig.SkipNodeDelete(nodeID)
+	resp := markRetryFromOutcome(outcomeFromSingle(res, err))
+	return resp, err
+}
+
+// UnskipNodeDelete re-includes a node in source removal during cleanup planning.
+func UnskipNodeDelete(mig *migration.Migration, nodeID string) (*MarkRetryResponse, error) {
+	if mig == nil {
+		return markRetryFromOutcome(nilMigrationOutcome()), nil
+	}
+	res, err := mig.UnskipNodeDelete(nodeID)
+	resp := markRetryFromOutcome(outcomeFromSingle(res, err))
+	return resp, err
 }

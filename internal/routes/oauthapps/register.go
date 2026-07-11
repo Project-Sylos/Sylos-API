@@ -18,9 +18,13 @@ type handler struct {
 
 func Register(router chi.Router, logger zerolog.Logger, mgr *manager.Manager, mw *middleware.Middleware) {
 	h := handler{logger: logger, mgr: mgr}
-	router.With(appauth.RequireRole("admin")).Get("/oauth-apps", middleware.NoBody(mw, h.list))
+	router.Get("/oauth-apps", middleware.NoBody(mw, h.list))
+	router.Get("/oauth-apps/health/summary", middleware.NoBody(mw, h.healthSummary))
+	router.Post("/oauth-apps/{providerID}/test", middleware.JSON(mw, h.test))
+	router.With(appauth.RequireRole("admin")).Get("/oauth-apps/health/settings", middleware.NoBody(mw, h.healthSettings))
+	router.With(appauth.RequireRole("admin")).Put("/oauth-apps/health/settings", middleware.JSON(mw, h.saveHealthSettings))
 	router.With(appauth.RequireRole("admin")).Put("/oauth-apps/{providerID}", middleware.JSON(mw, h.save))
-	router.With(appauth.RequireRole("admin")).Post("/oauth-apps/{providerID}/test", middleware.JSON(mw, h.test))
+	router.With(appauth.RequireRole("admin")).Delete("/oauth-apps/{providerID}", middleware.NoBody(mw, h.delete))
 }
 
 func (h handler) list(ctx *middleware.Context) {
@@ -30,6 +34,32 @@ func (h handler) list(ctx *middleware.Context) {
 		return
 	}
 	ctx.Response(http.StatusOK, items)
+}
+
+func (h handler) healthSummary(ctx *middleware.Context) {
+	summary, err := h.mgr.GetOAuthHealthSummary(ctx.Request().Context())
+	if err != nil {
+		ctx.Error(http.StatusInternalServerError, "failed to read oauth health summary", err)
+		return
+	}
+	ctx.Response(http.StatusOK, summary)
+}
+
+func (h handler) healthSettings(ctx *middleware.Context) {
+	settings, err := h.mgr.GetOAuthHealthSettings(ctx.Request().Context())
+	if err != nil {
+		ctx.Error(http.StatusInternalServerError, "failed to read oauth health settings", err)
+		return
+	}
+	ctx.Response(http.StatusOK, settings)
+}
+
+func (h handler) saveHealthSettings(ctx *middleware.Context, req manager.OAuthHealthSettings) {
+	if err := h.mgr.SaveOAuthHealthSettings(ctx.Request().Context(), req); err != nil {
+		ctx.Error(http.StatusBadRequest, "failed to save oauth health settings", err)
+		return
+	}
+	ctx.Response(http.StatusNoContent, nil)
 }
 
 func (h handler) save(ctx *middleware.Context, req manager.SaveOAuthAppRequest) {
@@ -48,4 +78,13 @@ func (h handler) test(ctx *middleware.Context, req manager.TestOAuthAppRequest) 
 		return
 	}
 	ctx.Response(http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (h handler) delete(ctx *middleware.Context) {
+	providerID := chi.URLParam(ctx.Request(), "providerID")
+	if err := h.mgr.DeleteOAuthApp(ctx.Request().Context(), providerID); err != nil {
+		ctx.Error(http.StatusBadRequest, "failed to delete oauth app", err)
+		return
+	}
+	ctx.Response(http.StatusNoContent, nil)
 }

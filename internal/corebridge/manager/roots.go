@@ -4,11 +4,11 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/apidb"
-	"codeberg.org/Sylos/Sylos-API/internal/corebridge/database"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/roots"
 )
 
@@ -28,13 +28,13 @@ func (m *Manager) SetRoot(ctx context.Context, req corebridge.SetRootRequest) (c
 			return corebridge.SetRootResponse{}, err
 		}
 		// Per-migration flow: create folder and materialize the migration (DB + row) so Start and polling never race on pending→persist.
-		migrationDir := database.GetMigrationDir(m.cfg.Runtime.DataDir, migrationID)
+		migrationDir := filepath.Join(m.cfg.Runtime.DataDir, migrationID)
 		_ = os.MkdirAll(migrationDir, 0755)
 		if _, err := m.GetMigration(ctx, migrationID); err != nil {
 			return corebridge.SetRootResponse{}, err
 		}
 	} else {
-		migrationDir := database.GetMigrationDir(m.cfg.Runtime.DataDir, migrationID)
+		migrationDir := filepath.Join(m.cfg.Runtime.DataDir, migrationID)
 		if err := os.MkdirAll(migrationDir, 0o755); err != nil {
 			return corebridge.SetRootResponse{}, err
 		}
@@ -42,7 +42,7 @@ func (m *Manager) SetRoot(ctx context.Context, req corebridge.SetRootRequest) (c
 		if err != nil {
 			return corebridge.SetRootResponse{}, err
 		}
-		engMig, err := m.getEngineMigration(migrationID)
+		engMig, err := m.GetMigration(ctx, migrationID)
 		if err != nil && err != corebridge.ErrMigrationNotFound {
 			return corebridge.SetRootResponse{}, err
 		}
@@ -93,6 +93,7 @@ func (m *Manager) SetRoot(ctx context.Context, req corebridge.SetRootRequest) (c
 	if err := m.initializePlanAdapters(resp.MigrationID); err != nil {
 		m.logger.Warn().Err(err).Str("migration_id", resp.MigrationID).Msg("initialize fs adapters")
 	}
+	m.refreshDefaultMigrationName(ctx, resp.MigrationID)
 
 	existingMeta, err := m.getMigrationRecord(resp.MigrationID)
 	isNewMigration := true
@@ -100,9 +101,17 @@ func (m *Manager) SetRoot(ctx context.Context, req corebridge.SetRootRequest) (c
 		isNewMigration = existingMeta.IsNewMigration
 	}
 
+	recName := resp.MigrationID
+	if mig, migErr := m.GetMigration(ctx, resp.MigrationID); migErr == nil && mig != nil {
+		if n := strings.TrimSpace(mig.GetName()); n != "" {
+			recName = n
+		}
+	} else if existingMeta.ID != "" && existingMeta.Name != "" {
+		recName = existingMeta.Name
+	}
 	rec := apidb.MigrationRecord{
 		ID:             resp.MigrationID,
-		Name:           resp.MigrationID,
+		Name:           recName,
 		DatabasePath:   resp.DatabasePath,
 		IsNewMigration: isNewMigration,
 	}

@@ -28,7 +28,7 @@ func (h handler) excludeNodes(ctx *middleware.Context, payload corebridge.Exclus
 		ctx.Error(http.StatusInternalServerError, "failed to get migration", err)
 		return
 	}
-	result, err := corebridge.ExcludeNodes(mig, payload)
+	result, err := corebridge.SetNodesExcluded(mig, payload, true)
 	if err != nil {
 		ctx.Error(http.StatusInternalServerError, "failed to exclude nodes", err)
 		return
@@ -59,7 +59,7 @@ func (h handler) unexcludeNodes(ctx *middleware.Context, payload corebridge.Excl
 		ctx.Error(http.StatusInternalServerError, "failed to get migration", err)
 		return
 	}
-	result, err := corebridge.UnexcludeNodes(mig, payload)
+	result, err := corebridge.SetNodesExcluded(mig, payload, false)
 	if err != nil {
 		ctx.Error(http.StatusInternalServerError, "failed to unexclude nodes", err)
 		return

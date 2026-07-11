@@ -1,6 +1,7 @@
 package manager
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 
@@ -14,17 +15,17 @@ func (m *Manager) initializePlanAdapters(migrationID string) error {
 	if plan == nil {
 		return nil
 	}
-	mig, err := m.getEngineMigration(migrationID)
+	mig, err := m.GetMigration(context.Background(), migrationID)
 	if err != nil || mig == nil {
 		return err
 	}
 	if plan.SourceAdapter != nil && plan.SourceDefinition.Type == services.ServiceTypeCloud {
-		if err := m.serviceMgr.FSManager().InitializeCloudAdapter(plan.SourceAdapter, nil, plan.SourceConnectionID); err != nil {
+		if err := m.serviceMgr.FS.InitializeCloudAdapter(plan.SourceAdapter, nil, plan.SourceConnectionID); err != nil {
 			return fmt.Errorf("initialize source cloud adapter: %w", err)
 		}
 	}
 	if plan.DestinationAdapter != nil && plan.DestinationDefinition.Type == services.ServiceTypeCloud {
-		if err := m.serviceMgr.FSManager().InitializeCloudAdapter(plan.DestinationAdapter, nil, plan.DestinationConnectionID); err != nil {
+		if err := m.serviceMgr.FS.InitializeCloudAdapter(plan.DestinationAdapter, nil, plan.DestinationConnectionID); err != nil {
 			return fmt.Errorf("initialize destination cloud adapter: %w", err)
 		}
 	}
@@ -40,7 +41,7 @@ func (m *Manager) rehydrateCloudConnection(migrationID string, binding migration
 	if err != nil {
 		return err
 	}
-	_, err = m.serviceMgr.RegisterCloudConnection(fslib.CloudConnectionOptions{
+	_, err = m.serviceMgr.FS.RegisterCloudConnection(fslib.CloudConnectionOptions{
 		ProviderID:      services.CloudProviderID(def),
 		ConnectionID:    binding.ConnectionID,
 		CredentialsJSON: credsJSON,

@@ -17,7 +17,13 @@ func (h handler) updatePreferences(ctx *middleware.Context, prefs Preferences) {
 
 	prefs = mergeWithDefaults(prefs)
 
-	data, err := json.Marshal(prefs)
+	normalized, err := validatePreferences(prefs)
+	if err != nil {
+		ctx.Error(http.StatusBadRequest, err.Error(), err)
+		return
+	}
+
+	data, err := json.Marshal(normalized)
 	if err != nil {
 		h.logger.Error().Err(err).Msg("failed to serialize preferences")
 		ctx.Error(http.StatusInternalServerError, "failed to serialize preferences", err)
@@ -31,5 +37,5 @@ func (h handler) updatePreferences(ctx *middleware.Context, prefs Preferences) {
 	}
 
 	h.logger.Info().Str("user_id", claims.Subject).Msg("preferences saved")
-	ctx.Response(http.StatusOK, prefs)
+	ctx.Response(http.StatusOK, normalized)
 }

@@ -13,10 +13,14 @@ import (
 
 // OAuthAppSummary is returned to the UI (no client secret).
 type OAuthAppSummary struct {
-	ProviderID  string `json:"providerId"`
-	DisplayName string `json:"displayName"`
-	Configured  bool   `json:"configured"`
-	ClientID    string `json:"clientId,omitempty"`
+	ProviderID    string     `json:"providerId"`
+	DisplayName   string     `json:"displayName"`
+	Configured    bool       `json:"configured"`
+	ClientID      string     `json:"clientId,omitempty"`
+	HealthStatus         string     `json:"healthStatus"`
+	HealthError          string     `json:"healthError,omitempty"`
+	LastCheckedAt        *time.Time `json:"lastCheckedAt,omitempty"`
+	HealthMonitorEnabled bool       `json:"healthMonitorEnabled"`
 }
 
 type SaveOAuthAppRequest struct {
@@ -41,16 +45,13 @@ func (m *Manager) ListOAuthApps(_ context.Context) ([]OAuthAppSummary, error) {
 	out := make([]OAuthAppSummary, 0, len(known))
 	for _, k := range known {
 		summary := OAuthAppSummary{
-			ProviderID:  k.id,
-			DisplayName: k.name,
+			ProviderID:   k.id,
+			DisplayName:  k.name,
+			HealthStatus: OAuthHealthNotConfigured,
 		}
 		if m.apiDB != nil {
 			if app, err := m.apiDB.GetProviderOAuthApp(k.id); err == nil {
-				summary.Configured = app.ClientID != "" && app.ClientSecret != ""
-				summary.ClientID = app.ClientID
-				if app.DisplayName != "" {
-					summary.DisplayName = app.DisplayName
-				}
+				summary = oauthSummaryFromApp(app, k.name)
 			}
 		}
 		out = append(out, summary)
@@ -78,14 +79,7 @@ func (m *Manager) SaveOAuthApp(_ context.Context, providerID string, req SaveOAu
 
 	displayName := req.DisplayName
 	if displayName == "" {
-		switch providerID {
-		case "google_drive":
-			displayName = "Google Drive"
-		case "dropbox":
-			displayName = "Dropbox"
-		default:
-			displayName = providerID
-		}
+		displayName = oauthProviderDisplayName(providerID)
 	}
 	if err := m.apiDB.UpsertProviderOAuthApp(apidb.ProviderOAuthApp{
 		ProviderID:   providerID,
@@ -97,6 +91,19 @@ func (m *Manager) SaveOAuthApp(_ context.Context, providerID string, req SaveOAu
 		return err
 	}
 	m.refreshOAuthCredsFromDB()
+	summary, _ := m.checkOAuthProviderHealth(providerID, false)
+	_ = summary
+	return nil
+}
+
+func (m *Manager) DeleteOAuthApp(_ context.Context, providerID string) error {
+	if m.apiDB == nil {
+		return fmt.Errorf("API database not configured")
+	}
+	if err := m.apiDB.DeleteProviderOAuthApp(providerID); err != nil {
+		return err
+	}
+	m.refreshOAuthCredsFromDB()
 	return nil
 }
 
@@ -105,16 +112,30 @@ func (m *Manager) TestOAuthApp(_ context.Context, providerID string, req TestOAu
 	if err != nil {
 		return err
 	}
-	return oauth.ValidateAppCredentials(providerID, creds)
+	checkErr := oauth.ValidateAppCredentials(providerID, creds)
+	inUse := m.providersInUseByLiveMigrations()
+	skip := inUse[providerID]
+	if skip {
+		_, _ = m.checkOAuthProviderHealth(providerID, true)
+		return fmt.Errorf("cannot test %s while it is in use by a live migration", providerID)
+	}
+	if checkErr != nil {
+		_, _ = m.checkOAuthProviderHealth(providerID, false)
+		return checkErr
+	}
+	_, _ = m.checkOAuthProviderHealth(providerID, false)
+	return nil
 }
 
 func (m *Manager) resolveOAuthAppCredentials(providerID string, req TestOAuthAppRequest) (oauthcreds.ProviderCredentials, error) {
 	clientID := strings.TrimSpace(req.ClientID)
 	clientSecret := strings.TrimSpace(req.ClientSecret)
 
-	if clientID == "" && m.apiDB != nil {
+	if m.apiDB != nil {
 		if app, err := m.apiDB.GetProviderOAuthApp(providerID); err == nil {
-			clientID = app.ClientID
+			if clientID == "" {
+				clientID = app.ClientID
+			}
 			if clientSecret == "" {
 				clientSecret = app.ClientSecret
 			}

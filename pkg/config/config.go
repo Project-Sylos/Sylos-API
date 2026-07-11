@@ -1,8 +1,6 @@
 package config
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -166,15 +164,6 @@ func (c *Config) normalizeRuntime(configFile string) error {
 	return nil
 }
 
-func generateEphemeralSecret() string {
-	const secretBytes = 32
-	b := make([]byte, secretBytes)
-	if _, err := rand.Read(b); err != nil {
-		return fmt.Sprintf("ephemeral-%d", time.Now().UnixNano())
-	}
-	return hex.EncodeToString(b)
-}
-
 type RuntimeConfig struct {
 	DataDir                string `mapstructure:"data_dir"`
 	MigrationDBStorageDir  string `mapstructure:"migration_db_storage_dir"`
@@ -251,6 +240,13 @@ func (p ProvidersConfig) applyDefaults() {
 				"sharing.read",
 				"team_data.team_space",
 			},
+		}
+	}
+	if _, ok := p["sftp"]; !ok {
+		p["sftp"] = ProviderConfig{
+			Enabled:     true,
+			DisplayName: "SFTP",
+			ServiceID:   "sftp",
 		}
 	}
 	for id, cfg := range p {

@@ -23,6 +23,8 @@ func Register(router chi.Router, logger zerolog.Logger, mgr *manager.Manager, mw
 	router.Post("/providers/{providerID}/connections", middleware.JSON(mw, h.createConnection))
 	router.Post("/providers/{providerID}/connections/{connectionID}/oauth/exchange", middleware.JSON(mw, h.exchangeOAuth))
 	router.Post("/providers/{providerID}/connections/{connectionID}/tokens", middleware.JSON(mw, h.postTokens))
+	router.Post("/providers/{providerID}/connections/{connectionID}/credentials", middleware.JSON(mw, h.postCredentials))
+	router.Post("/providers/{providerID}/host-key/probe", middleware.JSON(mw, h.probeHostKey))
 	router.Get("/providers/{providerID}/connections/{connectionID}/status", middleware.NoBody(mw, h.connectionStatus))
 	router.Delete("/providers/{providerID}/connections/{connectionID}", middleware.NoBody(mw, h.revokeConnection))
 	router.Get("/providers/{providerID}/connections/{connectionID}/roots", middleware.NoBody(mw, h.listRoots))
@@ -60,6 +62,27 @@ func (h handler) postTokens(ctx *middleware.Context, req corebridge.OAuthTokenRe
 	status, err := h.mgr.PostProviderTokens(ctx.Request().Context(), providerID, connectionID, req)
 	if err != nil {
 		ctx.Error(http.StatusBadRequest, "failed to store tokens", err)
+		return
+	}
+	ctx.Response(http.StatusOK, status)
+}
+
+func (h handler) probeHostKey(ctx *middleware.Context, req corebridge.SFTPHostKeyProbeRequest) {
+	providerID := chi.URLParam(ctx.Request(), "providerID")
+	resp, err := h.mgr.ProbeSFTPHostKey(ctx.Request().Context(), providerID, req)
+	if err != nil {
+		ctx.Error(http.StatusBadRequest, "failed to probe host key", err)
+		return
+	}
+	ctx.Response(http.StatusOK, resp)
+}
+
+func (h handler) postCredentials(ctx *middleware.Context, req corebridge.SFTPCredentialsRequest) {
+	providerID := chi.URLParam(ctx.Request(), "providerID")
+	connectionID := chi.URLParam(ctx.Request(), "connectionID")
+	status, err := h.mgr.PostProviderCredentials(ctx.Request().Context(), providerID, connectionID, req)
+	if err != nil {
+		ctx.Error(http.StatusBadRequest, "failed to store credentials", err)
 		return
 	}
 	ctx.Response(http.StatusOK, status)

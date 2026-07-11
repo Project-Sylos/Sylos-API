@@ -1,5 +1,5 @@
 #!/bin/bash
-# Deprecated: use Settings > Danger zone or POST /api/admin/clean-slate (admin JWT required).
+# Deprecated: use POST /api/admin/clear-migrations (migration data only) or POST /api/admin/wipe-install (full reset).
 # This script will delete all data from the server and start fresh.
 
 echo "Cleaning api data..."
