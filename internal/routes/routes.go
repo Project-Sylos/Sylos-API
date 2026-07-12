@@ -66,7 +66,7 @@ func New(deps Dependencies) chi.Router {
 	healthroutes.Register(apiRouter)
 	authroutes.RegisterProtected(apiRouter, deps.Logger, deps.UserStore, mw)
 	usersroutes.Register(apiRouter, deps.Logger, deps.UserStore, mw)
-	serviceroutes.Register(apiRouter, deps.Logger, deps.CoreBridge, mw)
+	serviceroutes.Register(apiRouter, deps.Logger, deps.CoreBridge, deps.UserStore, mw)
 	providerroutes.Register(apiRouter, deps.Logger, deps.Manager, mw)
 	oauthappsroutes.Register(apiRouter, deps.Logger, deps.Manager, mw)
 	adminroutes.Register(apiRouter, deps.Logger, deps.Manager, mw)

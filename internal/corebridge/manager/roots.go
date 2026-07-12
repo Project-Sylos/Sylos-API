@@ -47,15 +47,13 @@ func (m *Manager) SetRoot(ctx context.Context, req corebridge.SetRootRequest) (c
 			return corebridge.SetRootResponse{}, err
 		}
 		if engMig == nil {
-			key, keyErr := m.apiDB.EnsureMigrationKey(migrationID)
-			if keyErr != nil {
+			if _, keyErr := m.apiDB.EnsureMigrationKey(migrationID); keyErr != nil {
 				return corebridge.SetRootResponse{}, keyErr
 			}
 			if _, err := m.engineMgr.CreateMigration(migration.CreateMigrationConfig{
-				Name:          "migration",
-				MigrationDir:  absDir,
-				MigrationID:   migrationID,
-				EncryptionKey: key,
+				Name:         "migration",
+				MigrationDir: absDir,
+				MigrationID:  migrationID,
 			}); err != nil {
 				return corebridge.SetRootResponse{}, err
 			}

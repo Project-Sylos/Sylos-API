@@ -48,7 +48,7 @@ func Run(ctx context.Context, opts Options) error {
 
 	apiDBPath := filepath.Join(cfg.Runtime.DataDir, "sylos.duckdb")
 	if _, err := os.Stat(apiDBPath); os.IsNotExist(err) {
-		log.Warn().Str("path", apiDBPath).Msg("sylos.duckdb not found; creating a new encrypted API database")
+		log.Warn().Str("path", apiDBPath).Msg("sylos.duckdb not found; creating a new API database")
 	}
 
 	apiDB, err := apidb.Open(cfg.Runtime.DataDir, masterKey)

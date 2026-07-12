@@ -10,36 +10,34 @@ import (
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/apidb"
 )
 
-// Opener resolves per-migration encryption keys and opens migration DuckDBs through the engine.
+// Opener resolves per-migration keys from the API database and opens plaintext migration DuckDBs.
+// Per-migration keys are stored encrypted in sylos.duckdb (wrapped by the install master key from the OS keyring).
+// Token encryption inside migration DBs uses the decrypted per-migration key via the engine.
 type Opener struct {
-	APIDB     *apidb.DB
-	Engine    *migration.MigrationManager
-	DataDir   string
+	APIDB   *apidb.DB
+	Engine  *migration.MigrationManager
+	DataDir string
 }
 
-// AuthorizeMigrationAccess is a stub RBAC hook; allow-all until roles are defined.
-func AuthorizeMigrationAccess(_ string, _ string) error {
-	return nil
-}
-
-// OpenMigrationDB looks up the migration key, opens the encrypted migration DB, and returns the engine migration.
+// OpenMigrationDB loads the per-migration key and opens the migration database.
 func (o *Opener) OpenMigrationDB(ctx context.Context, migrationID, userID string) (*migration.Migration, error) {
 	_ = ctx
-	if err := AuthorizeMigrationAccess(userID, migrationID); err != nil {
-		return nil, err
-	}
+	_ = userID
 	if o.APIDB == nil {
 		return nil, fmt.Errorf("API database not configured")
 	}
-	key, err := o.APIDB.EnsureMigrationKey(migrationID)
+
+	tokenKey, err := o.APIDB.EnsureMigrationKey(migrationID)
 	if err != nil {
 		return nil, fmt.Errorf("migration key for %q: %w", migrationID, err)
 	}
+
 	migrationDir, err := filepath.Abs(filepath.Join(o.DataDir, migrationID))
 	if err != nil {
 		return nil, err
 	}
-	mig, err := o.Engine.GetMigration(migrationID, migrationDir, key)
+
+	mig, err := o.Engine.GetMigration(migrationID, migrationDir, tokenKey)
 	if err != nil {
 		return nil, err
 	}

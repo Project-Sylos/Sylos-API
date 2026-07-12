@@ -4,20 +4,23 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/rs/zerolog"
 
+	"codeberg.org/Sylos/Sylos-API/internal/auth/users"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
 	"codeberg.org/Sylos/Sylos-API/internal/routes/middleware"
 )
 
 type handler struct {
-	logger zerolog.Logger
-	core   corebridge.Bridge
+	logger    zerolog.Logger
+	core      corebridge.Bridge
+	userStore *users.Store
 }
 
 // Register mounts filesystem service discovery and browsing routes.
-func Register(router chi.Router, logger zerolog.Logger, core corebridge.Bridge, mw *middleware.Middleware) {
+func Register(router chi.Router, logger zerolog.Logger, core corebridge.Bridge, userStore *users.Store, mw *middleware.Middleware) {
 	h := handler{
-		logger: logger,
-		core:   core,
+		logger:    logger,
+		core:      core,
+		userStore: userStore,
 	}
 
 	router.Get("/services", middleware.NoBody(mw, h.listServices))

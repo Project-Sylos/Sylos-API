@@ -95,6 +95,7 @@ func Load() (Config, error) {
 	if err := v.UnmarshalKey("services", &cfg.Services); err != nil {
 		return Config{}, fmt.Errorf("failed to parse services config: %w", err)
 	}
+	cfg.Services.applyDefaults()
 
 	if err := v.UnmarshalKey("providers", &cfg.Providers); err != nil {
 		return Config{}, fmt.Errorf("failed to parse providers config: %w", err)
@@ -229,7 +230,7 @@ func (p ProvidersConfig) applyDefaults() {
 	}
 	if _, ok := p["dropbox"]; !ok {
 		p["dropbox"] = ProviderConfig{
-			Enabled:     false,
+			Enabled:     true,
 			DisplayName: "Dropbox",
 			ServiceID:   "dropbox",
 			Scopes: []string{
@@ -258,5 +259,14 @@ func (p ProvidersConfig) applyDefaults() {
 			cfg.DisplayName = id
 			p[id] = cfg
 		}
+	}
+}
+
+func (s *ServicesConfig) applyDefaults() {
+	if len(s.Local) == 0 {
+		s.Local = []LocalServiceConfig{{
+			ID:   "local",
+			Name: "Local Filesystem",
+		}}
 	}
 }

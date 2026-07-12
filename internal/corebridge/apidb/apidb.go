@@ -12,45 +12,44 @@ import (
 
 	_ "github.com/marcboeker/go-duckdb"
 	enginedb "codeberg.org/Sylos/Migration-Engine/pkg/db"
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge/migrationkey"
 )
 
 const defaultDBName = "sylos.duckdb"
 
-// DB is the encrypted Sylos API database (users, migrations registry, keys, provider OAuth apps).
+// DB is the Sylos API database (users, migrations registry, encrypted per-migration keys, provider OAuth apps).
 type DB struct {
-	path       string
-	masterKey  []byte
-	engine     *enginedb.DB
-	sql        *sql.DB
+	path      string
+	masterKey []byte
+	sql       *sql.DB
 }
 
-// Open opens or creates the encrypted API database.
+// Open opens or creates the API database. masterKey must be the 32-byte install key from masterkey.Resolve.
 func Open(dataDir string, masterKey []byte) (*DB, error) {
 	if len(masterKey) != 32 {
 		return nil, fmt.Errorf("master key must be 32 bytes")
 	}
+
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
 		return nil, err
 	}
 	path := filepath.Join(dataDir, defaultDBName)
 
 	engine, err := enginedb.Open(enginedb.Options{
-		Path:          path,
-		EncryptionKey: masterKey,
+		Path: path,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("open API database: %w", err)
 	}
-
 	conn, err := engine.GetDB()
 	if err != nil {
 		_ = engine.Close()
 		return nil, err
 	}
 
-	db := &DB{path: path, masterKey: masterKey, engine: engine, sql: conn}
+	db := &DB{path: path, masterKey: masterKey, sql: conn}
 	if err := db.migrate(); err != nil {
-		_ = db.Close()
+		_ = conn.Close()
 		return nil, err
 	}
 	return db, nil
@@ -65,13 +64,12 @@ func (d *DB) Path() string {
 }
 
 func (d *DB) Close() error {
-	if d.engine == nil {
-		return nil
+	if d.sql != nil {
+		err := d.sql.Close()
+		d.sql = nil
+		return err
 	}
-	err := d.engine.Close()
-	d.engine = nil
-	d.sql = nil
-	return err
+	return nil
 }
 
 func (d *DB) migrate() error {
@@ -94,9 +92,10 @@ func (d *DB) migrate() error {
 			is_new_migration BOOLEAN NOT NULL DEFAULT false,
 			has_path_review_changes BOOLEAN NOT NULL DEFAULT false
 		)`,
+		// Store encrypted migration keys (not plaintext!).
 		`CREATE TABLE IF NOT EXISTS migration_keys (
 			migration_id VARCHAR PRIMARY KEY,
-			encryption_key BLOB NOT NULL,
+			encrypted_encryption_key BLOB NOT NULL,
 			created_at TIMESTAMP NOT NULL
 		)`,
 		`CREATE TABLE IF NOT EXISTS provider_oauth_apps (
@@ -261,25 +260,38 @@ func (d *DB) WipeInstallUserData() error {
 	return nil
 }
 
+// EnsureMigrationKey returns the decrypted per-migration key for the given migrationID,
+// creating a new one if not present (and storing it encrypted with the master key).
 func (d *DB) EnsureMigrationKey(migrationID string) ([]byte, error) {
-	var key []byte
+	var encryptedKey []byte
 	err := d.sql.QueryRow(
-		`SELECT encryption_key FROM migration_keys WHERE migration_id = ?`, migrationID,
-	).Scan(&key)
-	if err == nil && len(key) == 32 {
-		return key, nil
+		`SELECT encrypted_encryption_key FROM migration_keys WHERE migration_id = ?`, migrationID,
+	).Scan(&encryptedKey)
+	if err == nil {
+		key, err := migrationkey.DecryptMigrationKey(encryptedKey, d.masterKey)
+		if err == nil && len(key) == 32 {
+			return key, nil
+		}
+		if err != nil {
+			return nil, fmt.Errorf("failed to decrypt migration key: %w", err)
+		}
 	}
 	if err != nil && err != sql.ErrNoRows {
 		return nil, err
 	}
-	key = make([]byte, 32)
+	// No key found, so generate a new per-migration key, encrypt it, and store.
+	key := make([]byte, 32)
 	if _, err := io.ReadFull(rand.Reader, key); err != nil {
 		return nil, err
 	}
+	encryptedKey, err = migrationkey.EncryptMigrationKey(key, d.masterKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encrypt migration key: %w", err)
+	}
 	now := time.Now().UTC()
 	_, err = d.sql.Exec(
-		`INSERT INTO migration_keys (migration_id, encryption_key, created_at) VALUES (?, ?, ?)`,
-		migrationID, key, now,
+		`INSERT INTO migration_keys (migration_id, encrypted_encryption_key, created_at) VALUES (?, ?, ?)`,
+		migrationID, encryptedKey, now,
 	)
 	if err != nil {
 		return nil, err
@@ -287,13 +299,18 @@ func (d *DB) EnsureMigrationKey(migrationID string) ([]byte, error) {
 	return key, nil
 }
 
+// MigrationKey returns the decrypted per-migration key for the given migrationID.
 func (d *DB) MigrationKey(migrationID string) ([]byte, error) {
-	var key []byte
+	var encryptedKey []byte
 	err := d.sql.QueryRow(
-		`SELECT encryption_key FROM migration_keys WHERE migration_id = ?`, migrationID,
-	).Scan(&key)
+		`SELECT encrypted_encryption_key FROM migration_keys WHERE migration_id = ?`, migrationID,
+	).Scan(&encryptedKey)
 	if err != nil {
 		return nil, err
+	}
+	key, err := migrationkey.DecryptMigrationKey(encryptedKey, d.masterKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decrypt migration key: %w", err)
 	}
 	if len(key) != 32 {
 		return nil, fmt.Errorf("invalid migration key length for %s", migrationID)
@@ -302,12 +319,12 @@ func (d *DB) MigrationKey(migrationID string) ([]byte, error) {
 }
 
 type ProviderOAuthApp struct {
-	ProviderID      string
-	ClientID        string
-	ClientSecret    string
-	DisplayName     string
-	IsDefault       bool
-	UpdatedAt       time.Time
+	ProviderID            string
+	ClientID              string
+	ClientSecret          string
+	DisplayName           string
+	IsDefault             bool
+	UpdatedAt             time.Time
 	HealthStatus          string
 	HealthCheckedAt       *time.Time
 	HealthError           string
