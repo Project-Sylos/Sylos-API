@@ -2,6 +2,7 @@ package migrations
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strings"
 
@@ -41,6 +42,35 @@ func (h handler) changePhase(ctx *middleware.Context, payload PhaseChangeRequest
 	}
 	if payload.Options.MigrationID == "" {
 		payload.Options.MigrationID = migrationID
+	}
+
+	if payload.Phase == "copy" {
+		mig, err := h.mgr.GetMigration(ctx.Request().Context(), migrationID)
+		if err != nil {
+			if errors.Is(err, corebridge.ErrMigrationNotFound) {
+				ctx.Error(http.StatusNotFound, "migration not found", err)
+				return
+			}
+			ctx.Error(http.StatusInternalServerError, "failed to get migration", err)
+			return
+		}
+		h.mgr.SyncPathCheckProviders(migrationID, mig)
+		if err := corebridge.EnsurePathIssuesClearForCopy(mig); err != nil {
+			var remaining *corebridge.PathIssuesRemainingError
+			if errors.As(err, &remaining) {
+				ctx.Response(http.StatusConflict, map[string]any{
+					"success":   false,
+					"errorCode": corebridge.ErrCodePathIssuesRemaining,
+					"error":     "Some destination names still need attention.",
+					"message":   "Some destination names still need attention.",
+					"count":     remaining.Count,
+					"issues":    remaining.Issues,
+				})
+				return
+			}
+			ctx.Error(http.StatusInternalServerError, "failed to check destination names", err)
+			return
+		}
 	}
 
 	// Validate synchronously before starting background operation

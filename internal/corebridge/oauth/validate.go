@@ -31,6 +31,10 @@ func ValidateAppCredentials(providerID string, creds oauthcreds.ProviderCredenti
 		tokenURL = googleTokenURL
 	case "dropbox":
 		tokenURL = dropboxTokenURL
+	case "onedrive", "sharepoint":
+		tokenURL = microsoftTokenURL
+	case "box":
+		tokenURL = boxTokenURL
 	default:
 		return fmt.Errorf("unsupported oauth provider %q", providerID)
 	}

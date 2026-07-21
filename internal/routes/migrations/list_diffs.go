@@ -50,6 +50,8 @@ func (h handler) listDiffs(ctx *middleware.Context) {
 		}
 	}
 
+	includeDestinationOnly := parseOptionalBoolQuery(ctx.Request().URL.Query().Get("includeDestinationOnly"))
+
 	mig, err := h.mgr.GetMigration(ctx.Request().Context(), migrationID)
 	if err != nil {
 		if errors.Is(err, corebridge.ErrMigrationNotFound) {
@@ -64,12 +66,13 @@ func (h handler) listDiffs(ctx *middleware.Context) {
 		return
 	}
 	diffs, err := corebridge.ListChildrenDiffs(mig, corebridge.ListChildrenDiffsRequest{
-		MigrationID: migrationID,
-		Path:        path,
-		Offset:      offset,
-		Limit:       limit,
-		AfterPath:   afterPath,
-		FoldersOnly: foldersOnly,
+		MigrationID:            migrationID,
+		Path:                   path,
+		Offset:                 offset,
+		Limit:                  limit,
+		AfterPath:              afterPath,
+		FoldersOnly:            foldersOnly,
+		IncludeDestinationOnly: includeDestinationOnly,
 	})
 	if err != nil {
 		ctx.Error(http.StatusInternalServerError, "failed to list children diffs", err)
@@ -98,6 +101,8 @@ func (h handler) diffsStats(ctx *middleware.Context) {
 		}
 	}
 
+	includeDestinationOnly := parseOptionalBoolQuery(ctx.Request().URL.Query().Get("includeDestinationOnly"))
+
 	mig, err := h.mgr.GetMigration(ctx.Request().Context(), migrationID)
 	if err != nil {
 		if errors.Is(err, corebridge.ErrMigrationNotFound) {
@@ -111,10 +116,21 @@ func (h handler) diffsStats(ctx *middleware.Context) {
 		ctx.Error(http.StatusInternalServerError, "failed to get migration", err)
 		return
 	}
-	stats, err := corebridge.GetChildrenDiffsStats(mig, path, foldersOnly)
+	stats, err := corebridge.GetChildrenDiffsStats(mig, path, foldersOnly, includeDestinationOnly)
 	if err != nil {
 		ctx.Error(http.StatusInternalServerError, "failed to get diffs stats", err)
 		return
 	}
 	ctx.Response(http.StatusOK, stats)
+}
+
+func parseOptionalBoolQuery(raw string) *bool {
+	if raw == "" {
+		return nil
+	}
+	parsed, err := strconv.ParseBool(raw)
+	if err != nil {
+		return nil
+	}
+	return &parsed
 }

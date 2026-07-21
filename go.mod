@@ -23,6 +23,7 @@ require (
 	cloud.google.com/go/auth/oauth2adapt v0.2.8 // indirect
 	cloud.google.com/go/compute/metadata v0.9.0 // indirect
 	codeberg.org/Sylos/Spectra v0.2.6 // indirect
+	codeberg.org/Sylos/go-path-linter v0.0.0 // indirect
 	github.com/apache/arrow/go/v14 v14.0.2 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/danieljoos/wincred v1.2.2 // indirect
@@ -81,3 +82,5 @@ replace codeberg.org/Sylos/Migration-Engine => ../Migration-Engine
 replace codeberg.org/Sylos/Sylos-FS => ../Sylos-FS
 
 replace codeberg.org/Sylos/Spectra => ../Spectra
+
+replace codeberg.org/Sylos/go-path-linter => ../go-path-linter

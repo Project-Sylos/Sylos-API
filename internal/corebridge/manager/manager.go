@@ -91,6 +91,9 @@ func NewManager(logger zerolog.Logger, cfg config.Config, apiDB *apidb.DB) (*Man
 			Engine:  engineMgr,
 			DataDir: cfg.Runtime.DataDir,
 		}
+		if err := apiDB.ImportLegacySFTPKnownHostsFile(cfg.Runtime.DataDir); err != nil {
+			logger.Warn().Err(err).Msg("import legacy sftp known hosts file")
+		}
 	}
 
 	return mgr, nil
@@ -109,6 +112,18 @@ func (m *Manager) oauthClientID(providerID string) string {
 	case "dropbox":
 		if m.oauthCreds.Dropbox != nil {
 			return m.oauthCreds.Dropbox.ClientID
+		}
+	case "onedrive":
+		if m.oauthCreds.OneDrive != nil {
+			return m.oauthCreds.OneDrive.ClientID
+		}
+	case "sharepoint":
+		if m.oauthCreds.SharePoint != nil {
+			return m.oauthCreds.SharePoint.ClientID
+		}
+	case "box":
+		if m.oauthCreds.Box != nil {
+			return m.oauthCreds.Box.ClientID
 		}
 	}
 	return ""
@@ -135,6 +150,21 @@ func (m *Manager) oauthProviderCredentials(providerID string) (oauthcreds.Provid
 			return oauthcreds.ProviderCredentials{}, fmt.Errorf("dropbox oauth not configured: add credentials in Settings → Cloud providers")
 		}
 		return *m.oauthCreds.Dropbox, nil
+	case "onedrive":
+		if m.oauthCreds.OneDrive == nil {
+			return oauthcreds.ProviderCredentials{}, fmt.Errorf("onedrive oauth not configured: add credentials in Settings → Cloud providers")
+		}
+		return *m.oauthCreds.OneDrive, nil
+	case "sharepoint":
+		if m.oauthCreds.SharePoint == nil {
+			return oauthcreds.ProviderCredentials{}, fmt.Errorf("sharepoint oauth not configured: add credentials in Settings → Cloud providers")
+		}
+		return *m.oauthCreds.SharePoint, nil
+	case "box":
+		if m.oauthCreds.Box == nil {
+			return oauthcreds.ProviderCredentials{}, fmt.Errorf("box oauth not configured: add credentials in Settings → Cloud providers")
+		}
+		return *m.oauthCreds.Box, nil
 	default:
 		return oauthcreds.ProviderCredentials{}, fmt.Errorf("unsupported provider %q", providerID)
 	}

@@ -21,8 +21,10 @@ type TokenResponse struct {
 }
 
 var (
-	googleTokenURL  = "https://oauth2.googleapis.com/token"
-	dropboxTokenURL = "https://api.dropboxapi.com/oauth2/token"
+	googleTokenURL    = "https://oauth2.googleapis.com/token"
+	dropboxTokenURL   = "https://api.dropboxapi.com/oauth2/token"
+	microsoftTokenURL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+	boxTokenURL       = "https://api.box.com/oauth2/token"
 )
 
 func ExchangeAuthCode(providerID string, creds oauthcreds.ProviderCredentials, code, redirectURI string) (TokenResponse, error) {
@@ -31,6 +33,10 @@ func ExchangeAuthCode(providerID string, creds oauthcreds.ProviderCredentials, c
 		return postTokenExchange(googleTokenURL, creds, code, redirectURI)
 	case "dropbox":
 		return postTokenExchange(dropboxTokenURL, creds, code, redirectURI)
+	case "onedrive", "sharepoint":
+		return postTokenExchange(microsoftTokenURL, creds, code, redirectURI)
+	case "box":
+		return postTokenExchange(boxTokenURL, creds, code, redirectURI)
 	default:
 		return TokenResponse{}, fmt.Errorf("unsupported oauth provider %q", providerID)
 	}

@@ -185,6 +185,12 @@ func loadOAuthConfigFromDB(db *apidb.DB) (oauthcreds.Config, error) {
 			cfg.GoogleDrive = creds
 		case "dropbox":
 			cfg.Dropbox = creds
+		case "onedrive":
+			cfg.OneDrive = creds
+		case "sharepoint":
+			cfg.SharePoint = creds
+		case "box":
+			cfg.Box = creds
 		}
 	}
 	return cfg, nil

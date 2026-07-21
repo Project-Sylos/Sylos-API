@@ -250,6 +250,41 @@ func (p ProvidersConfig) applyDefaults() {
 			ServiceID:   "sftp",
 		}
 	}
+	if _, ok := p["onedrive"]; !ok {
+		p["onedrive"] = ProviderConfig{
+			Enabled:     true,
+			DisplayName: "OneDrive",
+			ServiceID:   "onedrive",
+			Scopes: []string{
+				"Files.ReadWrite.All",
+				"offline_access",
+				"User.Read",
+			},
+		}
+	}
+	if _, ok := p["sharepoint"]; !ok {
+		p["sharepoint"] = ProviderConfig{
+			Enabled:     true,
+			DisplayName: "SharePoint",
+			ServiceID:   "sharepoint",
+			Scopes: []string{
+				"Sites.ReadWrite.All",
+				"Files.ReadWrite.All",
+				"offline_access",
+				"User.Read",
+			},
+		}
+	}
+	if _, ok := p["box"]; !ok {
+		p["box"] = ProviderConfig{
+			Enabled:     true,
+			DisplayName: "Box",
+			ServiceID:   "box",
+			Scopes: []string{
+				"root_readwrite",
+			},
+		}
+	}
 	for id, cfg := range p {
 		if cfg.ServiceID == "" {
 			cfg.ServiceID = strings.ReplaceAll(id, "_", "-")
@@ -268,5 +303,30 @@ func (s *ServicesConfig) applyDefaults() {
 			ID:   "local",
 			Name: "Local Filesystem",
 		}}
+	}
+	// Spectra is a developer test connector. Auto-register when unset and the
+	// default Migration-Engine config is present next to the process cwd.
+	if len(s.Spectra) == 0 {
+		const defaultSpectraConfig = "../Migration-Engine/pkg/configs/spectra.json"
+		if abs, err := filepath.Abs(defaultSpectraConfig); err == nil {
+			if _, err := os.Stat(abs); err == nil {
+				s.Spectra = []SpectraServiceConfig{
+					{
+						ID:         "spectra-primary",
+						Name:       "Spectra Primary",
+						ConfigPath: defaultSpectraConfig,
+						World:      "primary",
+						RootID:     "root",
+					},
+					{
+						ID:         "spectra-s1",
+						Name:       "Spectra S1",
+						ConfigPath: defaultSpectraConfig,
+						World:      "s1",
+						RootID:     "root",
+					},
+				}
+			}
+		}
 	}
 }

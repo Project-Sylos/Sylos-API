@@ -17,6 +17,27 @@ func (m *Manager) SetRoot(ctx context.Context, req corebridge.SetRootRequest) (c
 		return corebridge.SetRootResponse{}, err
 	}
 
+	rootsReq := roots.SetRootRequest{
+		MigrationID:  req.MigrationID,
+		Role:         req.Role,
+		ServiceID:    req.ServiceID,
+		ConnectionID: req.ConnectionID,
+		Root: roots.FolderDescriptor{
+			ID:           req.Root.ID,
+			ParentID:     req.Root.ParentID,
+			ParentPath:   req.Root.ParentPath,
+			DisplayName:  req.Root.DisplayName,
+			LocationPath: req.Root.LocationPath,
+			LastUpdated:  req.Root.LastUpdated,
+			DepthLevel:   req.Root.DepthLevel,
+			Type:         req.Root.Type,
+		},
+		Config: req.Config,
+	}
+	if err := m.rootsMgr.ValidateMigrationRoot(req.ServiceID, rootsReq.Root); err != nil {
+		return corebridge.SetRootResponse{}, err
+	}
+
 	migrationID := req.MigrationID
 	if migrationID == "" {
 		created, err := m.engineMgr.CreateMigration(migration.CreateMigrationConfig{Name: "migration"})
@@ -63,23 +84,7 @@ func (m *Manager) SetRoot(ctx context.Context, req corebridge.SetRootRequest) (c
 		}
 	}
 
-	rootsReq := roots.SetRootRequest{
-		MigrationID:  migrationID,
-		Role:         req.Role,
-		ServiceID:    req.ServiceID,
-		ConnectionID: req.ConnectionID,
-		Root: roots.FolderDescriptor{
-			ID:           req.Root.ID,
-			ParentID:     req.Root.ParentID,
-			ParentPath:   req.Root.ParentPath,
-			DisplayName:  req.Root.DisplayName,
-			LocationPath: req.Root.LocationPath,
-			LastUpdated:  req.Root.LastUpdated,
-			DepthLevel:   req.Root.DepthLevel,
-			Type:         req.Root.Type,
-		},
-		Config: req.Config,
-	}
+	rootsReq.MigrationID = migrationID
 	resp, err := m.rootsMgr.SetRoot(ctx, rootsReq)
 	if err != nil {
 		return corebridge.SetRootResponse{}, err

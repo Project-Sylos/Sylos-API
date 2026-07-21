@@ -20,6 +20,10 @@ type handler struct {
 func Register(router chi.Router, logger zerolog.Logger, mgr *manager.Manager, mw *middleware.Middleware) {
 	h := handler{logger: logger, mgr: mgr}
 	router.Get("/providers", middleware.NoBody(mw, h.listProviders))
+	router.Get("/providers/sftp/saved-hosts", middleware.NoBody(mw, h.listSFTPSavedHosts))
+	router.Post("/providers/sftp/saved-hosts", middleware.JSON(mw, h.upsertSFTPSavedHost))
+	router.Get("/providers/sftp/saved-hosts/{hostID}", middleware.NoBody(mw, h.getSFTPSavedHost))
+	router.Delete("/providers/sftp/saved-hosts/{hostID}", middleware.NoBody(mw, h.deleteSFTPSavedHost))
 	router.Post("/providers/{providerID}/connections", middleware.JSON(mw, h.createConnection))
 	router.Post("/providers/{providerID}/connections/{connectionID}/oauth/exchange", middleware.JSON(mw, h.exchangeOAuth))
 	router.Post("/providers/{providerID}/connections/{connectionID}/tokens", middleware.JSON(mw, h.postTokens))
@@ -150,4 +154,41 @@ func (h handler) listChildren(ctx *middleware.Context) {
 		return
 	}
 	ctx.Response(http.StatusOK, resp)
+}
+
+func (h handler) listSFTPSavedHosts(ctx *middleware.Context) {
+	items, err := h.mgr.ListSFTPSavedHosts(ctx.Request().Context())
+	if err != nil {
+		ctx.Error(http.StatusInternalServerError, "failed to list saved SFTP hosts", err)
+		return
+	}
+	ctx.Response(http.StatusOK, map[string]any{"items": items})
+}
+
+func (h handler) getSFTPSavedHost(ctx *middleware.Context) {
+	hostID := chi.URLParam(ctx.Request(), "hostID")
+	item, err := h.mgr.GetSFTPSavedHost(ctx.Request().Context(), hostID)
+	if err != nil {
+		ctx.Error(http.StatusNotFound, "saved SFTP host not found", err)
+		return
+	}
+	ctx.Response(http.StatusOK, item)
+}
+
+func (h handler) upsertSFTPSavedHost(ctx *middleware.Context, req corebridge.SFTPSavedHostUpsertRequest) {
+	item, err := h.mgr.UpsertSFTPSavedHost(ctx.Request().Context(), req)
+	if err != nil {
+		ctx.Error(http.StatusBadRequest, "failed to save SFTP host", err)
+		return
+	}
+	ctx.Response(http.StatusOK, item)
+}
+
+func (h handler) deleteSFTPSavedHost(ctx *middleware.Context) {
+	hostID := chi.URLParam(ctx.Request(), "hostID")
+	if err := h.mgr.DeleteSFTPSavedHost(ctx.Request().Context(), hostID); err != nil {
+		ctx.Error(http.StatusNotFound, "failed to delete saved SFTP host", err)
+		return
+	}
+	ctx.Response(http.StatusNoContent, nil)
 }

@@ -16,6 +16,21 @@ func (m *Manager) persistOAuthCredentials(mig *migration.Migration, connectionID
 	return mig.UpsertOAuthCredentials(connectionID, credsJSON)
 }
 
+// cloudCredentialsPersistHook returns a callback that writes rotated StoredCredentials
+// back into the migration DB (required for Box single-use refresh tokens).
+func (m *Manager) cloudCredentialsPersistHook(mig *migration.Migration, connectionID string) func(cloud.StoredCredentials) error {
+	if mig == nil || connectionID == "" {
+		return nil
+	}
+	return func(stored cloud.StoredCredentials) error {
+		credsJSON, err := json.Marshal(stored)
+		if err != nil {
+			return err
+		}
+		return m.persistOAuthCredentials(mig, connectionID, credsJSON)
+	}
+}
+
 // loadStoredCloudCredentials reads OAuth refresh credentials from the migration DB.
 func (m *Manager) loadStoredCloudCredentials(_ string, mig *migration.Migration, binding migration.FSCredentialBinding) (cloud.StoredCredentials, error) {
 	if binding.ConnectionID == "" {

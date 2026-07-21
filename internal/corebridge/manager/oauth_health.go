@@ -246,7 +246,7 @@ func (m *Manager) providersInUseByLiveMigrations() map[string]bool {
 }
 
 func knownOAuthProviderIDs() []string {
-	return []string{"google_drive", "dropbox"}
+	return []string{"google_drive", "dropbox", "onedrive", "sharepoint", "box"}
 }
 
 func oauthProviderDisplayName(providerID string) string {
@@ -255,6 +255,12 @@ func oauthProviderDisplayName(providerID string) string {
 		return "Google Drive"
 	case "dropbox":
 		return "Dropbox"
+	case "onedrive":
+		return "OneDrive"
+	case "sharepoint":
+		return "SharePoint"
+	case "box":
+		return "Box"
 	default:
 		return providerID
 	}

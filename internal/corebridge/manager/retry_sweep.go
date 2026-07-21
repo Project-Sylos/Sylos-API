@@ -17,22 +17,32 @@ func (m *Manager) TriggerRetrySweep(ctx context.Context, migrationID string, con
 		}, err
 	}
 
-	runningTasks := m.bgTaskMgr.GetRunningTasks(migrationID)
-	if len(runningTasks) > 0 {
-		return corebridge.SweepResponse{
-			Success: false,
-			Error:   fmt.Sprintf("cannot start retry sweep: there are %d running background tasks. Please wait for them to complete", len(runningTasks)),
-		}, fmt.Errorf("cannot start retry sweep: there are %d running background tasks", len(runningTasks))
-	}
-
-	if m.bgTaskMgr.HasRunningTask(migrationID, corebridge.BackgroundTaskTypeRetrySweep) {
-		return corebridge.SweepResponse{
-			Success: false,
-			Error:   "retry sweep is already running for this migration",
-		}, fmt.Errorf("retry sweep is already running")
-	}
-
 	mig, err := m.GetMigration(context.TODO(), migrationID)
+	if err != nil {
+		return corebridge.SweepResponse{
+			Success: false,
+			Error:   err.Error(),
+		}, err
+	}
+	if resp, ok := m.resumeIfAlreadyRunning(migrationID, mig); ok {
+		return resp, nil
+	}
+	if err := m.normalizeDeadInProgressForResume(migrationID, mig); err != nil {
+		return corebridge.SweepResponse{
+			Success: false,
+			Error:   err.Error(),
+		}, err
+	}
+
+	// Root plans are in-memory only; rebuild adapters/roots from the migration DB after API restart.
+	if err := m.ensureFSAdaptersRehydrated(migrationID); err != nil {
+		return corebridge.SweepResponse{
+			Success: false,
+			Error:   err.Error(),
+		}, err
+	}
+
+	mig, err = m.GetMigration(context.TODO(), migrationID)
 	if err != nil {
 		return corebridge.SweepResponse{
 			Success: false,

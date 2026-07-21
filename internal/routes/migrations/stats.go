@@ -26,7 +26,12 @@ func (h handler) stats(ctx *middleware.Context) {
 		ctx.Error(http.StatusInternalServerError, "failed to get migration", err)
 		return
 	}
-	stats, err := corebridge.PathReviewStatsFromMigration(mig)
+	view := ctx.Request().URL.Query().Get("view")
+	if view != "" && view != "source-cleanup" {
+		ctx.Error(http.StatusBadRequest, "unsupported stats view", nil)
+		return
+	}
+	stats, err := corebridge.PathReviewStatsFromMigration(mig, view)
 	if err != nil {
 		ctx.Error(http.StatusInternalServerError, "failed to get path review stats", err)
 		return

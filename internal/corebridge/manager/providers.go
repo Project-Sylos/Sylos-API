@@ -64,10 +64,22 @@ func (m *Manager) ProbeSFTPHostKey(_ context.Context, providerID string, req cor
 	if err != nil {
 		return corebridge.SFTPHostKeyProbeResponse{}, err
 	}
-	return corebridge.SFTPHostKeyProbeResponse{
+	resp := corebridge.SFTPHostKeyProbeResponse{
 		HostKey:     result.HostKey,
 		Fingerprint: result.Fingerprint,
-	}, nil
+	}
+	if m.apiDB != nil {
+		if pinned, ok, lookupErr := m.apiDB.LookupSFTPKnownHost(req.Host, req.Port); lookupErr == nil && ok {
+			resp.Trusted = true
+			if pinned.HostKey != result.HostKey {
+				resp.HostKeyChanged = true
+			} else {
+				resp.HostKey = pinned.HostKey
+				resp.Fingerprint = pinned.Fingerprint
+			}
+		}
+	}
+	return resp, nil
 }
 
 func (m *Manager) PostProviderCredentials(ctx context.Context, providerID, connectionID string, req corebridge.SFTPCredentialsRequest) (corebridge.ConnectionStatus, error) {
@@ -116,19 +128,25 @@ func (m *Manager) PostProviderCredentials(ctx context.Context, providerID, conne
 		return corebridge.ConnectionStatus{}, err
 	}
 
+	if m.apiDB != nil {
+		fp, fpErr := sftpfs.FingerprintHostKey(req.HostKey)
+		if fpErr != nil {
+			m.logger.Warn().Err(fpErr).Str("host", req.Host).Msg("fingerprint sftp host key for known hosts")
+		} else if pinErr := m.apiDB.UpsertSFTPKnownHost(req.Host, req.Port, req.HostKey, fp); pinErr != nil {
+			m.logger.Warn().Err(pinErr).Str("host", req.Host).Msg("persist sftp known host")
+		}
+	}
+
 	if mig != nil {
 		if err := m.persistOAuthCredentials(mig, connectionID, credsJSON); err != nil {
 			return corebridge.ConnectionStatus{}, fmt.Errorf("persist sftp credentials: %w", err)
 		}
 	}
 
+	m.attachAccountIdentity(ctx, &rec, connectionID)
 	m.connMgr.Set(connectionID, rec)
 
-	return corebridge.ConnectionStatus{
-		ConnectionID: connectionID,
-		ProviderID:   providerID,
-		Valid:        true,
-	}, nil
+	return m.connectionStatusFromRecord(providerID, connectionID, rec, true), nil
 }
 
 func (m *Manager) PostProviderTokens(ctx context.Context, providerID, connectionID string, req corebridge.OAuthTokenRequest) (corebridge.ConnectionStatus, error) {
@@ -157,11 +175,12 @@ func (m *Manager) PostProviderTokens(ctx context.Context, providerID, connection
 	}
 
 	_, err = m.serviceMgr.FS.RegisterCloudConnection(fslib.CloudConnectionOptions{
-		ProviderID:      providerID,
-		ConnectionID:    connectionID,
-		CredentialsJSON: credsJSON,
-		AccessToken:     req.AccessToken,
-		ExpiresInSec:    req.ExpiresIn,
+		ProviderID:         providerID,
+		ConnectionID:       connectionID,
+		CredentialsJSON:    credsJSON,
+		AccessToken:        req.AccessToken,
+		ExpiresInSec:       req.ExpiresIn,
+		PersistCredentials: m.cloudCredentialsPersistHook(mig, connectionID),
 	})
 	if err != nil {
 		return corebridge.ConnectionStatus{}, err
@@ -171,6 +190,11 @@ func (m *Manager) PostProviderTokens(ctx context.Context, providerID, connection
 		if err := m.persistOAuthCredentials(mig, connectionID, credsJSON); err != nil {
 			return corebridge.ConnectionStatus{}, fmt.Errorf("persist oauth credentials: %w", err)
 		}
+	} else if rec.MigrationID != "" {
+		m.logger.Warn().
+			Str("connection_id", connectionID).
+			Str("migration_id", rec.MigrationID).
+			Msg("oauth tokens not persisted yet; will store on set-root when migration DB exists")
 	}
 
 	expiresAt := time.Time{}
@@ -179,14 +203,10 @@ func (m *Manager) PostProviderTokens(ctx context.Context, providerID, connection
 	}
 	rec.AccessToken = req.AccessToken
 	rec.ExpiresAt = expiresAt
+	m.attachAccountIdentity(ctx, &rec, connectionID)
 	m.connMgr.Set(connectionID, rec)
 
-	return corebridge.ConnectionStatus{
-		ConnectionID: connectionID,
-		ProviderID:   providerID,
-		Valid:        true,
-		ExpiresAt:    expiresAt,
-	}, nil
+	return m.connectionStatusFromRecord(providerID, connectionID, rec, true), nil
 }
 
 func (m *Manager) ExchangeProviderOAuthCode(ctx context.Context, providerID, connectionID string, req corebridge.OAuthExchangeRequest) (corebridge.ConnectionStatus, error) {
@@ -250,12 +270,38 @@ func (m *Manager) ProviderConnectionStatus(ctx context.Context, providerID, conn
 		return corebridge.ConnectionStatus{ConnectionID: connectionID, ProviderID: providerID, Valid: false}, nil
 	}
 	valid := m.cloudConnectionValid(providerID, connectionID)
+	if valid && rec.AccountEmail == "" && rec.AccountDisplayName == "" {
+		m.attachAccountIdentity(ctx, &rec, connectionID)
+		m.connMgr.Set(connectionID, rec)
+	}
+	return m.connectionStatusFromRecord(providerID, connectionID, rec, valid), nil
+}
+
+func (m *Manager) attachAccountIdentity(ctx context.Context, rec *connections.Record, connectionID string) {
+	if rec == nil {
+		return
+	}
+	identity, err := m.serviceMgr.FS.CloudAccountIdentity(ctx, connectionID)
+	if err != nil || (identity.Email == "" && identity.DisplayName == "") {
+		return
+	}
+	rec.AccountEmail = identity.Email
+	rec.AccountDisplayName = identity.DisplayName
+}
+
+func (m *Manager) connectionStatusFromRecord(
+	providerID, connectionID string,
+	rec connections.Record,
+	valid bool,
+) corebridge.ConnectionStatus {
 	return corebridge.ConnectionStatus{
-		ConnectionID: connectionID,
-		ProviderID:   providerID,
-		Valid:        valid,
-		ExpiresAt:    rec.ExpiresAt,
-	}, nil
+		ConnectionID:       connectionID,
+		ProviderID:         providerID,
+		Valid:              valid,
+		ExpiresAt:          rec.ExpiresAt,
+		AccountEmail:       rec.AccountEmail,
+		AccountDisplayName: rec.AccountDisplayName,
+	}
 }
 
 func (m *Manager) cloudConnectionValid(providerID, connectionID string) bool {

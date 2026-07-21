@@ -76,6 +76,8 @@ type RootPlan struct {
 	RootSummary               migration.RootSeedSummary
 	Seeded                    bool
 	Seeding                   bool
+	// PathCheckTarget selects destination-name rules: "none", "auto", or a provider id (e.g. "windows").
+	PathCheckTarget string
 }
 
 func NewManager(logger zerolog.Logger, dataDir string, serviceMgr *services.ServiceManager, resolveDBPath func(path, migrationID string) (string, error)) *Manager {
@@ -116,6 +118,16 @@ func FolderFromDescriptor(desc FolderDescriptor) (fstypes.Folder, error) {
 	// LastUpdated will be set by caller if needed
 
 	return folder, nil
+}
+
+// ValidateMigrationRoot applies Sylos-FS provider policy before any migration
+// state is created or mutated.
+func (m *Manager) ValidateMigrationRoot(serviceID string, desc FolderDescriptor) error {
+	folder, err := FolderFromDescriptor(desc)
+	if err != nil {
+		return err
+	}
+	return m.serviceMgr.ValidateMigrationRoot(serviceID, folder)
 }
 
 func (m *Manager) SetRoot(ctx context.Context, req SetRootRequest) (SetRootResponse, error) {
@@ -159,8 +171,16 @@ func (m *Manager) SetRoot(ctx context.Context, req SetRootRequest) (SetRootRespo
 	if err != nil {
 		return SetRootResponse{}, fmt.Errorf("invalid %s root: %w", role, err)
 	}
+	// Use the resolved concrete service id (spectra-primary / spectra-s1), not
+	// the virtual catalog id "spectra".
+	if err := m.serviceMgr.ValidateMigrationRoot(serviceDef.ID, folder); err != nil {
+		return SetRootResponse{}, err
+	}
 
-	if role == "source" {
+	// Spectra needs a registered session before ListChildren works, and that
+	// session is created later in this flow. Synthetic Spectra roots are never
+	// "empty" in the filesystem sense, so skip the pre-check.
+	if role == "source" && serviceDef.Type != services.ServiceTypeSpectra {
 		if err := m.validateSourceRootNotEmpty(ctx, serviceID, folder, req.ConnectionID); err != nil {
 			return SetRootResponse{}, err
 		}
@@ -210,7 +230,8 @@ func (m *Manager) SetRoot(ctx context.Context, req SetRootRequest) (SetRootRespo
 	// This ensures both source and destination adapters share the same *sdk.SpectraFS instance
 	connectionID := req.ConnectionID
 	var sessionID string
-	if serviceDef.Type == services.ServiceTypeSpectra {
+	switch serviceDef.Type {
+	case services.ServiceTypeSpectra:
 		m.mu.RLock()
 		existingSessionID := plan.SourceConnectionID
 		m.mu.RUnlock()
@@ -281,12 +302,12 @@ func (m *Manager) SetRoot(ctx context.Context, req SetRootRequest) (SetRootRespo
 			sessionID = existingSessionID
 			fmt.Printf("Reusing existing Spectra session - sessionID: %s\n", sessionID)
 		}
-	} else if serviceDef.Type == services.ServiceTypeCloud {
+	case services.ServiceTypeCloud:
 		if connectionID == "" {
 			return SetRootResponse{}, fmt.Errorf("connectionId is required for cloud services")
 		}
 		sessionID = connectionID
-	} else {
+	default:
 		// For non-Spectra services, use connectionID as-is
 		sessionID = connectionID
 	}
@@ -389,6 +410,21 @@ func (m *Manager) GetPlan(migrationID string) *RootPlan {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.plans[migrationID]
+}
+
+// SetPathCheckTarget stores the user-selected destination-name check profile on the plan.
+func (m *Manager) SetPathCheckTarget(migrationID, target string) {
+	if migrationID == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	plan := m.plans[migrationID]
+	if plan == nil {
+		plan = &RootPlan{}
+		m.plans[migrationID] = plan
+	}
+	plan.PathCheckTarget = strings.TrimSpace(target)
 }
 
 // ApplyRehydratedSide attaches an adapter for one role after loading FS credential state from the migration DB (e.g. API restart).
@@ -495,11 +531,14 @@ func (m *Manager) ClearAllPlans() {
 }
 
 func (m *Manager) validateSourceRootNotEmpty(ctx context.Context, serviceID string, folder fstypes.Folder, connectionID string) error {
+	rootType, driveID := cloudRootListMeta(folder)
 	count, err := m.serviceMgr.CountChildren(ctx, services.ListChildrenRequest{
 		ServiceID:    serviceID,
 		Identifier:   folder.ServiceID,
 		Role:         "source",
 		ConnectionID: connectionID,
+		RootType:     rootType,
+		DriveID:      driveID,
 	})
 	if err != nil {
 		return fmt.Errorf("failed to validate source root: %w", err)
@@ -508,6 +547,18 @@ func (m *Manager) validateSourceRootNotEmpty(ctx context.Context, serviceID stri
 		return fmt.Errorf("source root cannot be empty — there is nothing to migrate")
 	}
 	return nil
+}
+
+// cloudRootListMeta returns rootType/driveId for virtual cloud roots so ListChildren
+// uses the provider's virtual-root query (e.g. sharedWithMe=true) instead of treating
+// the sentinel id as a normal folder.
+func cloudRootListMeta(folder fstypes.Folder) (rootType, driveID string) {
+	switch folder.Type {
+	case "shared_with_me", "my_drive", "shared_drive", "user_root", "team_space", "team_folder", "shared_folder":
+		return folder.Type, folder.ParentId
+	default:
+		return "", ""
+	}
 }
 
 // getMapKeys returns the keys of a map for debugging purposes

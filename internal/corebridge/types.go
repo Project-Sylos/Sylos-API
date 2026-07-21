@@ -140,13 +140,13 @@ type OAuthExchangeRequest struct {
 }
 
 type SFTPCredentialsRequest struct {
-	Host                   string `json:"host"`
-	Port                   int    `json:"port,omitempty"`
-	Username               string `json:"username"`
-	Password               string `json:"password,omitempty"`
-	PrivateKey             string `json:"privateKey,omitempty"`
-	KeyPassphrase          string `json:"keyPassphrase,omitempty"`
-	HostKey string `json:"hostKey,omitempty"`
+	Host          string `json:"host"`
+	Port          int    `json:"port,omitempty"`
+	Username      string `json:"username"`
+	Password      string `json:"password,omitempty"`
+	PrivateKey    string `json:"privateKey,omitempty"`
+	KeyPassphrase string `json:"keyPassphrase,omitempty"`
+	HostKey       string `json:"hostKey,omitempty"`
 }
 
 type SFTPHostKeyProbeRequest struct {
@@ -155,15 +155,54 @@ type SFTPHostKeyProbeRequest struct {
 }
 
 type SFTPHostKeyProbeResponse struct {
-	HostKey     string `json:"hostKey"`
-	Fingerprint string `json:"fingerprint"`
+	HostKey        string `json:"hostKey"`
+	Fingerprint    string `json:"fingerprint"`
+	Trusted        bool   `json:"trusted"`
+	HostKeyChanged bool   `json:"hostKeyChanged,omitempty"`
+}
+
+// SFTPSavedHostSummary is a remembered SFTP site without decrypted secrets.
+type SFTPSavedHostSummary struct {
+	ID          string     `json:"id"`
+	DisplayName string     `json:"displayName"`
+	Host        string     `json:"host"`
+	Port        int        `json:"port"`
+	Username    string     `json:"username"`
+	AuthMethod  string     `json:"authMethod"`
+	UpdatedAt   time.Time  `json:"updatedAt"`
+	LastUsedAt  *time.Time `json:"lastUsedAt,omitempty"`
+}
+
+// SFTPSavedHostDetail includes secrets for reconnecting from the credentials form.
+type SFTPSavedHostDetail struct {
+	SFTPSavedHostSummary
+	Password      string `json:"password,omitempty"`
+	PrivateKey    string `json:"privateKey,omitempty"`
+	KeyPassphrase string `json:"keyPassphrase,omitempty"`
+	HostKey       string `json:"hostKey,omitempty"`
+}
+
+// SFTPSavedHostUpsertRequest creates or updates a remembered SFTP site.
+type SFTPSavedHostUpsertRequest struct {
+	ID            string `json:"id,omitempty"`
+	DisplayName   string `json:"displayName,omitempty"`
+	Host          string `json:"host"`
+	Port          int    `json:"port,omitempty"`
+	Username      string `json:"username"`
+	AuthMethod    string `json:"authMethod"`
+	Password      string `json:"password,omitempty"`
+	PrivateKey    string `json:"privateKey,omitempty"`
+	KeyPassphrase string `json:"keyPassphrase,omitempty"`
+	HostKey       string `json:"hostKey,omitempty"`
 }
 
 type ConnectionStatus struct {
-	ConnectionID string    `json:"connectionId"`
-	ProviderID   string    `json:"providerId"`
-	Valid        bool      `json:"valid"`
-	ExpiresAt    time.Time `json:"expiresAt,omitempty"`
+	ConnectionID       string    `json:"connectionId"`
+	ProviderID         string    `json:"providerId"`
+	Valid              bool      `json:"valid"`
+	ExpiresAt          time.Time `json:"expiresAt,omitempty"`
+	AccountEmail       string    `json:"accountEmail,omitempty"`
+	AccountDisplayName string    `json:"accountDisplayName,omitempty"`
 }
 
 type CreateConnectionRequest struct {
@@ -212,6 +251,8 @@ type MigrationOptions struct {
 	StartupDelaySec         int                 `json:"startupDelaySeconds,omitempty"`
 	ProgressTickMillis      int                 `json:"progressTickMillis,omitempty"`
 	Verification            VerificationOptions `json:"verification,omitempty"`
+	// PathCheckTarget selects destination-name rules: "none", "auto", or a provider id (e.g. "windows").
+	PathCheckTarget string `json:"pathCheckTarget,omitempty"`
 }
 
 type StartMigrationRequest struct {
@@ -359,27 +400,42 @@ type ExternalQueueMetrics struct {
 	ItemsPerSecond float64 `json:"items_per_second,omitempty"` // Combined items/sec (EMA-smoothed)
 	BytesPerSecond float64 `json:"bytes_per_second,omitempty"` // Bytes/sec transfer rate (EMA-smoothed)
 
+	// Deterministic copy/delete progress (0–100). Omitted for traversal.
+	ProgressPercent float64 `json:"progress_percent,omitempty"`
+
 	// Common state fields (used by both phases)
-	Round        int    `json:"round"`
-	Pending      int    `json:"pending"`
-	InProgress   int    `json:"in_progress"`
-	Workers      int    `json:"workers"`
-	TotalPending int    `json:"total_pending,omitempty"` // Total pending from DB (copy phase)
-	TotalFailed  int    `json:"total_failed,omitempty"`  // Total failed from DB (copy phase)
-	Name         string `json:"name,omitempty"`          // Queue name ("copy", "src-traversal", etc.)
-	PossibleStall bool  `json:"possible_stall,omitempty"`
+	Round         int    `json:"round"`
+	Pending       int    `json:"pending"`
+	InProgress    int    `json:"in_progress"`
+	Workers       int    `json:"workers"`
+	TotalPending  int    `json:"total_pending,omitempty"` // Total pending from DB (copy phase)
+	TotalFailed   int    `json:"total_failed,omitempty"`  // Total failed from DB (copy phase)
+	Name          string `json:"name,omitempty"`          // Queue name ("copy", "src-traversal", etc.)
+	PossibleStall bool   `json:"possible_stall,omitempty"`
+
+	// Current-round Expected/Completed (console progress line counters).
+	RoundExpected  int `json:"round_expected,omitempty"`
+	RoundCompleted int `json:"round_completed,omitempty"`
+	CopyPass       int `json:"copy_pass,omitempty"`
+
+	// Active FS rate-limit windows (RFC3339 UTC + remaining ms at poll time).
+	RateLimitedUntilSrc       string `json:"rate_limited_until_src,omitempty"`
+	RateLimitedUntilDst       string `json:"rate_limited_until_dst,omitempty"`
+	RateLimitedRemainingMsSrc int64  `json:"rate_limited_remaining_ms_src,omitempty"`
+	RateLimitedRemainingMsDst int64  `json:"rate_limited_remaining_ms_dst,omitempty"`
+	InterOpDelayMs            int64  `json:"inter_op_delay_ms,omitempty"`
 }
 
 // QueueMetricsResponse represents all queue metrics for a migration
 type QueueMetricsResponse struct {
-	Success      bool                  `json:"success"`             // Whether the operation succeeded
-	ErrorCode    string                `json:"errorCode,omitempty"` // Error code if success is false (e.g., "DATABASE_NOT_AVAILABLE")
-	Error        string                `json:"error,omitempty"`     // Human-readable error message if success is false
-	SrcTraversal *ExternalQueueMetrics `json:"srcTraversal,omitempty"`
-	DstTraversal *ExternalQueueMetrics `json:"dstTraversal,omitempty"`
-	Copy         *ExternalQueueMetrics `json:"copy,omitempty"`
-	Delete       *ExternalQueueMetrics `json:"delete,omitempty"`
-	PossibleStall bool                 `json:"possibleStall,omitempty"`
+	Success       bool                  `json:"success"`             // Whether the operation succeeded
+	ErrorCode     string                `json:"errorCode,omitempty"` // Error code if success is false (e.g., "DATABASE_NOT_AVAILABLE")
+	Error         string                `json:"error,omitempty"`     // Human-readable error message if success is false
+	SrcTraversal  *ExternalQueueMetrics `json:"srcTraversal,omitempty"`
+	DstTraversal  *ExternalQueueMetrics `json:"dstTraversal,omitempty"`
+	Copy          *ExternalQueueMetrics `json:"copy,omitempty"`
+	Delete        *ExternalQueueMetrics `json:"delete,omitempty"`
+	PossibleStall bool                  `json:"possibleStall,omitempty"`
 }
 
 // LogEntry represents a single log entry from the database
@@ -448,6 +504,8 @@ type ListChildrenDiffsRequest struct {
 	AfterPath   string      // Keyset cursor: return children with path > AfterPath (empty = first page)
 	FoldersOnly bool        // If true, only return folders and apply limit to folders only
 	Sort        *SortOption `json:"sort,omitempty"` // Sort options (field and direction); keyset uses path order
+	// IncludeDestinationOnly when false hides destination-only rows. Nil means include (legacy default).
+	IncludeDestinationOnly *bool `json:"includeDestinationOnly,omitempty"`
 }
 
 // PathNodeItem represents a single node (from either SRC or DST) with its metadata
@@ -473,6 +531,8 @@ type PathNodeItem struct {
 type PathNodes struct {
 	Src *PathNodeItem `json:"src,omitempty"`
 	Dst *PathNodeItem `json:"dst,omitempty"`
+	// ResolvedDstName is the accepted/committed destination basename when it differs from the source name.
+	ResolvedDstName string `json:"resolvedDstName,omitempty"`
 }
 
 type FileSizeStats struct {
@@ -505,15 +565,15 @@ type PathReviewStats struct {
 	SuccessfulCount     int           `json:"successfulCount"`
 	FoldersCount        int           `json:"foldersCount"`
 	FilesCount          int           `json:"filesCount"`
-	FoldersRatio        float64      `json:"foldersRatio"`
-	FilesRatio          float64      `json:"filesRatio"`
+	FoldersRatio        float64       `json:"foldersRatio"`
+	FilesRatio          float64       `json:"filesRatio"`
 	TotalFileSize       FileSizeStats `json:"totalFileSize"`
 }
 
 // ListChildrenDiffsResponse wraps the diff result with pagination metadata
 type ListChildrenDiffsResponse struct {
-	Items      map[string]PathNodes `json:"items"` // path -> {src?: {...}, dst?: {...}}
-	ItemOrder  []string               `json:"itemOrder,omitempty"` // paths in engine/SQL order; use when present — JSON object keys are sorted by path, not by sort
+	Items      map[string]PathNodes `json:"items"`               // path -> {src?: {...}, dst?: {...}}
+	ItemOrder  []string             `json:"itemOrder,omitempty"` // paths in engine/SQL order; use when present — JSON object keys are sorted by path, not by sort
 	Pagination PaginationInfo       `json:"pagination"`
 }
 
@@ -537,10 +597,10 @@ type ExclusionRequest struct {
 // AffectedCount and Deltas come from the engine's PathReviewActionResult so the UI can update local stats without refetching.
 // Delta keys (traversal only): traversalPending, traversalFailed, excluded. Apply to the phase's pending/failed/excluded counts.
 type ExclusionResponse struct {
-	Success       bool            `json:"success"`
-	Error         string          `json:"error,omitempty"`
-	TaskID        string          `json:"taskID,omitempty"` // Background task ID for 'all' operations
-	AffectedCount int64           `json:"affectedCount"`
+	Success       bool             `json:"success"`
+	Error         string           `json:"error,omitempty"`
+	TaskID        string           `json:"taskID,omitempty"` // Background task ID for 'all' operations
+	AffectedCount int64            `json:"affectedCount"`
 	Deltas        map[string]int64 `json:"deltas"` // Engine keys: traversalPending, traversalFailed, excluded; only keys that changed are present
 }
 
@@ -558,9 +618,10 @@ type SweepConfigRequest struct {
 
 // SweepResponse represents the response from triggering a sweep
 type SweepResponse struct {
-	Success bool   `json:"success"`
-	Message string `json:"message,omitempty"`
-	Error   string `json:"error,omitempty"`
+	Success        bool   `json:"success"`
+	Message        string `json:"message,omitempty"`
+	Error          string `json:"error,omitempty"`
+	AlreadyRunning bool   `json:"alreadyRunning,omitempty"`
 }
 
 // PendingWorkResponse represents the response for checking pending work
@@ -583,12 +644,13 @@ type MarkRetryRequest struct {
 //   - Discovery retry (mark/unmark for retry discovery): traversalPending, traversalFailed, pendingRetries; plus folders, files, excluded, sizeDst when DST descendants removed.
 //   - Copy retry (mark/unmark for retry copy): copyPending, copyFailed.
 //   - Retry all failed: traversalFailed, traversalPending.
+//
 // UI should apply traversal keys to traversal review counters and copy keys to copy review counters.
 type MarkRetryResponse struct {
-	Success       bool            `json:"success"`
-	Error         string          `json:"error,omitempty"`
-	TaskID        string          `json:"taskID,omitempty"` // Background task ID for 'all' operations
-	AffectedCount int64           `json:"affectedCount"`
+	Success       bool             `json:"success"`
+	Error         string           `json:"error,omitempty"`
+	TaskID        string           `json:"taskID,omitempty"` // Background task ID for 'all' operations
+	AffectedCount int64            `json:"affectedCount"`
 	Deltas        map[string]int64 `json:"deltas"` // Engine keys above; only keys that changed are present
 }
 
@@ -605,6 +667,8 @@ type SearchRequest struct {
 	Conditions       []SearchCondition `json:"conditions,omitempty"`       // Search conditions
 	Sort             *SortOption       `json:"sort,omitempty"`             // Sort options (field and direction)
 	StatusSearchType string            `json:"statusSearchType,omitempty"` // Which status type(s) to search by: "traversal", "copy", or "both" (default: "both")
+	// IncludeDestinationOnly when false hides destination-only rows. Nil means include (legacy default).
+	IncludeDestinationOnly *bool `json:"includeDestinationOnly,omitempty"`
 }
 
 // SortOption represents sorting options for search results

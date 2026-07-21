@@ -8,4 +8,7 @@ type ProviderCredentials struct {
 type Config struct {
 	GoogleDrive *ProviderCredentials `json:"google_drive,omitempty"`
 	Dropbox     *ProviderCredentials `json:"dropbox,omitempty"`
+	OneDrive    *ProviderCredentials `json:"onedrive,omitempty"`
+	SharePoint  *ProviderCredentials `json:"sharepoint,omitempty"`
+	Box         *ProviderCredentials `json:"box,omitempty"`
 }

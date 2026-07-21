@@ -12,36 +12,90 @@ import (
 // ResumeMigration resumes a stopped or failed migration in the correct phase:
 // traversal-suspended / awaiting-traversal-review → retry sweep;
 // copy-suspended → StartCopy (full copy resume);
-// copy-in-progress (dead) / awaiting-copy-review → copy retry (failed copy items).
+// awaiting-copy-review → copy retry (failed copy items);
+// delete-suspended → StartDelete; awaiting-delete-review → delete retry.
+//
+// Idempotent: if the migration (or a resume background task) is already live, returns success
+// with AlreadyRunning. If phase is still *-in-progress but nothing is running, normalizes to
+// *-suspended then resumes.
 func (m *Manager) ResumeMigration(ctx context.Context, migrationID string, config corebridge.SweepConfigRequest) (corebridge.SweepResponse, error) {
 	mig, err := m.GetMigration(context.TODO(), migrationID)
 	if err != nil {
 		return corebridge.SweepResponse{Success: false, Error: err.Error()}, err
 	}
 
+	if resp, ok := m.resumeIfAlreadyRunning(migrationID, mig); ok {
+		return resp, nil
+	}
+	if err := m.normalizeDeadInProgressForResume(migrationID, mig); err != nil {
+		return corebridge.SweepResponse{Success: false, Error: err.Error()}, err
+	}
+
 	switch mig.Phase() {
 	case migration.PhaseCopySuspended:
 		return m.triggerCopyStartResume(migrationID)
-	case migration.PhaseCopyReview, migration.PhaseCopying:
+	case migration.PhaseCopyReview:
 		return m.triggerCopyRetryResume(migrationID, config)
 	case migration.PhaseDeleteSuspended:
 		return m.triggerDeleteStartResume(migrationID)
-	case migration.PhaseDeleteReview, migration.PhaseDeleting:
+	case migration.PhaseDeleteReview:
 		return m.triggerDeleteRetryResume(migrationID, config)
 	default:
 		return m.TriggerRetrySweep(ctx, migrationID, config)
 	}
 }
 
+func (m *Manager) resumeIfAlreadyRunning(migrationID string, mig *migration.Migration) (corebridge.SweepResponse, bool) {
+	if mig != nil && mig.IsLive() {
+		return corebridge.SweepResponse{
+			Success:        true,
+			Message:        "Migration already running",
+			AlreadyRunning: true,
+		}, true
+	}
+	if len(m.bgTaskMgr.GetRunningTasks(migrationID)) > 0 {
+		return corebridge.SweepResponse{
+			Success:        true,
+			Message:        "Migration resume already in progress",
+			AlreadyRunning: true,
+		}, true
+	}
+	return corebridge.SweepResponse{}, false
+}
+
+func (m *Manager) normalizeDeadInProgressForResume(migrationID string, mig *migration.Migration) error {
+	if mig == nil {
+		return nil
+	}
+	changed, err := mig.NormalizeDeadInProgressToSuspended()
+	if err != nil {
+		return err
+	}
+	if !changed {
+		return nil
+	}
+	m.mu.Lock()
+	if rec := m.runtimeByID[migrationID]; rec != nil {
+		rec.Status = mig.Phase()
+		rec.Error = ""
+	}
+	m.mu.Unlock()
+	return nil
+}
+
 func (m *Manager) triggerCopyStartResume(migrationID string) (corebridge.SweepResponse, error) {
-	if err := m.ensureCopyResumeAllowed(migrationID, corebridge.BackgroundTaskTypeCopyResume); err != nil {
+	mig, err := m.GetMigration(context.TODO(), migrationID)
+	if err != nil {
 		return corebridge.SweepResponse{Success: false, Error: err.Error()}, err
+	}
+	if resp, ok := m.resumeIfAlreadyRunning(migrationID, mig); ok {
+		return resp, nil
 	}
 	if err := m.ensureFSAdaptersRehydrated(migrationID); err != nil {
 		return corebridge.SweepResponse{Success: false, Error: err.Error()}, err
 	}
 
-	mig, err := m.GetMigration(context.TODO(), migrationID)
+	mig, err = m.GetMigration(context.TODO(), migrationID)
 	if err != nil {
 		return corebridge.SweepResponse{Success: false, Error: err.Error()}, err
 	}
@@ -90,14 +144,18 @@ func (m *Manager) triggerCopyStartResume(migrationID string) (corebridge.SweepRe
 }
 
 func (m *Manager) triggerCopyRetryResume(migrationID string, config corebridge.SweepConfigRequest) (corebridge.SweepResponse, error) {
-	if err := m.ensureCopyResumeAllowed(migrationID, corebridge.BackgroundTaskTypeCopyRetry); err != nil {
+	mig, err := m.GetMigration(context.TODO(), migrationID)
+	if err != nil {
 		return corebridge.SweepResponse{Success: false, Error: err.Error()}, err
+	}
+	if resp, ok := m.resumeIfAlreadyRunning(migrationID, mig); ok {
+		return resp, nil
 	}
 	if err := m.ensureFSAdaptersRehydrated(migrationID); err != nil {
 		return corebridge.SweepResponse{Success: false, Error: err.Error()}, err
 	}
 
-	mig, err := m.GetMigration(context.TODO(), migrationID)
+	mig, err = m.GetMigration(context.TODO(), migrationID)
 	if err != nil {
 		return corebridge.SweepResponse{Success: false, Error: err.Error()}, err
 	}
@@ -149,17 +207,6 @@ func (m *Manager) triggerCopyRetryResume(migrationID string, config corebridge.S
 	}, nil
 }
 
-func (m *Manager) ensureCopyResumeAllowed(migrationID string, taskType corebridge.BackgroundTaskType) error {
-	runningTasks := m.bgTaskMgr.GetRunningTasks(migrationID)
-	if len(runningTasks) > 0 {
-		return fmt.Errorf("cannot resume: there are %d running background tasks", len(runningTasks))
-	}
-	if m.bgTaskMgr.HasRunningTask(migrationID, taskType) {
-		return fmt.Errorf("copy resume is already running for this migration")
-	}
-	return nil
-}
-
 func (m *Manager) buildCopyPhaseOptions(config corebridge.SweepConfigRequest) migration.CopyPhaseOptions {
 	maxRetries := config.MaxRetries
 	if maxRetries <= 0 {
@@ -193,10 +240,17 @@ func (m *Manager) buildCopyPhaseOptions(config corebridge.SweepConfigRequest) mi
 }
 
 func (m *Manager) triggerDeleteStartResume(migrationID string) (corebridge.SweepResponse, error) {
+	mig, err := m.GetMigration(context.TODO(), migrationID)
+	if err != nil {
+		return corebridge.SweepResponse{Success: false, Error: err.Error()}, err
+	}
+	if resp, ok := m.resumeIfAlreadyRunning(migrationID, mig); ok {
+		return resp, nil
+	}
 	if err := m.ensureFSAdaptersRehydrated(migrationID); err != nil {
 		return corebridge.SweepResponse{Success: false, Error: err.Error()}, err
 	}
-	mig, err := m.GetMigration(context.TODO(), migrationID)
+	mig, err = m.GetMigration(context.TODO(), migrationID)
 	if err != nil {
 		return corebridge.SweepResponse{Success: false, Error: err.Error()}, err
 	}
@@ -232,10 +286,17 @@ func (m *Manager) triggerDeleteStartResume(migrationID string) (corebridge.Sweep
 }
 
 func (m *Manager) triggerDeleteRetryResume(migrationID string, config corebridge.SweepConfigRequest) (corebridge.SweepResponse, error) {
+	mig, err := m.GetMigration(context.TODO(), migrationID)
+	if err != nil {
+		return corebridge.SweepResponse{Success: false, Error: err.Error()}, err
+	}
+	if resp, ok := m.resumeIfAlreadyRunning(migrationID, mig); ok {
+		return resp, nil
+	}
 	if err := m.ensureFSAdaptersRehydrated(migrationID); err != nil {
 		return corebridge.SweepResponse{Success: false, Error: err.Error()}, err
 	}
-	mig, err := m.GetMigration(context.TODO(), migrationID)
+	mig, err = m.GetMigration(context.TODO(), migrationID)
 	if err != nil {
 		return corebridge.SweepResponse{Success: false, Error: err.Error()}, err
 	}

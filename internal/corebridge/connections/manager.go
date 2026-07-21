@@ -7,11 +7,13 @@ import (
 
 // Record tracks in-memory OAuth state for a cloud connection.
 type Record struct {
-	ProviderID  string
-	ServiceID   string
-	MigrationID string
-	AccessToken string
-	ExpiresAt   time.Time
+	ProviderID         string
+	ServiceID          string
+	MigrationID        string
+	AccessToken        string
+	ExpiresAt          time.Time
+	AccountEmail       string
+	AccountDisplayName string
 }
 
 // Manager holds access tokens in process memory only.

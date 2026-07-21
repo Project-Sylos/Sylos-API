@@ -4,11 +4,12 @@ import "fmt"
 
 // Preferences represents the application preferences structure.
 type Preferences struct {
-	Theme            string    `json:"theme"`
-	SidebarCollapsed bool      `json:"sidebarCollapsed"`
-	PreSplashEnabled bool      `json:"preSplashEnabled"`
-	Tips             TipsPrefs `json:"tips"`
-	Developer        DevPrefs  `json:"developer"`
+	Theme              string    `json:"theme"`
+	SidebarCollapsed   bool      `json:"sidebarCollapsed"`
+	HideUnsetServices  bool      `json:"hideUnsetServices"`
+	PreSplashEnabled   bool      `json:"preSplashEnabled"`
+	Tips               TipsPrefs `json:"tips"`
+	Developer          DevPrefs  `json:"developer"`
 }
 
 // TipsPrefs represents the tips preferences.

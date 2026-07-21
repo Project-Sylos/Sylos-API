@@ -28,15 +28,62 @@ type SpectraConfig struct {
 		MaxFiles               int     `json:"max_files"`
 		FileBackoffFactor      float64 `json:"file_backoff_factor,omitempty"`
 		FileDepthDecayFactor   float64 `json:"file_depth_decay_factor,omitempty"`
-
-		// Cache configuration (optional, defaults to false)
-		EnableCache bool `json:"enable_cache,omitempty"`
+		DivergingTreeMode      bool    `json:"diverging_tree_mode,omitempty"`
 	} `json:"seed"`
 	API struct {
 		Host string `json:"host"`
 		Port int    `json:"port"`
 	} `json:"api"`
 	SecondaryTables map[string]float64 `json:"secondary_tables"`
+	Chaos           *SpectraChaosConfig `json:"chaos,omitempty"`
+	Auth            *SpectraAuthConfig  `json:"auth,omitempty"`
+}
+
+// SpectraAuthConfig mirrors Spectra auth settings.
+type SpectraAuthConfig struct {
+	Enabled               bool  `json:"enabled"`
+	AccessTokenTTLSeconds int64 `json:"access_token_ttl_seconds"`
+}
+
+// SpectraChaosConfig mirrors Spectra chaos simulation settings.
+type SpectraChaosConfig struct {
+	Enabled    bool                   `json:"enabled"`
+	RateLimits SpectraChaosRateLimits `json:"rate_limits"`
+	Backoff    SpectraChaosBackoff    `json:"backoff"`
+	Latency    SpectraChaosLatency    `json:"latency"`
+	PacketLoss SpectraChaosPacketLoss `json:"packet_loss"`
+}
+
+type SpectraChaosRateLimits struct {
+	PollIntervalMs int                              `json:"poll_interval_ms"`
+	Global         SpectraChaosCallLimit            `json:"global"`
+	Operations     map[string]SpectraChaosCallLimit `json:"operations"`
+	Bandwidth      SpectraChaosBandwidthLimit       `json:"bandwidth"`
+}
+
+type SpectraChaosCallLimit struct {
+	CallsPerSecond float64 `json:"calls_per_second"`
+	Burst          int     `json:"burst,omitempty"`
+}
+
+type SpectraChaosBandwidthLimit struct {
+	BytesPerSecond float64 `json:"bytes_per_second"`
+	BurstBytes     int64   `json:"burst_bytes,omitempty"`
+}
+
+type SpectraChaosBackoff struct {
+	BaseRetryAfterMs  int     `json:"base_retry_after_ms"`
+	ExponentialFactor float64 `json:"exponential_factor"`
+}
+
+type SpectraChaosLatency struct {
+	ListChildrenMs int `json:"list_children_ms"`
+	JitterMs       int `json:"jitter_ms"`
+}
+
+type SpectraChaosPacketLoss struct {
+	Probability  float64 `json:"probability"`
+	RetryAfterMs int     `json:"retry_after_ms"`
 }
 
 // SaveSpectraConfigOverride creates a Spectra config override file with a custom db_path
@@ -64,6 +111,7 @@ func SaveSpectraConfigOverride(dataDir, migrationID, originalConfigPath string) 
 	// Navigate to seed.db_path and update it
 	if seed, ok := configMap["seed"].(map[string]any); ok {
 		seed["db_path"] = absSpectraDBPath
+		delete(seed, "enable_cache")
 	} else {
 		return "", fmt.Errorf("invalid config structure: 'seed' field is missing or not an object")
 	}
@@ -135,6 +183,7 @@ func SaveSpectraConfigFromData(dataDir, migrationID string, configData map[strin
 	// Navigate to seed.db_path and update it
 	if seed, ok := configMap["seed"].(map[string]any); ok {
 		seed["db_path"] = absSpectraDBPath
+		delete(seed, "enable_cache")
 	} else {
 		return "", fmt.Errorf("invalid config structure: 'seed' field is missing or not an object")
 	}

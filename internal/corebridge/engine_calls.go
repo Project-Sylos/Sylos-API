@@ -17,12 +17,12 @@ func InspectMigrationStatus(mig *migration.Migration) (migration.MigrationStatus
 	return migration.InspectMigrationStatus(mig.DB)
 }
 
-// PathReviewStatsFromMigration returns phase-aware review stats from the engine (cache-backed, no DB on API side).
-func PathReviewStatsFromMigration(mig *migration.Migration) (*PathReviewStats, error) {
+// PathReviewStatsFromMigration returns review stats projected for the requested UI view.
+func PathReviewStatsFromMigration(mig *migration.Migration, view string) (*PathReviewStats, error) {
 	if mig == nil {
 		return nil, fmt.Errorf("migration is nil")
 	}
-	stats := mig.GetPathReviewStats()
+	stats := mig.GetPathReviewStatsForView(view)
 	return &PathReviewStats{
 		PendingCount:        stats.PendingCount,
 		FailedCount:         stats.FailedCount,
@@ -73,7 +73,9 @@ func diffListResponse(items []migration.DiffItem, offset, limit, total int) List
 }
 
 func diffItemToPathNodes(item migration.DiffItem) PathNodes {
-	pathNodes := PathNodes{}
+	pathNodes := PathNodes{
+		ResolvedDstName: strings.TrimSpace(item.ResolvedDstName),
+	}
 	if !item.MissingOnSource {
 		pathNodes.Src = &PathNodeItem{
 			Queue:           "SRC",
@@ -91,11 +93,17 @@ func diffItemToPathNodes(item migration.DiffItem) PathNodes {
 		}
 	}
 	if !item.MissingOnDest {
+		dstName := item.Name
+		dstPath := item.Path
+		if pathNodes.ResolvedDstName != "" {
+			dstName = pathNodes.ResolvedDstName
+			dstPath = joinParentPath(item.Path, pathNodes.ResolvedDstName)
+		}
 		pathNodes.Dst = &PathNodeItem{
 			Queue:           "DST",
 			Id:              item.DstNodeID,
-			Name:            item.Name,
-			LocationPath:    item.Path,
+			Name:            dstName,
+			LocationPath:    dstPath,
 			DepthLevel:      item.Depth,
 			Type:            item.Type,
 			Size:            item.Size,
@@ -107,6 +115,26 @@ func diffItemToPathNodes(item migration.DiffItem) PathNodes {
 	return pathNodes
 }
 
+// joinParentPath replaces the basename of srcPath with newBase.
+func joinParentPath(srcPath, newBase string) string {
+	newBase = strings.TrimSpace(newBase)
+	if newBase == "" {
+		return srcPath
+	}
+	srcPath = strings.TrimSpace(srcPath)
+	if srcPath == "" || srcPath == "/" {
+		return "/" + newBase
+	}
+	i := strings.LastIndex(srcPath, "/")
+	if i < 0 {
+		return "/" + newBase
+	}
+	if i == 0 {
+		return "/" + newBase
+	}
+	return srcPath[:i] + "/" + newBase
+}
+
 // ListChildrenDiffs calls the engine and converts the result to API response.
 func ListChildrenDiffs(mig *migration.Migration, req ListChildrenDiffsRequest) (ListChildrenDiffsResponse, error) {
 	if mig == nil {
@@ -114,12 +142,13 @@ func ListChildrenDiffs(mig *migration.Migration, req ListChildrenDiffsRequest) (
 	}
 	sortBy, sortDirection := resolveSort(req.Sort)
 	result, err := mig.ListChildrenDiffs(migration.ListChildrenDiffsRequest{
-		Path:          req.Path,
-		Limit:         req.Limit,
-		Offset:        req.Offset,
-		SortBy:        sortBy,
-		SortDirection: sortDirection,
-		FoldersOnly:   req.FoldersOnly,
+		Path:                   req.Path,
+		Limit:                  req.Limit,
+		Offset:                 req.Offset,
+		SortBy:                 sortBy,
+		SortDirection:          sortDirection,
+		FoldersOnly:            req.FoldersOnly,
+		IncludeDestinationOnly: req.IncludeDestinationOnly,
 	})
 	if err != nil {
 		return ListChildrenDiffsResponse{}, fmt.Errorf("failed to list children diffs: %w", err)
@@ -128,11 +157,11 @@ func ListChildrenDiffs(mig *migration.Migration, req ListChildrenDiffsRequest) (
 }
 
 // GetChildrenDiffsStats calls the engine and converts to API response.
-func GetChildrenDiffsStats(mig *migration.Migration, path string, foldersOnly bool) (DiffsStatsResponse, error) {
+func GetChildrenDiffsStats(mig *migration.Migration, path string, foldersOnly bool, includeDestinationOnly *bool) (DiffsStatsResponse, error) {
 	if mig == nil {
 		return DiffsStatsResponse{}, fmt.Errorf("migration is nil")
 	}
-	stats, err := mig.GetChildrenDiffsStats(path, foldersOnly)
+	stats, err := mig.GetChildrenDiffsStats(path, foldersOnly, includeDestinationOnly)
 	if err != nil {
 		return DiffsStatsResponse{}, fmt.Errorf("failed to get diffs stats: %w", err)
 	}
@@ -167,13 +196,14 @@ func enginePathReviewConditions(req SearchRequest) []migration.PathReviewSearchC
 func engineSearchRequest(req SearchRequest, offset, limit int) migration.SearchRequest {
 	sortBy, sortDirection := resolveSort(req.Sort)
 	return migration.SearchRequest{
-		Path:             "",
-		Limit:            limit,
-		Offset:           offset,
-		SortBy:           sortBy,
-		SortDirection:    sortDirection,
-		Conditions:       enginePathReviewConditions(req),
-		StatusSearchType: req.StatusSearchType,
+		Path:                   "",
+		Limit:                  limit,
+		Offset:                 offset,
+		SortBy:                 sortBy,
+		SortDirection:          sortDirection,
+		Conditions:             enginePathReviewConditions(req),
+		StatusSearchType:       req.StatusSearchType,
+		IncludeDestinationOnly: req.IncludeDestinationOnly,
 	}
 }
 
@@ -215,6 +245,14 @@ func commonQueueState(m *ExternalQueueMetrics, name string, q map[string]any) {
 	m.TotalPending = convert.ToNumber[int](q["total_pending"])
 	m.TotalFailed = convert.ToNumber[int](q["total_failed"])
 	m.PossibleStall = convert.ToBool(q["possible_stall"])
+	m.RoundExpected = convert.ToNumber[int](q["round_expected"])
+	m.RoundCompleted = convert.ToNumber[int](q["round_completed"])
+	m.CopyPass = convert.ToNumber[int](q["copy_pass"])
+	m.RateLimitedUntilSrc = convert.ToString(q["rate_limited_until_src"])
+	m.RateLimitedUntilDst = convert.ToString(q["rate_limited_until_dst"])
+	m.RateLimitedRemainingMsSrc = convert.ToNumber[int64](q["rate_limited_remaining_ms_src"])
+	m.RateLimitedRemainingMsDst = convert.ToNumber[int64](q["rate_limited_remaining_ms_dst"])
+	m.InterOpDelayMs = convert.ToNumber[int64](q["inter_op_delay_ms"])
 }
 
 func traversalQueueMetrics(name string, q map[string]any) *ExternalQueueMetrics {
@@ -230,12 +268,13 @@ func traversalQueueMetrics(name string, q map[string]any) *ExternalQueueMetrics 
 
 func copyQueueMetrics(q map[string]any) *ExternalQueueMetrics {
 	m := &ExternalQueueMetrics{
-		Folders:        convert.ToNumber[int64](q["folders"]),
-		Files:          convert.ToNumber[int64](q["files"]),
-		Total:          convert.ToNumber[int64](q["total"]),
-		Bytes:          convert.ToNumber[int64](q["bytes"]),
-		ItemsPerSecond: convert.ToNumber[float64](q["items_per_second"]),
-		BytesPerSecond: convert.ToNumber[float64](q["bytes_per_second"]),
+		Folders:         convert.ToNumber[int64](q["folders"]),
+		Files:           convert.ToNumber[int64](q["files"]),
+		Total:           convert.ToNumber[int64](q["total"]),
+		Bytes:           convert.ToNumber[int64](q["bytes"]),
+		ItemsPerSecond:  convert.ToNumber[float64](q["items_per_second"]),
+		BytesPerSecond:  convert.ToNumber[float64](q["bytes_per_second"]),
+		ProgressPercent: convert.ToNumber[float64](q["progress_percent"]),
 	}
 	commonQueueState(m, "copy", q)
 	return m
@@ -243,10 +282,13 @@ func copyQueueMetrics(q map[string]any) *ExternalQueueMetrics {
 
 func deleteQueueMetrics(q map[string]any) *ExternalQueueMetrics {
 	m := &ExternalQueueMetrics{
-		Folders:        convert.ToNumber[int64](q["folders"]),
-		Files:          convert.ToNumber[int64](q["files"]),
-		Total:          convert.ToNumber[int64](q["total"]),
-		ItemsPerSecond: convert.ToNumber[float64](q["items_per_second"]),
+		Folders:         convert.ToNumber[int64](q["folders"]),
+		Files:           convert.ToNumber[int64](q["files"]),
+		Total:           convert.ToNumber[int64](q["total"]),
+		Bytes:           convert.ToNumber[int64](q["bytes"]),
+		ItemsPerSecond:  convert.ToNumber[float64](q["items_per_second"]),
+		BytesPerSecond:  convert.ToNumber[float64](q["bytes_per_second"]),
+		ProgressPercent: convert.ToNumber[float64](q["progress_percent"]),
 	}
 	commonQueueState(m, "delete", q)
 	return m

@@ -20,11 +20,17 @@ func (m *Manager) initializePlanAdapters(migrationID string) error {
 		return err
 	}
 	if plan.SourceAdapter != nil && plan.SourceDefinition.Type == services.ServiceTypeCloud {
+		if err := m.persistLiveCloudCredentials(mig, plan.SourceConnectionID); err != nil {
+			m.logger.Warn().Err(err).Str("migration_id", migrationID).Str("connection_id", plan.SourceConnectionID).Msg("persist source cloud credentials")
+		}
 		if err := m.serviceMgr.FS.InitializeCloudAdapter(plan.SourceAdapter, nil, plan.SourceConnectionID); err != nil {
 			return fmt.Errorf("initialize source cloud adapter: %w", err)
 		}
 	}
 	if plan.DestinationAdapter != nil && plan.DestinationDefinition.Type == services.ServiceTypeCloud {
+		if err := m.persistLiveCloudCredentials(mig, plan.DestinationConnectionID); err != nil {
+			m.logger.Warn().Err(err).Str("migration_id", migrationID).Str("connection_id", plan.DestinationConnectionID).Msg("persist destination cloud credentials")
+		}
 		if err := m.serviceMgr.FS.InitializeCloudAdapter(plan.DestinationAdapter, nil, plan.DestinationConnectionID); err != nil {
 			return fmt.Errorf("initialize destination cloud adapter: %w", err)
 		}
@@ -42,9 +48,10 @@ func (m *Manager) rehydrateCloudConnection(migrationID string, binding migration
 		return err
 	}
 	_, err = m.serviceMgr.FS.RegisterCloudConnection(fslib.CloudConnectionOptions{
-		ProviderID:      services.CloudProviderID(def),
-		ConnectionID:    binding.ConnectionID,
-		CredentialsJSON: credsJSON,
+		ProviderID:         services.CloudProviderID(def),
+		ConnectionID:       binding.ConnectionID,
+		CredentialsJSON:    credsJSON,
+		PersistCredentials: m.cloudCredentialsPersistHook(mig, binding.ConnectionID),
 	})
 	return err
 }

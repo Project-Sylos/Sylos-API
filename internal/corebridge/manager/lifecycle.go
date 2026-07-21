@@ -28,6 +28,10 @@ func (m *Manager) StartMigration(ctx context.Context, req corebridge.StartMigrat
 	if plan == nil || !plan.HasSource || !plan.HasDestination {
 		return corebridge.Migration{}, fmt.Errorf("roots not fully configured for migration %s", mig.ID)
 	}
+	if strings.TrimSpace(req.Options.PathCheckTarget) != "" {
+		m.SetPathCheckTarget(mig.ID, req.Options.PathCheckTarget)
+		plan = m.rootsMgr.GetPlan(mig.ID)
+	}
 
 	cfg := m.buildTraversalConfig(req.Options, plan)
 	if _, err := mig.AddRoots(plan.SourceRoot, plan.DestinationRoot); err != nil && mig.Phase() == migration.PhaseCreated {
@@ -121,11 +125,22 @@ func (m *Manager) buildTraversalConfig(opts corebridge.MigrationOptions, plan *r
 		SkipListener:    skipListener,
 		StartupDelay:    time.Duration(opts.StartupDelaySec) * time.Second,
 		ProgressTick:    time.Duration(opts.ProgressTickMillis) * time.Millisecond,
+		PathCheckTarget: pathCheckTargetFromOpts(opts, plan),
 		Verification: migration.VerifyOptions{
 			AllowPending:  opts.Verification.AllowPending,
 			AllowNotOnSrc: opts.Verification.AllowNotOnSrc,
 		},
 	}
+}
+
+func pathCheckTargetFromOpts(opts corebridge.MigrationOptions, plan *roots.RootPlan) string {
+	if strings.TrimSpace(opts.PathCheckTarget) != "" {
+		return strings.TrimSpace(opts.PathCheckTarget)
+	}
+	if plan != nil && strings.TrimSpace(plan.PathCheckTarget) != "" {
+		return strings.TrimSpace(plan.PathCheckTarget)
+	}
+	return ""
 }
 
 func migrationService(def services.ServiceDefinition, adapter fstypes.FSAdapter, root fstypes.Folder, connectionID string) migration.Service {
@@ -338,7 +353,8 @@ func (m *Manager) GetMigrationStatus(ctx context.Context, id string) (corebridge
 		status = mig.Phase()
 	}
 	// Background phase-change goroutine sets completedAt when the run ends; prefer engine phase over stale runtime status.
-	if completedAt != nil && !mig.IsLive() {
+	// Do not override an explicit failed runtime status — that hides the real error behind a stuck *-in-progress phase.
+	if completedAt != nil && !mig.IsLive() && status != corebridge.MigrationStatusFailed {
 		status = mig.Phase()
 	}
 

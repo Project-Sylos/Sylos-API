@@ -7,6 +7,7 @@ import (
 
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
 	"codeberg.org/Sylos/Sylos-API/internal/routes/middleware"
+	"codeberg.org/Sylos/Sylos-FS/pkg/cloud"
 )
 
 func (h handler) setRoot(ctx *middleware.Context, payload corebridge.SetRootRequest) {
@@ -15,6 +16,7 @@ func (h handler) setRoot(ctx *middleware.Context, payload corebridge.SetRootRequ
 		status := http.StatusInternalServerError
 		if errors.Is(err, corebridge.ErrServiceNotFound) ||
 			errors.Is(err, corebridge.ErrMigrationNotFound) ||
+			errors.Is(err, cloud.ErrForbiddenMigrationRoot) ||
 			isUserInputError(err) {
 			status = http.StatusBadRequest
 		}

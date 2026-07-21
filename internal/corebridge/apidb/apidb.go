@@ -110,6 +110,27 @@ func (d *DB) migrate() error {
 			key VARCHAR PRIMARY KEY,
 			value VARCHAR NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS sftp_known_hosts (
+			host_port VARCHAR PRIMARY KEY,
+			host_key VARCHAR NOT NULL,
+			fingerprint VARCHAR NOT NULL,
+			updated_at TIMESTAMP NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS sftp_saved_hosts (
+			id VARCHAR PRIMARY KEY,
+			display_name VARCHAR NOT NULL,
+			host VARCHAR NOT NULL,
+			port INTEGER NOT NULL,
+			username VARCHAR NOT NULL,
+			auth_method VARCHAR NOT NULL,
+			secrets_blob BLOB NOT NULL,
+			host_key VARCHAR,
+			created_at TIMESTAMP NOT NULL,
+			updated_at TIMESTAMP NOT NULL,
+			last_used_at TIMESTAMP
+		)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS sftp_saved_hosts_endpoint
+			ON sftp_saved_hosts (host, port, username)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := d.sql.Exec(stmt); err != nil {
@@ -242,7 +263,7 @@ func (d *DB) DeleteAllMigrationRegistry() error {
 	return nil
 }
 
-// WipeInstallUserData removes users, cloud provider OAuth apps, and install config from the API database.
+// WipeInstallUserData removes users, cloud provider OAuth apps, install config, and SFTP host pins from the API database.
 // Migration registry rows should be cleared separately via DeleteAllMigrationRegistry.
 func (d *DB) WipeInstallUserData() error {
 	if _, err := d.sql.Exec(`DELETE FROM users`); err != nil {
@@ -256,6 +277,12 @@ func (d *DB) WipeInstallUserData() error {
 	}
 	if _, err := d.sql.Exec(`DELETE FROM install_config`); err != nil {
 		return fmt.Errorf("delete install config: %w", err)
+	}
+	if err := d.DeleteAllSFTPKnownHosts(); err != nil {
+		return err
+	}
+	if err := d.DeleteAllSFTPSavedHosts(); err != nil {
+		return err
 	}
 	return nil
 }

@@ -41,6 +41,9 @@ func (m *Manager) ListOAuthApps(_ context.Context) ([]OAuthAppSummary, error) {
 	}{
 		{"google_drive", "Google Drive"},
 		{"dropbox", "Dropbox"},
+		{"onedrive", "OneDrive"},
+		{"sharepoint", "SharePoint"},
+		{"box", "Box"},
 	}
 	out := make([]OAuthAppSummary, 0, len(known))
 	for _, k := range known {
@@ -170,6 +173,12 @@ func (m *Manager) refreshOAuthCredsFromDB() {
 			cfg.GoogleDrive = creds
 		case "dropbox":
 			cfg.Dropbox = creds
+		case "onedrive":
+			cfg.OneDrive = creds
+		case "sharepoint":
+			cfg.SharePoint = creds
+		case "box":
+			cfg.Box = creds
 		}
 	}
 	m.oauthCreds = cfg

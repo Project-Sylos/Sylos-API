@@ -3,6 +3,7 @@ package manager
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
@@ -61,6 +62,7 @@ func (m *Manager) ListAllMigrations(ctx context.Context, req corebridge.ListMigr
 			status = corebridge.Status{
 				Migration: corebridge.Migration{
 					ID:            rec.ID,
+					Name:          rec.Name,
 					SourceID:      "",
 					DestinationID: "",
 					StartedAt:     rec.CreatedAt,
@@ -87,6 +89,9 @@ func (m *Manager) ListAllMigrations(ctx context.Context, req corebridge.ListMigr
 			}
 		}
 
+		// Prefer a human-friendly registry name when status has none / only the ID.
+		status.Name = preferMigrationDisplayName(status.Name, rec.Name, rec.ID)
+
 		statuses = append(statuses, status)
 	}
 
@@ -112,6 +117,26 @@ func (m *Manager) ListAllMigrations(ctx context.Context, req corebridge.ListMigr
 		Limit:      limit,
 		HasMore:    hasMore,
 	}, nil
+}
+
+// preferMigrationDisplayName picks a user-facing name for list cards.
+// Prefer a non-empty status/engine name, then registry name, else the migration ID.
+func preferMigrationDisplayName(statusName, registryName, migrationID string) string {
+	statusName = strings.TrimSpace(statusName)
+	registryName = strings.TrimSpace(registryName)
+	if statusName != "" && statusName != migrationID {
+		return statusName
+	}
+	if registryName != "" && registryName != migrationID {
+		return registryName
+	}
+	if statusName != "" {
+		return statusName
+	}
+	if registryName != "" {
+		return registryName
+	}
+	return migrationID
 }
 
 func sortStatusesByTime(statuses []corebridge.Status) {

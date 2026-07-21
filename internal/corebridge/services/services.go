@@ -360,6 +360,25 @@ func (m *ServiceManager) CountChildren(ctx context.Context, req ListChildrenRequ
 	return m.FS.CountChildren(ctx, fsReq)
 }
 
+// ValidateMigrationRoot delegates provider-owned forbidden-root policy to
+// Sylos-FS. Non-cloud services (including the virtual "spectra" catalog id)
+// have no cloud virtual-root policy.
+func (m *ServiceManager) ValidateMigrationRoot(serviceID string, folder fstypes.Folder) error {
+	// Catalog lists a single virtual "spectra" entry; concrete worlds are
+	// spectra-primary / spectra-s1 and are resolved later by role.
+	if serviceID == "" || serviceID == "spectra" {
+		return nil
+	}
+	def, err := m.GetServiceDefinition(serviceID)
+	if err != nil {
+		return err
+	}
+	if def.Type != ServiceTypeCloud {
+		return nil
+	}
+	return m.FS.ValidateMigrationRoot(def.ID, folder)
+}
+
 func (m *ServiceManager) GetServiceDefinition(id string) (ServiceDefinition, error) {
 	def, ok := m.services[id]
 	if !ok {
@@ -376,4 +395,3 @@ func (m *ServiceManager) GetServiceDefinitionByWorld(world string) (ServiceDefin
 	}
 	return ServiceDefinition{}, ErrServiceNotFound
 }
-

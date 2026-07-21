@@ -12,6 +12,8 @@ import (
 )
 
 // persistFSCredentialBinding writes one side's binding after SetRoot.
+// For cloud/SFTP connections it also persists OAuth/form credentials into the migration DB
+// (tokens are often received before the migration exists, so PostProviderTokens may have skipped persist).
 func (m *Manager) persistFSCredentialBinding(migrationID, role string) error {
 	mig, err := m.GetMigration(context.Background(), migrationID)
 	if err != nil {
@@ -56,7 +58,38 @@ func (m *Manager) persistFSCredentialBinding(migrationID, role string) error {
 	default:
 		return nil
 	}
-	return mig.UpsertFSCredentialBinding(binding)
+	if err := mig.UpsertFSCredentialBinding(binding); err != nil {
+		return err
+	}
+	if binding.ConnectionID != "" {
+		if err := m.persistLiveCloudCredentials(mig, binding.ConnectionID); err != nil {
+			m.logger.Warn().Err(err).
+				Str("migration_id", migrationID).
+				Str("connection_id", binding.ConnectionID).
+				Msg("persist cloud credentials on set-root")
+		}
+		if rec, ok := m.connMgr.Get(binding.ConnectionID); ok && rec.MigrationID == "" {
+			rec.MigrationID = migrationID
+			m.connMgr.Set(binding.ConnectionID, rec)
+		}
+	}
+	return nil
+}
+
+// persistLiveCloudCredentials copies StoredCredentials from the in-memory FS session into the migration DB.
+func (m *Manager) persistLiveCloudCredentials(mig *migration.Migration, connectionID string) error {
+	if mig == nil || connectionID == "" || m.serviceMgr == nil || m.serviceMgr.FS == nil {
+		return nil
+	}
+	credsJSON, err := m.serviceMgr.FS.ExportCloudCredentialsJSON(connectionID)
+	if err != nil {
+		return err
+	}
+	if err := m.persistOAuthCredentials(mig, connectionID, credsJSON); err != nil {
+		return err
+	}
+	// Attach rotation persist for providers like Box (tokens may have been registered before the migration existed).
+	return m.serviceMgr.FS.SetCloudCredentialsPersist(connectionID, m.cloudCredentialsPersistHook(mig, connectionID))
 }
 
 // ensureFSAdaptersRehydrated rebuilds in-memory FS adapters when a real filesystem operation is needed.
@@ -78,8 +111,11 @@ func (m *Manager) rehydrateFSAdaptersIfNeeded(migrationID string, mig *migration
 		return nil
 	}
 	bindings, err := mig.ListFSCredentialBindings()
-	if err != nil || len(bindings) == 0 {
+	if err != nil {
 		return err
+	}
+	if len(bindings) == 0 {
+		return fmt.Errorf("no persisted FS roots/credentials for migration %s (cannot restore after restart)", migrationID)
 	}
 	order := []string{migration.FSCredentialRoleSource, migration.FSCredentialRoleDestination}
 	spectraRegistered := make(map[string]bool)
