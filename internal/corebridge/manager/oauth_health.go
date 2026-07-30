@@ -209,6 +209,7 @@ func (m *Manager) checkOAuthProviderHealth(providerID string, skipBecauseLive bo
 	creds := oauthcreds.ProviderCredentials{
 		ClientID:     app.ClientID,
 		ClientSecret: app.ClientSecret,
+		TenantID:     app.TenantID,
 	}
 	checkErr := oauth.ValidateAppCredentials(providerID, creds)
 	if checkErr != nil {
@@ -272,6 +273,7 @@ func oauthSummaryFromApp(app apidb.ProviderOAuthApp, fallbackName string) OAuthA
 		DisplayName: fallbackName,
 		Configured:  app.ClientID != "" && app.ClientSecret != "",
 		ClientID:    app.ClientID,
+		TenantID:    app.TenantID,
 	}
 	if app.DisplayName != "" {
 		summary.DisplayName = app.DisplayName

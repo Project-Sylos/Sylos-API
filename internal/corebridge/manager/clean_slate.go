@@ -5,7 +5,7 @@ import (
 	"fmt"
 
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
-	"codeberg.org/Sylos/Sylos-API/internal/corebridge/database"
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge/migrationfiles"
 	"codeberg.org/Sylos/Sylos-API/pkg/oauthcreds"
 )
 
@@ -13,9 +13,6 @@ import (
 type AdminActionResponse struct {
 	Message string `json:"message"`
 }
-
-// CleanSlateResponse is kept for backward compatibility with older clients.
-type CleanSlateResponse = AdminActionResponse
 
 func (m *Manager) clearMigrationRuntimeAndDisk(ctx context.Context) error {
 	m.mu.Lock()
@@ -49,7 +46,7 @@ func (m *Manager) clearMigrationRuntimeAndDisk(ctx context.Context) error {
 		}
 	}
 
-	if err := database.CleanMigrationData(m.cfg.Runtime.DataDir); err != nil {
+	if err := migrationfiles.CleanMigrationData(m.cfg.Runtime.DataDir); err != nil {
 		return fmt.Errorf("clean migration data files: %w", err)
 	}
 
@@ -68,11 +65,6 @@ func (m *Manager) ClearAllMigrations(ctx context.Context) (AdminActionResponse, 
 	return AdminActionResponse{
 		Message: "All migration data has been removed. User accounts and cloud provider settings were kept.",
 	}, nil
-}
-
-// CleanSlate is an alias for ClearAllMigrations.
-func (m *Manager) CleanSlate(ctx context.Context) (CleanSlateResponse, error) {
-	return m.ClearAllMigrations(ctx)
 }
 
 // WipeInstall removes all migration data plus users, cloud provider OAuth apps, and install config.

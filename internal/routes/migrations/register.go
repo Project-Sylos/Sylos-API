@@ -4,8 +4,8 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/rs/zerolog"
 
-	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/manager"
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge/migrationops"
 	"codeberg.org/Sylos/Sylos-API/internal/routes/middleware"
 )
 
@@ -42,22 +42,22 @@ func Register(router chi.Router, logger zerolog.Logger, mgr *manager.Manager, mw
 	router.Post("/migrations/{migrationID}/exclude", middleware.JSON(mw, h.excludeNodes))
 	router.Post("/migrations/{migrationID}/unexclude", middleware.JSON(mw, h.unexcludeNodes))
 	router.Post("/migrations/{migrationID}/node/{nodeID}/mark-retry-discovery", middleware.NoBody(mw, func(ctx *middleware.Context) {
-		h.handleMarkNodeForRetry(ctx, corebridge.RetryKindDiscovery)
+		h.handleMarkNodeForRetry(ctx, migrationops.RetryKindDiscovery)
 	}))
 	router.Post("/migrations/{migrationID}/node/{nodeID}/mark-retry-copy", middleware.NoBody(mw, func(ctx *middleware.Context) {
-		h.handleMarkNodeForRetry(ctx, corebridge.RetryKindCopy)
+		h.handleMarkNodeForRetry(ctx, migrationops.RetryKindCopy)
 	}))
 	router.Post("/migrations/{migrationID}/node/{nodeID}/unmark-retry-discovery", middleware.NoBody(mw, func(ctx *middleware.Context) {
-		h.handleUnmarkNodeForRetry(ctx, corebridge.RetryKindDiscovery)
+		h.handleUnmarkNodeForRetry(ctx, migrationops.RetryKindDiscovery)
 	}))
 	router.Post("/migrations/{migrationID}/node/{nodeID}/unmark-retry-copy", middleware.NoBody(mw, func(ctx *middleware.Context) {
-		h.handleUnmarkNodeForRetry(ctx, corebridge.RetryKindCopy)
+		h.handleUnmarkNodeForRetry(ctx, migrationops.RetryKindCopy)
 	}))
 	router.Post("/migrations/{migrationID}/node/{nodeID}/mark-retry-delete", middleware.NoBody(mw, func(ctx *middleware.Context) {
-		h.handleMarkNodeForRetry(ctx, corebridge.RetryKindDelete)
+		h.handleMarkNodeForRetry(ctx, migrationops.RetryKindDelete)
 	}))
 	router.Post("/migrations/{migrationID}/node/{nodeID}/unmark-retry-delete", middleware.NoBody(mw, func(ctx *middleware.Context) {
-		h.handleUnmarkNodeForRetry(ctx, corebridge.RetryKindDelete)
+		h.handleUnmarkNodeForRetry(ctx, migrationops.RetryKindDelete)
 	}))
 	router.Post("/migrations/{migrationID}/prepare-source-cleanup", middleware.JSON(mw, h.prepareSourceCleanup))
 	router.Post("/migrations/{migrationID}/node/{nodeID}/skip-delete", middleware.NoBody(mw, h.handleSkipNodeDelete))
@@ -72,12 +72,16 @@ func Register(router chi.Router, logger zerolog.Logger, mgr *manager.Manager, mw
 	router.Post("/migrations/{migrationID}/path-issues/ignore-remaining", middleware.NoBody(mw, h.ignoreRemainingPathIssues))
 	router.Post("/migrations/{migrationID}/path-issues/{nodeID}/accept", middleware.JSON(mw, h.acceptPathIssue))
 	router.Post("/migrations/{migrationID}/path-issues/{nodeID}/remap", middleware.JSON(mw, h.remapPathIssue))
+	router.Post("/migrations/{migrationID}/path-issues/{nodeID}/reset", middleware.NoBody(mw, h.resetPathRemap))
 	router.Post("/migrations/{migrationID}/path-issues/{nodeID}/ignore", middleware.NoBody(mw, h.ignorePathIssueSubtree))
 	router.Post("/migrations/{migrationID}/path-issues/{nodeID}/unignore", middleware.NoBody(mw, h.unignorePathIssueSubtree))
 	router.Get("/migrations/{migrationID}/bgTasks", middleware.NoBody(mw, h.bgTasks))
 	router.Get("/migrations/{migrationID}/bgTasks/running", middleware.NoBody(mw, h.bgTasksRunning))
 	router.Get("/migrations/{migrationID}/bgTasks/{taskID}", middleware.NoBody(mw, h.bgTaskByID))
 	router.Get("/migrations/{migrationID}/stats", middleware.NoBody(mw, h.stats))
+	router.Get("/migrations/{migrationID}/scaling", middleware.NoBody(mw, h.getScaling))
+	router.Put("/migrations/{migrationID}/scaling", middleware.JSON(mw, h.putScaling))
+	router.Post("/migrations/{migrationID}/search/count", middleware.JSON(mw, h.searchCount))
 	router.Post("/migrations/{migrationID}/search", middleware.JSON(mw, h.search))
 	router.Get("/migrations/{migrationID}/stream", h.handleStream)
 }

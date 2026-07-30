@@ -47,7 +47,7 @@ func (m *Manager) ListChildren(ctx context.Context, req corebridge.ListChildrenR
 		Pagination: corebridge.PaginationInfo{
 			Offset:       pagination.Offset,
 			Limit:        pagination.Limit,
-			Total:        pagination.Total,
+			Total:        &pagination.Total,
 			TotalFolders: pagination.TotalFolders,
 			TotalFiles:   pagination.TotalFiles,
 			HasMore:      pagination.HasMore,
@@ -57,6 +57,10 @@ func (m *Manager) ListChildren(ctx context.Context, req corebridge.ListChildrenR
 
 func (m *Manager) ListDrives(ctx context.Context, serviceID string) ([]corebridge.DriveInfo, error) {
 	return m.serviceMgr.FS.ListDrives(ctx, serviceID)
+}
+
+func (m *Manager) GetStorageInfo(ctx context.Context, req corebridge.GetStorageInfoRequest) (corebridge.StorageInfo, error) {
+	return m.serviceMgr.GetStorageInfo(ctx, req)
 }
 
 func (m *Manager) MountDrive(ctx context.Context, serviceID string, req corebridge.MountDriveRequest) (corebridge.DriveInfo, error) {

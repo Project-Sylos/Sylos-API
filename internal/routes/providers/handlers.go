@@ -2,13 +2,13 @@ package providers
 
 import (
 	"net/http"
-	"strconv"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/rs/zerolog"
 
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/manager"
+	"codeberg.org/Sylos/Sylos-API/internal/routes/httputil"
 	"codeberg.org/Sylos/Sylos-API/internal/routes/middleware"
 )
 
@@ -138,17 +138,8 @@ func (h handler) listRoots(ctx *middleware.Context) {
 func (h handler) listChildren(ctx *middleware.Context) {
 	providerID := chi.URLParam(ctx.Request(), "providerID")
 	connectionID := chi.URLParam(ctx.Request(), "connectionID")
-	q := ctx.Request().URL.Query()
-	identifier := q.Get("identifier")
-	rootType := q.Get("rootType")
-	driveID := q.Get("driveId")
-	if driveID == "" {
-		driveID = q.Get("drive_id")
-	}
-	offset, _ := strconv.Atoi(q.Get("offset"))
-	limit, _ := strconv.Atoi(q.Get("limit"))
-	foldersOnly := q.Get("foldersOnly") == "true" || q.Get("folders_only") == "true"
-	resp, err := h.mgr.ListProviderChildren(ctx.Request().Context(), providerID, connectionID, identifier, rootType, driveID, offset, limit, foldersOnly)
+	q := httputil.ParseListChildrenQuery(ctx.Request().URL.Query())
+	resp, err := h.mgr.ListProviderChildren(ctx.Request().Context(), providerID, connectionID, q.Identifier, q.RootType, q.DriveID, q.Offset, q.Limit, q.FoldersOnly)
 	if err != nil {
 		ctx.Error(http.StatusInternalServerError, "failed to list children", err)
 		return

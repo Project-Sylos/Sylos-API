@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"strings"
 
-	"codeberg.org/Sylos/Sylos-API/internal/corebridge/database"
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge/migrationfiles"
 	"codeberg.org/Sylos/Sylos-API/internal/routes/middleware"
 	"github.com/go-chi/chi/v5"
 )
@@ -20,15 +20,15 @@ func (h handler) uploadUnified(ctx *middleware.Context) {
 
 	uploadType := strings.TrimSpace(strings.ToLower(ctx.Request().URL.Query().Get("type")))
 	if uploadType == "" {
-		uploadType = database.UploadTypeZip
+		uploadType = migrationfiles.UploadTypeZip
 	}
-	if uploadType != database.UploadTypeZip && uploadType != database.UploadTypeDB && uploadType != database.UploadTypeYAML {
+	if uploadType != migrationfiles.UploadTypeZip && uploadType != migrationfiles.UploadTypeDB && uploadType != migrationfiles.UploadTypeYAML {
 		ctx.Error(http.StatusBadRequest, "type must be zip, db, or yaml", nil)
 		return
 	}
 
 	maxSize := int64(100 << 20) // 100MB for db/yaml
-	if uploadType == database.UploadTypeZip {
+	if uploadType == migrationfiles.UploadTypeZip {
 		maxSize = 500 << 20 // 500MB for zip
 	}
 	if err := ctx.Request().ParseMultipartForm(maxSize); err != nil {

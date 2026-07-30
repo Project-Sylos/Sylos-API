@@ -5,21 +5,21 @@ import (
 	"github.com/rs/zerolog"
 
 	"codeberg.org/Sylos/Sylos-API/internal/auth/users"
-	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge/manager"
 	"codeberg.org/Sylos/Sylos-API/internal/routes/middleware"
 )
 
 type handler struct {
 	logger    zerolog.Logger
-	core      corebridge.Bridge
+	mgr       *manager.Manager
 	userStore *users.Store
 }
 
 // Register mounts filesystem service discovery and browsing routes.
-func Register(router chi.Router, logger zerolog.Logger, core corebridge.Bridge, userStore *users.Store, mw *middleware.Middleware) {
+func Register(router chi.Router, logger zerolog.Logger, mgr *manager.Manager, userStore *users.Store, mw *middleware.Middleware) {
 	h := handler{
 		logger:    logger,
-		core:      core,
+		mgr:       mgr,
 		userStore: userStore,
 	}
 
@@ -29,5 +29,6 @@ func Register(router chi.Router, logger zerolog.Logger, core corebridge.Bridge, 
 	router.Post("/services/{serviceID}/folders", middleware.JSON(mw, h.createFolder))
 	router.Post("/services/{serviceID}/nodes/delete", middleware.JSON(mw, h.deleteNodes))
 	router.Get("/services/{serviceID}/drives", middleware.NoBody(mw, h.listDrives))
+	router.Get("/services/{serviceID}/storage", middleware.NoBody(mw, h.getStorageInfo))
 	router.Post("/services/{serviceID}/drives/mount", middleware.JSON(mw, h.mountDrive))
 }

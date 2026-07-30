@@ -24,7 +24,7 @@ func (h handler) mountDrive(ctx *middleware.Context, payload corebridge.MountDri
 		return
 	}
 
-	drive, err := h.core.MountDrive(ctx.Request().Context(), serviceID, corebridge.MountDriveRequest{
+	drive, err := h.mgr.MountDrive(ctx.Request().Context(), serviceID, corebridge.MountDriveRequest{
 		Device: device,
 	})
 	if err != nil {

@@ -9,6 +9,11 @@ import (
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
 )
 
+type phaseResumeSetup struct {
+	mig *migration.Migration
+	cfg migration.Config
+}
+
 // ResumeMigration resumes a stopped or failed migration in the correct phase:
 // traversal-suspended / awaiting-traversal-review → retry sweep;
 // copy-suspended → StartCopy (full copy resume);
@@ -83,53 +88,99 @@ func (m *Manager) normalizeDeadInProgressForResume(migrationID string, mig *migr
 	return nil
 }
 
-func (m *Manager) triggerCopyStartResume(migrationID string) (corebridge.SweepResponse, error) {
+func (m *Manager) preparePhaseResume(migrationID string, requireDestination bool) (phaseResumeSetup, corebridge.SweepResponse, bool, error) {
 	mig, err := m.GetMigration(context.TODO(), migrationID)
 	if err != nil {
-		return corebridge.SweepResponse{Success: false, Error: err.Error()}, err
+		return phaseResumeSetup{}, corebridge.SweepResponse{Success: false, Error: err.Error()}, false, err
 	}
 	if resp, ok := m.resumeIfAlreadyRunning(migrationID, mig); ok {
-		return resp, nil
+		return phaseResumeSetup{}, resp, true, nil
 	}
 	if err := m.ensureFSAdaptersRehydrated(migrationID); err != nil {
-		return corebridge.SweepResponse{Success: false, Error: err.Error()}, err
+		return phaseResumeSetup{}, corebridge.SweepResponse{Success: false, Error: err.Error()}, false, err
 	}
-
 	mig, err = m.GetMigration(context.TODO(), migrationID)
 	if err != nil {
-		return corebridge.SweepResponse{Success: false, Error: err.Error()}, err
+		return phaseResumeSetup{}, corebridge.SweepResponse{Success: false, Error: err.Error()}, false, err
 	}
 	plan := m.rootsMgr.GetPlan(migrationID)
-	if plan == nil || !plan.HasSource || !plan.HasDestination {
-		msg := fmt.Sprintf("roots not fully configured for migration %s", migrationID)
-		return corebridge.SweepResponse{Success: false, Error: msg}, fmt.Errorf("%s", msg)
+	if requireDestination {
+		if plan == nil || !plan.HasSource || !plan.HasDestination {
+			msg := fmt.Sprintf("roots not fully configured for migration %s", migrationID)
+			return phaseResumeSetup{}, corebridge.SweepResponse{Success: false, Error: msg}, false, fmt.Errorf("%s", msg)
+		}
+	} else if plan == nil || !plan.HasSource {
+		msg := fmt.Sprintf("source root not configured for migration %s", migrationID)
+		return phaseResumeSetup{}, corebridge.SweepResponse{Success: false, Error: msg}, false, fmt.Errorf("%s", msg)
 	}
-
 	cfg := m.buildTraversalConfig(corebridge.MigrationOptions{}, plan)
+	return phaseResumeSetup{mig: mig, cfg: cfg}, corebridge.SweepResponse{}, false, nil
+}
+
+func (m *Manager) setRuntimePhaseStatus(migrationID, status string) {
 	m.mu.Lock()
 	if rec := m.runtimeByID[migrationID]; rec != nil {
-		rec.Status = migration.PhaseCopying
+		rec.Status = status
 		rec.CompletedAt = nil
 		rec.Error = ""
 	}
 	m.mu.Unlock()
+}
+
+func (m *Manager) finishRuntimeAfterBackgroundPhase(migrationID string, mig *migration.Migration, runErr error) {
+	doneAt := time.Now().UTC()
+	m.mu.Lock()
+	if rec := m.runtimeByID[migrationID]; rec != nil {
+		rec.CompletedAt = &doneAt
+		if runErr != nil {
+			rec.Status = corebridge.MigrationStatusFailed
+			rec.Error = runErr.Error()
+		} else {
+			rec.Status = mig.Phase()
+			rec.Error = ""
+		}
+	}
+	m.mu.Unlock()
+}
+
+func (m *Manager) sweepConfigFields(config corebridge.SweepConfigRequest) (workerCount, maxRetries int, logAddress, logLevel string, skipListener bool) {
+	workerCount = config.WorkerCount
+	maxRetries = config.MaxRetries
+	if maxRetries <= 0 {
+		maxRetries = m.cfg.Runtime.DefaultMaxRetries
+	}
+	if maxRetries <= 0 {
+		maxRetries = 3
+	}
+	logAddress = config.LogAddress
+	if logAddress == "" {
+		logAddress = m.cfg.Runtime.LogAddress
+	}
+	logLevel = config.LogLevel
+	if logLevel == "" {
+		logLevel = m.cfg.Runtime.LogLevel
+	}
+	if logLevel == "" {
+		logLevel = "info"
+	}
+	skipListener = true
+	if config.SkipListener != nil {
+		skipListener = *config.SkipListener
+	}
+	return workerCount, maxRetries, logAddress, logLevel, skipListener
+}
+
+func (m *Manager) triggerCopyStartResume(migrationID string) (corebridge.SweepResponse, error) {
+	setup, early, done, err := m.preparePhaseResume(migrationID, true)
+	if err != nil || done {
+		return early, err
+	}
+	m.setRuntimePhaseStatus(migrationID, migration.PhaseCopying)
 
 	taskID := m.bgTaskMgr.StartTaskWithPath(migrationID, corebridge.BackgroundTaskTypeCopyResume, "")
 	go func() {
-		_, runErr := mig.StartCopy(cfg)
-		doneAt := time.Now().UTC()
-		m.mu.Lock()
-		if rec := m.runtimeByID[migrationID]; rec != nil {
-			rec.CompletedAt = &doneAt
-			if runErr != nil {
-				rec.Status = corebridge.MigrationStatusFailed
-				rec.Error = runErr.Error()
-			} else {
-				rec.Status = mig.Phase()
-				rec.Error = ""
-			}
-		}
-		m.mu.Unlock()
+		_, runErr := setup.mig.StartCopy(setup.cfg)
+		m.finishRuntimeAfterBackgroundPhase(migrationID, setup.mig, runErr)
 		if runErr != nil {
 			m.bgTaskMgr.FailTask(migrationID, taskID, runErr)
 			return
@@ -144,56 +195,20 @@ func (m *Manager) triggerCopyStartResume(migrationID string) (corebridge.SweepRe
 }
 
 func (m *Manager) triggerCopyRetryResume(migrationID string, config corebridge.SweepConfigRequest) (corebridge.SweepResponse, error) {
-	mig, err := m.GetMigration(context.TODO(), migrationID)
-	if err != nil {
-		return corebridge.SweepResponse{Success: false, Error: err.Error()}, err
+	setup, early, done, err := m.preparePhaseResume(migrationID, true)
+	if err != nil || done {
+		return early, err
 	}
-	if resp, ok := m.resumeIfAlreadyRunning(migrationID, mig); ok {
-		return resp, nil
-	}
-	if err := m.ensureFSAdaptersRehydrated(migrationID); err != nil {
-		return corebridge.SweepResponse{Success: false, Error: err.Error()}, err
-	}
-
-	mig, err = m.GetMigration(context.TODO(), migrationID)
-	if err != nil {
-		return corebridge.SweepResponse{Success: false, Error: err.Error()}, err
-	}
-	plan := m.rootsMgr.GetPlan(migrationID)
-	if plan == nil || !plan.HasSource || !plan.HasDestination {
-		msg := fmt.Sprintf("roots not fully configured for migration %s", migrationID)
-		return corebridge.SweepResponse{Success: false, Error: msg}, fmt.Errorf("%s", msg)
-	}
-
-	cfg := m.buildTraversalConfig(corebridge.MigrationOptions{}, plan)
 	opts := m.buildCopyPhaseOptions(config)
-	if err := mig.PrepareCopyRetry(); err != nil {
+	if err := setup.mig.PreparePhase(migration.PreparePhaseCopyRetry); err != nil {
 		return corebridge.SweepResponse{Success: false, Error: err.Error()}, err
 	}
-	m.mu.Lock()
-	if rec := m.runtimeByID[migrationID]; rec != nil {
-		rec.Status = migration.PhaseCopying
-		rec.CompletedAt = nil
-		rec.Error = ""
-	}
-	m.mu.Unlock()
+	m.setRuntimePhaseStatus(migrationID, migration.PhaseCopying)
 
 	taskID := m.bgTaskMgr.StartTaskWithPath(migrationID, corebridge.BackgroundTaskTypeCopyRetry, "")
 	go func() {
-		_, runErr := mig.RunCopyRetry(cfg, opts)
-		doneAt := time.Now().UTC()
-		m.mu.Lock()
-		if rec := m.runtimeByID[migrationID]; rec != nil {
-			rec.CompletedAt = &doneAt
-			if runErr != nil {
-				rec.Status = corebridge.MigrationStatusFailed
-				rec.Error = runErr.Error()
-			} else {
-				rec.Status = mig.Phase()
-				rec.Error = ""
-			}
-		}
-		m.mu.Unlock()
+		_, runErr := setup.mig.RunCopyRetry(setup.cfg, opts)
+		m.finishRuntimeAfterBackgroundPhase(migrationID, setup.mig, runErr)
 		if runErr != nil {
 			m.bgTaskMgr.FailTask(migrationID, taskID, runErr)
 			return
@@ -208,30 +223,9 @@ func (m *Manager) triggerCopyRetryResume(migrationID string, config corebridge.S
 }
 
 func (m *Manager) buildCopyPhaseOptions(config corebridge.SweepConfigRequest) migration.CopyPhaseOptions {
-	maxRetries := config.MaxRetries
-	if maxRetries <= 0 {
-		maxRetries = m.cfg.Runtime.DefaultMaxRetries
-	}
-	if maxRetries <= 0 {
-		maxRetries = 3
-	}
-	logAddress := config.LogAddress
-	if logAddress == "" {
-		logAddress = m.cfg.Runtime.LogAddress
-	}
-	logLevel := config.LogLevel
-	if logLevel == "" {
-		logLevel = m.cfg.Runtime.LogLevel
-	}
-	if logLevel == "" {
-		logLevel = "info"
-	}
-	skipListener := true
-	if config.SkipListener != nil {
-		skipListener = *config.SkipListener
-	}
+	workerCount, maxRetries, logAddress, logLevel, skipListener := m.sweepConfigFields(config)
 	return migration.CopyPhaseOptions{
-		WorkerCount:  config.WorkerCount,
+		WorkerCount:  workerCount,
 		MaxRetries:   maxRetries,
 		LogAddress:   logAddress,
 		LogLevel:     logLevel,
@@ -240,97 +234,31 @@ func (m *Manager) buildCopyPhaseOptions(config corebridge.SweepConfigRequest) mi
 }
 
 func (m *Manager) triggerDeleteStartResume(migrationID string) (corebridge.SweepResponse, error) {
-	mig, err := m.GetMigration(context.TODO(), migrationID)
-	if err != nil {
-		return corebridge.SweepResponse{Success: false, Error: err.Error()}, err
+	setup, early, done, err := m.preparePhaseResume(migrationID, false)
+	if err != nil || done {
+		return early, err
 	}
-	if resp, ok := m.resumeIfAlreadyRunning(migrationID, mig); ok {
-		return resp, nil
-	}
-	if err := m.ensureFSAdaptersRehydrated(migrationID); err != nil {
-		return corebridge.SweepResponse{Success: false, Error: err.Error()}, err
-	}
-	mig, err = m.GetMigration(context.TODO(), migrationID)
-	if err != nil {
-		return corebridge.SweepResponse{Success: false, Error: err.Error()}, err
-	}
-	plan := m.rootsMgr.GetPlan(migrationID)
-	if plan == nil || !plan.HasSource {
-		msg := fmt.Sprintf("source root not configured for migration %s", migrationID)
-		return corebridge.SweepResponse{Success: false, Error: msg}, fmt.Errorf("%s", msg)
-	}
-	cfg := m.buildTraversalConfig(corebridge.MigrationOptions{}, plan)
-	m.mu.Lock()
-	if rec := m.runtimeByID[migrationID]; rec != nil {
-		rec.Status = migration.PhaseDeleting
-		rec.CompletedAt = nil
-		rec.Error = ""
-	}
-	m.mu.Unlock()
+	m.setRuntimePhaseStatus(migrationID, migration.PhaseDeleting)
 	go func() {
-		_, runErr := mig.StartDelete(cfg)
-		doneAt := time.Now().UTC()
-		m.mu.Lock()
-		if rec := m.runtimeByID[migrationID]; rec != nil {
-			rec.CompletedAt = &doneAt
-			if runErr != nil {
-				rec.Status = corebridge.MigrationStatusFailed
-				rec.Error = runErr.Error()
-			} else {
-				rec.Status = mig.Phase()
-			}
-		}
-		m.mu.Unlock()
+		_, runErr := setup.mig.StartDelete(setup.cfg)
+		m.finishRuntimeAfterBackgroundPhase(migrationID, setup.mig, runErr)
 	}()
 	return corebridge.SweepResponse{Success: true, Message: "Delete phase resume started"}, nil
 }
 
 func (m *Manager) triggerDeleteRetryResume(migrationID string, config corebridge.SweepConfigRequest) (corebridge.SweepResponse, error) {
-	mig, err := m.GetMigration(context.TODO(), migrationID)
-	if err != nil {
-		return corebridge.SweepResponse{Success: false, Error: err.Error()}, err
+	setup, early, done, err := m.preparePhaseResume(migrationID, false)
+	if err != nil || done {
+		return early, err
 	}
-	if resp, ok := m.resumeIfAlreadyRunning(migrationID, mig); ok {
-		return resp, nil
-	}
-	if err := m.ensureFSAdaptersRehydrated(migrationID); err != nil {
-		return corebridge.SweepResponse{Success: false, Error: err.Error()}, err
-	}
-	mig, err = m.GetMigration(context.TODO(), migrationID)
-	if err != nil {
-		return corebridge.SweepResponse{Success: false, Error: err.Error()}, err
-	}
-	plan := m.rootsMgr.GetPlan(migrationID)
-	if plan == nil || !plan.HasSource {
-		msg := fmt.Sprintf("source root not configured for migration %s", migrationID)
-		return corebridge.SweepResponse{Success: false, Error: msg}, fmt.Errorf("%s", msg)
-	}
-	cfg := m.buildTraversalConfig(corebridge.MigrationOptions{}, plan)
 	opts := m.buildCopyPhaseOptions(config)
-	if err := mig.PrepareDeleteRetry(); err != nil {
+	if err := setup.mig.PreparePhase(migration.PreparePhaseDeleteRetry); err != nil {
 		return corebridge.SweepResponse{Success: false, Error: err.Error()}, err
 	}
-	m.mu.Lock()
-	if rec := m.runtimeByID[migrationID]; rec != nil {
-		rec.Status = migration.PhaseDeleting
-		rec.CompletedAt = nil
-		rec.Error = ""
-	}
-	m.mu.Unlock()
+	m.setRuntimePhaseStatus(migrationID, migration.PhaseDeleting)
 	go func() {
-		_, runErr := mig.RunDeleteRetry(cfg, opts)
-		doneAt := time.Now().UTC()
-		m.mu.Lock()
-		if rec := m.runtimeByID[migrationID]; rec != nil {
-			rec.CompletedAt = &doneAt
-			if runErr != nil {
-				rec.Status = corebridge.MigrationStatusFailed
-				rec.Error = runErr.Error()
-			} else {
-				rec.Status = mig.Phase()
-			}
-		}
-		m.mu.Unlock()
+		_, runErr := setup.mig.RunDeleteRetry(setup.cfg, opts)
+		m.finishRuntimeAfterBackgroundPhase(migrationID, setup.mig, runErr)
 	}()
 	return corebridge.SweepResponse{Success: true, Message: "Delete retry started"}, nil
 }

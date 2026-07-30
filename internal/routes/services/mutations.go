@@ -24,7 +24,7 @@ func (h handler) createFolder(ctx *middleware.Context, req corebridge.CreateBrow
 		return
 	}
 
-	folder, err := h.core.CreateBrowseFolder(ctx.Request().Context(), serviceID, req)
+	folder, err := h.mgr.CreateBrowseFolder(ctx.Request().Context(), serviceID, req)
 	if err != nil {
 		if err == corebridge.ErrServiceNotFound {
 			ctx.Error(http.StatusNotFound, "service not found", err)
@@ -52,7 +52,7 @@ func (h handler) deleteNodes(ctx *middleware.Context, req corebridge.DeleteBrows
 		return
 	}
 
-	result, err := h.core.DeleteBrowseNodes(ctx.Request().Context(), serviceID, req)
+	result, err := h.mgr.DeleteBrowseNodes(ctx.Request().Context(), serviceID, req)
 	if err != nil {
 		if err == corebridge.ErrServiceNotFound {
 			ctx.Error(http.StatusNotFound, "service not found", err)

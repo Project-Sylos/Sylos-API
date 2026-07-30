@@ -36,6 +36,10 @@ type SetRootRequest struct {
 	ConnectionID string
 	Root         FolderDescriptor
 	Config       map[string]any `json:"config,omitempty"` // Optional service-specific config (e.g., Spectra config JSON)
+	// Children are immediate children of Root from the root-pick review step (optional).
+	Children []RootChildPlan
+	// ExcludedIDs marks source children to exclude; ids not in Children are ignored.
+	ExcludedIDs []string
 }
 
 // SetRootResponse represents a response from setting a root
@@ -47,6 +51,8 @@ type SetRootResponse struct {
 	RootSummary             *migration.RootSeedSummary
 	SourceConnectionID      string
 	DestinationConnectionID string
+	SourceRootPrepared      bool
+	DestinationRootPrepared bool
 }
 
 // Manager handles root-related operations
@@ -78,6 +84,13 @@ type RootPlan struct {
 	Seeding                   bool
 	// PathCheckTarget selects destination-name rules: "none", "auto", or a provider id (e.g. "windows").
 	PathCheckTarget string
+	// WindowsCompat enables Windows desktop-sync overlays on soft cloud destinations.
+	WindowsCompat bool
+
+	SourceRootPrepared      bool
+	DestinationRootPrepared bool
+	SourceChildren          []RootChildPlan
+	DestinationChildren     []RootChildPlan
 }
 
 func NewManager(logger zerolog.Logger, dataDir string, serviceMgr *services.ServiceManager, resolveDBPath func(path, migrationID string) (string, error)) *Manager {
@@ -177,6 +190,23 @@ func (m *Manager) SetRoot(ctx context.Context, req SetRootRequest) (SetRootRespo
 		return SetRootResponse{}, err
 	}
 
+	var reviewedChildren []RootChildPlan
+	hasChildPayload := len(req.Children) > 0 || len(req.ExcludedIDs) > 0
+	if hasChildPayload {
+		allowExclude := role == "source"
+		if role == "destination" && len(req.ExcludedIDs) > 0 {
+			return SetRootResponse{}, fmt.Errorf("destination children cannot set excluded")
+		}
+		normalized, err := NormalizeRootChildren(req.Children, req.ExcludedIDs, allowExclude)
+		if err != nil {
+			return SetRootResponse{}, err
+		}
+		if role == "source" && len(normalized) == 0 {
+			return SetRootResponse{}, fmt.Errorf("source root review requires at least one included child")
+		}
+		reviewedChildren = normalized
+	}
+
 	// Spectra needs a registered session before ListChildren works, and that
 	// session is created later in this flow. Synthetic Spectra roots are never
 	// "empty" in the filesystem sense, so skip the pre-check.
@@ -194,34 +224,10 @@ func (m *Manager) SetRoot(ctx context.Context, req SetRootRequest) (SetRootRespo
 	}
 
 	m.mu.Lock()
-	plan := m.plans[migrationID]
-	if plan == nil {
-		plan = &RootPlan{}
-		m.plans[migrationID] = plan
+	if m.plans[migrationID] == nil {
+		m.plans[migrationID] = &RootPlan{}
 	}
-
-	// Cleanup old adapters if root is being reset (do this while holding lock)
-	var oldRelease func()
-	if role == "source" && plan.SourceAdapterRelease != nil {
-		oldRelease = plan.SourceAdapterRelease
-		plan.SourceAdapter = nil
-		plan.SourceAdapterRelease = nil
-	} else if role == "destination" && plan.DestinationAdapterRelease != nil {
-		oldRelease = plan.DestinationAdapterRelease
-		plan.DestinationAdapter = nil
-		plan.DestinationAdapterRelease = nil
-	}
-
-	plan.Seeded = false
-	plan.Seeding = false
-	plan.DatabasePath = ""
-	plan.RootSummary = migration.RootSeedSummary{}
 	m.mu.Unlock()
-
-	// Release old adapter outside of lock (in case it needs to close connections)
-	if oldRelease != nil {
-		oldRelease()
-	}
 
 	// For Spectra services, use Sylos-FS's session-based pattern:
 	// 1. API registers a session with ServiceManager using RegisterSpectraSession(configPath, connectionID)
@@ -233,7 +239,11 @@ func (m *Manager) SetRoot(ctx context.Context, req SetRootRequest) (SetRootRespo
 	switch serviceDef.Type {
 	case services.ServiceTypeSpectra:
 		m.mu.RLock()
-		existingSessionID := plan.SourceConnectionID
+		plan := m.plans[migrationID]
+		existingSessionID := ""
+		if plan != nil {
+			existingSessionID = plan.SourceConnectionID
+		}
 		m.mu.RUnlock()
 
 		if existingSessionID == "" {
@@ -312,9 +322,9 @@ func (m *Manager) SetRoot(ctx context.Context, req SetRootRequest) (SetRootRespo
 		sessionID = connectionID
 	}
 
-	// Acquire adapter for the root being set (blocking I/O - do NOT hold lock)
-	// For Spectra: session must be registered first using RegisterSpectraSession()
-	// ServiceManager manages the session lifecycle - API just uses the sessionID
+	// Acquire before releasing any previous adapter for this role. Releasing first
+	// drops the last ref on cloud/Spectra sessions and deletes them, so editing a
+	// root with the same connectionId fails with "connection not found".
 	adapter, release, err := m.serviceMgr.FS.AcquireAdapter(serviceDef, folder, sessionID)
 	if err != nil {
 		return SetRootResponse{}, fmt.Errorf("failed to acquire %s adapter: %w", role, err)
@@ -322,34 +332,48 @@ func (m *Manager) SetRoot(ctx context.Context, req SetRootRequest) (SetRootRespo
 
 	fmt.Printf("Acquired adapter - role: %s, sessionID: %s\n", role, sessionID)
 
-	// Re-acquire lock to update plan with new adapter
 	m.mu.Lock()
-	plan = m.plans[migrationID] // Re-fetch in case it was modified
+	plan := m.plans[migrationID]
 	if plan == nil {
-		// Plan was deleted while we were acquiring adapter - release the adapter we just acquired
 		m.mu.Unlock()
 		release()
 		return SetRootResponse{}, fmt.Errorf("migration plan was deleted during adapter acquisition")
 	}
 
+	var oldRelease func()
 	if role == "source" {
+		oldRelease = plan.SourceAdapterRelease
 		plan.HasSource = true
 		plan.SourceDefinition = serviceDef
 		plan.SourceRoot = folder
 		plan.SourceConnectionID = sessionID
 		plan.SourceAdapter = adapter
 		plan.SourceAdapterRelease = release
+		plan.SourceChildren = reviewedChildren
+		plan.SourceRootPrepared = len(reviewedChildren) > 0
 	} else {
+		oldRelease = plan.DestinationAdapterRelease
 		plan.HasDestination = true
 		plan.DestinationDefinition = serviceDef
 		plan.DestinationRoot = folder
 		plan.DestinationConnectionID = sessionID
 		plan.DestinationAdapter = adapter
 		plan.DestinationAdapterRelease = release
+		plan.DestinationChildren = reviewedChildren
+		plan.DestinationRootPrepared = len(reviewedChildren) > 0
 	}
 
+	plan.Seeded = false
+	plan.Seeding = false
+	plan.DatabasePath = ""
+	plan.RootSummary = migration.RootSeedSummary{}
 	planReady := plan.HasSource && plan.HasDestination
+	_ = m.savePreparationLocked(migrationID, plan)
 	m.mu.Unlock()
+
+	if oldRelease != nil {
+		oldRelease()
+	}
 
 	if planReady {
 		m.mu.Lock()
@@ -367,12 +391,16 @@ func (m *Manager) SetRoot(ctx context.Context, req SetRootRequest) (SetRootRespo
 		summary    *migration.RootSeedSummary
 		sourceConn string
 		destConn   string
+		srcPrep    bool
+		dstPrep    bool
 	)
 	if plan != nil {
 		ready = plan.HasSource && plan.HasDestination
 		dbPath = plan.DatabasePath
 		sourceConn = plan.SourceConnectionID
 		destConn = plan.DestinationConnectionID
+		srcPrep = plan.SourceRootPrepared
+		dstPrep = plan.DestinationRootPrepared
 		if plan.Seeded {
 			s := plan.RootSummary
 			summary = &s
@@ -391,6 +419,8 @@ func (m *Manager) SetRoot(ctx context.Context, req SetRootRequest) (SetRootRespo
 		RootSummary:             summary,
 		SourceConnectionID:      sourceConn,
 		DestinationConnectionID: destConn,
+		SourceRootPrepared:      srcPrep,
+		DestinationRootPrepared: dstPrep,
 	}, nil
 }
 
@@ -425,6 +455,21 @@ func (m *Manager) SetPathCheckTarget(migrationID, target string) {
 		m.plans[migrationID] = plan
 	}
 	plan.PathCheckTarget = strings.TrimSpace(target)
+}
+
+// SetWindowsCompat stores the Windows desktop-sync overlay opt-in on the plan.
+func (m *Manager) SetWindowsCompat(migrationID string, enabled bool) {
+	if migrationID == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	plan := m.plans[migrationID]
+	if plan == nil {
+		plan = &RootPlan{}
+		m.plans[migrationID] = plan
+	}
+	plan.WindowsCompat = enabled
 }
 
 // ApplyRehydratedSide attaches an adapter for one role after loading FS credential state from the migration DB (e.g. API restart).

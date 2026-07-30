@@ -32,7 +32,22 @@ func (m *Manager) SetRoot(ctx context.Context, req corebridge.SetRootRequest) (c
 			DepthLevel:   req.Root.DepthLevel,
 			Type:         req.Root.Type,
 		},
-		Config: req.Config,
+		Config:      req.Config,
+		ExcludedIDs: req.ExcludedIds,
+	}
+	if len(req.Children) > 0 {
+		rootsReq.Children = make([]roots.RootChildPlan, len(req.Children))
+		for i, c := range req.Children {
+			rootsReq.Children[i] = roots.RootChildPlan{
+				ID:       c.ID,
+				Name:     c.Name,
+				Type:     c.Type,
+				Size:     c.Size,
+				MTime:    c.MTime,
+				Excluded: c.Excluded,
+				DstOnly:  c.DstOnly,
+			}
+		}
 	}
 	if err := m.rootsMgr.ValidateMigrationRoot(req.ServiceID, rootsReq.Root); err != nil {
 		return corebridge.SetRootResponse{}, err
@@ -130,5 +145,7 @@ func (m *Manager) SetRoot(ctx context.Context, req corebridge.SetRootRequest) (c
 		RootSummary:             resp.RootSummary,
 		SourceConnectionID:      resp.SourceConnectionID,
 		DestinationConnectionID: resp.DestinationConnectionID,
+		SourceRootPrepared:      resp.SourceRootPrepared,
+		DestinationRootPrepared: resp.DestinationRootPrepared,
 	}, nil
 }

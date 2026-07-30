@@ -12,6 +12,7 @@ import (
 
 	_ "github.com/marcboeker/go-duckdb"
 	enginedb "codeberg.org/Sylos/Migration-Engine/pkg/db"
+	_ "codeberg.org/Sylos/Migration-Engine/pkg/db/seal"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/migrationkey"
 )
 
@@ -131,6 +132,14 @@ func (d *DB) migrate() error {
 		)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS sftp_saved_hosts_endpoint
 			ON sftp_saved_hosts (host, port, username)`,
+		`CREATE TABLE IF NOT EXISTS scaling_overrides (
+			scope TEXT NOT NULL,
+			scope_key TEXT NOT NULL,
+			mode TEXT NOT NULL,
+			max_workers INTEGER NOT NULL,
+			updated_at TIMESTAMP NOT NULL,
+			PRIMARY KEY (scope, scope_key, mode)
+		)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := d.sql.Exec(stmt); err != nil {
@@ -146,6 +155,7 @@ func (d *DB) migrateProviderOAuthHealthColumns() error {
 		{"health_checked_at", `ALTER TABLE provider_oauth_apps ADD COLUMN health_checked_at TIMESTAMP`},
 		{"health_error", `ALTER TABLE provider_oauth_apps ADD COLUMN health_error VARCHAR`},
 		{"health_monitor_enabled", `ALTER TABLE provider_oauth_apps ADD COLUMN health_monitor_enabled BOOLEAN`},
+		{"tenant_id", `ALTER TABLE provider_oauth_apps ADD COLUMN tenant_id VARCHAR`},
 	} {
 		var exists int64
 		err := d.sql.QueryRow(
@@ -263,7 +273,7 @@ func (d *DB) DeleteAllMigrationRegistry() error {
 	return nil
 }
 
-// WipeInstallUserData removes users, cloud provider OAuth apps, install config, and SFTP host pins from the API database.
+// WipeInstallUserData removes users, cloud provider OAuth apps, install config, SFTP host pins, and scaling overrides from the API database.
 // Migration registry rows should be cleared separately via DeleteAllMigrationRegistry.
 func (d *DB) WipeInstallUserData() error {
 	if _, err := d.sql.Exec(`DELETE FROM users`); err != nil {
@@ -283,6 +293,9 @@ func (d *DB) WipeInstallUserData() error {
 	}
 	if err := d.DeleteAllSFTPSavedHosts(); err != nil {
 		return err
+	}
+	if _, err := d.sql.Exec(`DELETE FROM scaling_overrides`); err != nil {
+		return fmt.Errorf("delete scaling overrides: %w", err)
 	}
 	return nil
 }
@@ -346,16 +359,17 @@ func (d *DB) MigrationKey(migrationID string) ([]byte, error) {
 }
 
 type ProviderOAuthApp struct {
-	ProviderID            string
-	ClientID              string
-	ClientSecret          string
-	DisplayName           string
-	IsDefault             bool
-	UpdatedAt             time.Time
-	HealthStatus          string
-	HealthCheckedAt       *time.Time
-	HealthError           string
-	HealthMonitorEnabled  bool
+	ProviderID           string
+	ClientID             string
+	ClientSecret         string
+	TenantID             string
+	DisplayName          string
+	IsDefault            bool
+	UpdatedAt            time.Time
+	HealthStatus         string
+	HealthCheckedAt      *time.Time
+	HealthError          string
+	HealthMonitorEnabled bool
 }
 
 func (d *DB) UpsertProviderOAuthApp(app ProviderOAuthApp) error {
@@ -363,15 +377,16 @@ func (d *DB) UpsertProviderOAuthApp(app ProviderOAuthApp) error {
 		app.UpdatedAt = time.Now().UTC()
 	}
 	_, err := d.sql.Exec(
-		`INSERT INTO provider_oauth_apps (provider_id, client_id, client_secret, display_name, is_default, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?)
+		`INSERT INTO provider_oauth_apps (provider_id, client_id, client_secret, tenant_id, display_name, is_default, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT (provider_id) DO UPDATE SET
 		 client_id = excluded.client_id,
 		 client_secret = excluded.client_secret,
+		 tenant_id = excluded.tenant_id,
 		 display_name = excluded.display_name,
 		 is_default = excluded.is_default,
 		 updated_at = excluded.updated_at`,
-		app.ProviderID, app.ClientID, app.ClientSecret, app.DisplayName, app.IsDefault, app.UpdatedAt,
+		app.ProviderID, app.ClientID, app.ClientSecret, app.TenantID, app.DisplayName, app.IsDefault, app.UpdatedAt,
 	)
 	return err
 }
@@ -382,11 +397,11 @@ func (d *DB) GetProviderOAuthApp(providerID string) (ProviderOAuthApp, error) {
 	var healthStatus, healthError sql.NullString
 	var healthMonitor bool
 	err := d.sql.QueryRow(
-		`SELECT provider_id, client_id, client_secret, display_name, is_default, updated_at,
+		`SELECT provider_id, client_id, client_secret, COALESCE(tenant_id, ''), display_name, is_default, updated_at,
 		        health_status, health_checked_at, health_error, COALESCE(health_monitor_enabled, false)
 		 FROM provider_oauth_apps WHERE provider_id = ?`, providerID,
 	).Scan(
-		&app.ProviderID, &app.ClientID, &app.ClientSecret, &app.DisplayName, &app.IsDefault, &app.UpdatedAt,
+		&app.ProviderID, &app.ClientID, &app.ClientSecret, &app.TenantID, &app.DisplayName, &app.IsDefault, &app.UpdatedAt,
 		&healthStatus, &checkedAt, &healthError, &healthMonitor,
 	)
 	if err != nil {
@@ -429,7 +444,7 @@ func (d *DB) DeleteProviderOAuthApp(providerID string) error {
 
 func (d *DB) ListProviderOAuthApps() ([]ProviderOAuthApp, error) {
 	rows, err := d.sql.Query(
-		`SELECT provider_id, client_id, client_secret, display_name, is_default, updated_at,
+		`SELECT provider_id, client_id, client_secret, COALESCE(tenant_id, ''), display_name, is_default, updated_at,
 		        health_status, health_checked_at, health_error, COALESCE(health_monitor_enabled, false)
 		 FROM provider_oauth_apps ORDER BY provider_id`,
 	)
@@ -444,7 +459,7 @@ func (d *DB) ListProviderOAuthApps() ([]ProviderOAuthApp, error) {
 		var healthStatus, healthError sql.NullString
 		var healthMonitor bool
 		if err := rows.Scan(
-			&app.ProviderID, &app.ClientID, &app.ClientSecret, &app.DisplayName, &app.IsDefault, &app.UpdatedAt,
+			&app.ProviderID, &app.ClientID, &app.ClientSecret, &app.TenantID, &app.DisplayName, &app.IsDefault, &app.UpdatedAt,
 			&healthStatus, &checkedAt, &healthError, &healthMonitor,
 		); err != nil {
 			return nil, err

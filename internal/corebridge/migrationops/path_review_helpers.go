@@ -1,7 +1,8 @@
-package corebridge
+package migrationops
 
 import (
 	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
 )
 
 type pathReviewOutcome struct {
@@ -53,8 +54,8 @@ func outcomeFromSingle(res migration.PathReviewActionResult, err error) pathRevi
 	return pathReviewOutcome{success: true, affectedCount: aff, deltas: deltas}
 }
 
-func exclusionFromOutcome(o pathReviewOutcome) *ExclusionResponse {
-	return &ExclusionResponse{
+func exclusionFromOutcome(o pathReviewOutcome) *corebridge.ExclusionResponse {
+	return &corebridge.ExclusionResponse{
 		Success:       o.success,
 		Error:         o.errMsg,
 		AffectedCount: o.affectedCount,
@@ -62,8 +63,8 @@ func exclusionFromOutcome(o pathReviewOutcome) *ExclusionResponse {
 	}
 }
 
-func markRetryFromOutcome(o pathReviewOutcome) *MarkRetryResponse {
-	return &MarkRetryResponse{
+func markRetryFromOutcome(o pathReviewOutcome) *corebridge.MarkRetryResponse {
+	return &corebridge.MarkRetryResponse{
 		Success:       o.success,
 		Error:         o.errMsg,
 		AffectedCount: o.affectedCount,

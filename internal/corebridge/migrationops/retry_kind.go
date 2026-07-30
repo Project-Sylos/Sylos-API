@@ -1,4 +1,4 @@
-package corebridge
+package migrationops
 
 // RetryKind identifies discovery vs copy retry mutations in path review.
 type RetryKind string

@@ -13,7 +13,7 @@ import (
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/apidb"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/connections"
-	"codeberg.org/Sylos/Sylos-API/internal/corebridge/database"
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge/migrationfiles"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/migrationaccess"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/roots"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/services"
@@ -64,7 +64,7 @@ func NewManager(logger zerolog.Logger, cfg config.Config, apiDB *apidb.DB) (*Man
 	}
 
 	resolveDBPath := func(path, migrationID string) (string, error) {
-		return database.ResolveDatabasePath(cfg.Runtime.DataDir, path, migrationID)
+		return migrationfiles.ResolveDatabasePath(cfg.Runtime.DataDir, path, migrationID)
 	}
 
 	rootsMgr := roots.NewManager(logger, cfg.Runtime.DataDir, serviceMgr, resolveDBPath)
@@ -136,6 +136,7 @@ func (m *Manager) oauthProviderCredentials(providerID string) (oauthcreds.Provid
 			return oauthcreds.ProviderCredentials{
 				ClientID:     app.ClientID,
 				ClientSecret: app.ClientSecret,
+				TenantID:     app.TenantID,
 			}, nil
 		}
 	}
@@ -180,6 +181,15 @@ func (m *Manager) migrationDirFor(migrationID string) (string, error) {
 // When using per-migration DBs, the engine expects the migration folder path (e.g. data/{id}) so it can open or create the DB there.
 // FS adapters are not rehydrated here; call ensureFSAdaptersRehydrated before traversal, copy, or live FS browse.
 func (m *Manager) GetMigration(_ context.Context, migrationID string) (*migration.Migration, error) {
+	// Live/recent runtime migrations are already open and carry their decrypted key.
+	// API polling must not re-query sylos.duckdb for the key on every request.
+	m.mu.RLock()
+	if rec := m.runtimeByID[migrationID]; rec != nil && rec.Migration != nil {
+		mig := rec.Migration
+		m.mu.RUnlock()
+		return mig, nil
+	}
+	m.mu.RUnlock()
 	if m.migAccess == nil {
 		return nil, fmt.Errorf("API database not configured")
 	}

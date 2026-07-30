@@ -8,6 +8,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge/migrationops"
 	"codeberg.org/Sylos/Sylos-API/internal/routes/middleware"
 )
 
@@ -65,7 +66,7 @@ func (h handler) listDiffs(ctx *middleware.Context) {
 		ctx.Error(http.StatusInternalServerError, "failed to get migration", err)
 		return
 	}
-	diffs, err := corebridge.ListChildrenDiffs(mig, corebridge.ListChildrenDiffsRequest{
+	diffs, err := migrationops.ListChildrenDiffs(mig, corebridge.ListChildrenDiffsRequest{
 		MigrationID:            migrationID,
 		Path:                   path,
 		Offset:                 offset,
@@ -116,7 +117,7 @@ func (h handler) diffsStats(ctx *middleware.Context) {
 		ctx.Error(http.StatusInternalServerError, "failed to get migration", err)
 		return
 	}
-	stats, err := corebridge.GetChildrenDiffsStats(mig, path, foldersOnly, includeDestinationOnly)
+	stats, err := migrationops.GetChildrenDiffsStats(mig, path, foldersOnly, includeDestinationOnly)
 	if err != nil {
 		ctx.Error(http.StatusInternalServerError, "failed to get diffs stats", err)
 		return

@@ -32,9 +32,15 @@ func (m *Manager) StartMigration(ctx context.Context, req corebridge.StartMigrat
 		m.SetPathCheckTarget(mig.ID, req.Options.PathCheckTarget)
 		plan = m.rootsMgr.GetPlan(mig.ID)
 	}
+	if req.Options.WindowsCompat {
+		m.SetWindowsCompat(mig.ID, true)
+		plan = m.rootsMgr.GetPlan(mig.ID)
+	}
 
 	cfg := m.buildTraversalConfig(req.Options, plan)
-	if _, err := mig.AddRoots(plan.SourceRoot, plan.DestinationRoot); err != nil && mig.Phase() == migration.PhaseCreated {
+	prep := m.rootsMgr.PreparationFor(mig.ID)
+	cfg.RootPreparation = prep
+	if _, err := mig.AddRoots(plan.SourceRoot, plan.DestinationRoot, prep); err != nil && mig.Phase() == migration.PhaseCreated {
 		return corebridge.Migration{}, fmt.Errorf("failed to add roots: %w", err)
 	}
 
@@ -126,9 +132,13 @@ func (m *Manager) buildTraversalConfig(opts corebridge.MigrationOptions, plan *r
 		StartupDelay:    time.Duration(opts.StartupDelaySec) * time.Second,
 		ProgressTick:    time.Duration(opts.ProgressTickMillis) * time.Millisecond,
 		PathCheckTarget: pathCheckTargetFromOpts(opts, plan),
+		WindowsCompat:   windowsCompatFromOpts(opts, plan),
 		Verification: migration.VerifyOptions{
 			AllowPending:  opts.Verification.AllowPending,
 			AllowNotOnSrc: opts.Verification.AllowNotOnSrc,
+		},
+		Autoscaler: migration.AutoscalerConfig{
+			WorkerCapOverrides: m.resolveOverridesForPlan(plan),
 		},
 	}
 }
@@ -141,6 +151,16 @@ func pathCheckTargetFromOpts(opts corebridge.MigrationOptions, plan *roots.RootP
 		return strings.TrimSpace(plan.PathCheckTarget)
 	}
 	return ""
+}
+
+func windowsCompatFromOpts(opts corebridge.MigrationOptions, plan *roots.RootPlan) bool {
+	if opts.WindowsCompat {
+		return true
+	}
+	if plan != nil {
+		return plan.WindowsCompat
+	}
+	return false
 }
 
 func migrationService(def services.ServiceDefinition, adapter fstypes.FSAdapter, root fstypes.Folder, connectionID string) migration.Service {
@@ -159,6 +179,12 @@ func migrationService(def services.ServiceDefinition, adapter fstypes.FSAdapter,
 		svc.ProviderID = string(services.ServiceTypeLocal)
 	case services.ServiceTypeSpectra:
 		svc.ProviderID = string(services.ServiceTypeSpectra)
+	}
+	// Fill ProviderID when type switch missed it (e.g. cloud SFTP with provider_id "sftp").
+	if svc.ProviderID == "" {
+		if id := services.CloudProviderID(def); id != "" {
+			svc.ProviderID = id
+		}
 	}
 	return svc
 }
@@ -358,13 +384,21 @@ func (m *Manager) GetMigrationStatus(ctx context.Context, id string) (corebridge
 		status = mig.Phase()
 	}
 
-	sourceRoot, destinationRoot := m.migrationRoots(mig)
+	sourceRoot, destinationRoot, rootsCached := m.cachedMigrationRoots(id)
+	if !rootsCached && !mig.IsLive() {
+		// Historical/inactive migrations may not have an in-process root plan.
+		// Never query root bindings from DuckDB on a live status request.
+		sourceRoot, destinationRoot = m.migrationRoots(mig)
+	}
 	name := strings.TrimSpace(mig.GetName())
 	if isUnnamedMigration(mig) || isPlaceholderAutoMigrationName(name) {
 		if computed := defaultMigrationName(sourceRoot, destinationRoot); computed != "" {
 			name = computed
 		}
 	}
+
+	srcPrep, dstPrep := m.rootsMgr.PreparationSummary(id)
+	srcChildNames := m.rootsMgr.SourceChildrenNames(id)
 
 	return corebridge.Status{
 		Migration: corebridge.Migration{
@@ -375,12 +409,15 @@ func (m *Manager) GetMigrationStatus(ctx context.Context, id string) (corebridge
 			StartedAt:     startedAt,
 			Status:        status,
 		},
-		CompletedAt:     completedAt,
-		Error:           errText,
-		Live:            mig.IsLive(),
-		PossibleStall:   mig.PossibleStall(),
-		SourceRoot:      sourceRoot,
-		DestinationRoot: destinationRoot,
+		CompletedAt:             completedAt,
+		Error:                   errText,
+		Live:                    mig.IsLive(),
+		PossibleStall:           mig.PossibleStall(),
+		SourceRoot:              sourceRoot,
+		DestinationRoot:         destinationRoot,
+		SourceRootPrepared:      srcPrep,
+		DestinationRootPrepared: dstPrep,
+		SourceRootChildNames:    srcChildNames,
 	}, nil
 }
 

@@ -2,11 +2,11 @@ package services
 
 import (
 	"net/http"
-	"strconv"
 
 	"github.com/go-chi/chi/v5"
 
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
+	"codeberg.org/Sylos/Sylos-API/internal/routes/httputil"
 	"codeberg.org/Sylos/Sylos-API/internal/routes/middleware"
 )
 
@@ -17,50 +17,18 @@ func (h handler) listChildren(ctx *middleware.Context) {
 		return
 	}
 
-	identifier := ctx.Request().URL.Query().Get("identifier")
-	role := ctx.Request().URL.Query().Get("role")
-	rootType := ctx.Request().URL.Query().Get("rootType")
-	driveID := ctx.Request().URL.Query().Get("driveId")
-	if driveID == "" {
-		driveID = ctx.Request().URL.Query().Get("drive_id")
-	}
-	connectionID := ctx.Request().URL.Query().Get("connectionId")
-	if connectionID == "" {
-		connectionID = ctx.Request().URL.Query().Get("connection_id")
-	}
+	q := httputil.ParseListChildrenQuery(ctx.Request().URL.Query())
 
-	// Parse pagination parameters
-	offset := 0
-	if offsetStr := ctx.Request().URL.Query().Get("offset"); offsetStr != "" {
-		if parsed, err := strconv.Atoi(offsetStr); err == nil && parsed >= 0 {
-			offset = parsed
-		}
-	}
-
-	limit := 100 // Default limit
-	if limitStr := ctx.Request().URL.Query().Get("limit"); limitStr != "" {
-		if parsed, err := strconv.Atoi(limitStr); err == nil && parsed > 0 {
-			limit = parsed
-		}
-	}
-
-	foldersOnly := false
-	if foldersOnlyStr := ctx.Request().URL.Query().Get("foldersOnly"); foldersOnlyStr != "" {
-		if parsed, err := strconv.ParseBool(foldersOnlyStr); err == nil {
-			foldersOnly = parsed
-		}
-	}
-
-	children, err := h.core.ListChildren(ctx.Request().Context(), corebridge.ListChildrenRequest{
+	children, err := h.mgr.ListChildren(ctx.Request().Context(), corebridge.ListChildrenRequest{
 		ServiceID:    serviceID,
-		Identifier:   identifier,
-		Role:         role,
-		ConnectionID: connectionID,
-		RootType:     rootType,
-		DriveID:      driveID,
-		Offset:       offset,
-		Limit:        limit,
-		FoldersOnly:  foldersOnly,
+		Identifier:   q.Identifier,
+		Role:         q.Role,
+		ConnectionID: q.ConnectionID,
+		RootType:     q.RootType,
+		DriveID:      q.DriveID,
+		Offset:       q.Offset,
+		Limit:        q.Limit,
+		FoldersOnly:  q.FoldersOnly,
 	})
 	if err != nil {
 		if err == corebridge.ErrServiceNotFound {

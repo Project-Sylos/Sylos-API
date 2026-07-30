@@ -19,7 +19,6 @@ const (
 	BackgroundTaskTypeRetrySweep           BackgroundTaskType = "retry_sweep"
 	BackgroundTaskTypeCopyResume           BackgroundTaskType = "copy_resume"
 	BackgroundTaskTypeCopyRetry            BackgroundTaskType = "copy_retry"
-	BackgroundTaskTypeRetryAll             BackgroundTaskType = "retry_all"
 )
 
 // BackgroundTaskStatus represents the status of a background task
@@ -225,8 +224,8 @@ func (m *BackgroundTaskManager) HasRunningTask(migrationID string, taskType Back
 	return false
 }
 
-// GetTask returns a specific task by ID for a migration
-func (m *BackgroundTaskManager) GetTask(migrationID, taskID string) (*BackgroundTask, error) {
+// GetBackgroundTask returns a specific task by ID for a migration.
+func (m *BackgroundTaskManager) GetBackgroundTask(migrationID, taskID string) (*BackgroundTask, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 

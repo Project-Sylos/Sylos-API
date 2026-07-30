@@ -32,7 +32,7 @@ func ValidateAppCredentials(providerID string, creds oauthcreds.ProviderCredenti
 	case "dropbox":
 		tokenURL = dropboxTokenURL
 	case "onedrive", "sharepoint":
-		tokenURL = microsoftTokenURL
+		tokenURL = microsoftTokenURL(ResolveMicrosoftTenant(creds.TenantID, ""))
 	case "box":
 		tokenURL = boxTokenURL
 	default:

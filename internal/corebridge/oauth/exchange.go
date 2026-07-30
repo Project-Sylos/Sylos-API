@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"codeberg.org/Sylos/Sylos-API/pkg/oauthcreds"
+	"codeberg.org/Sylos/Sylos-FS/pkg/fs/msgraph"
 )
 
 type TokenResponse struct {
@@ -21,20 +22,39 @@ type TokenResponse struct {
 }
 
 var (
-	googleTokenURL    = "https://oauth2.googleapis.com/token"
-	dropboxTokenURL   = "https://api.dropboxapi.com/oauth2/token"
-	microsoftTokenURL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
-	boxTokenURL       = "https://api.box.com/oauth2/token"
+	googleTokenURL  = "https://oauth2.googleapis.com/token"
+	dropboxTokenURL = "https://api.dropboxapi.com/oauth2/token"
+	boxTokenURL     = "https://api.box.com/oauth2/token"
 )
 
+func microsoftTokenURL(tenantID string) string {
+	return msgraph.TokenURLForTenant(tenantID)
+}
+
+// ResolveMicrosoftTenant picks the Entra authority tenant for authorize/token.
+// Currently always "common" (multi-tenant + personal apps). Account type / configured
+// tenant are ignored until we need stricter authority selection again.
+func ResolveMicrosoftTenant(configuredTenantID, accountType string) string {
+	_ = configuredTenantID
+	_ = accountType
+	return "common"
+}
+
 func ExchangeAuthCode(providerID string, creds oauthcreds.ProviderCredentials, code, redirectURI string) (TokenResponse, error) {
+	return ExchangeAuthCodeWithMicrosoftAccount(providerID, creds, code, redirectURI, "")
+}
+
+// ExchangeAuthCodeWithMicrosoftAccount exchanges an auth code; microsoftAccountType selects the Entra tenant for OneDrive/SharePoint.
+func ExchangeAuthCodeWithMicrosoftAccount(providerID string, creds oauthcreds.ProviderCredentials, code, redirectURI, microsoftAccountType string) (TokenResponse, error) {
 	switch providerID {
 	case "google_drive":
 		return postTokenExchange(googleTokenURL, creds, code, redirectURI)
 	case "dropbox":
 		return postTokenExchange(dropboxTokenURL, creds, code, redirectURI)
 	case "onedrive", "sharepoint":
-		return postTokenExchange(microsoftTokenURL, creds, code, redirectURI)
+		msCreds := creds
+		msCreds.TenantID = ResolveMicrosoftTenant(creds.TenantID, microsoftAccountType)
+		return postTokenExchange(microsoftTokenURL(msCreds.TenantID), msCreds, code, redirectURI)
 	case "box":
 		return postTokenExchange(boxTokenURL, creds, code, redirectURI)
 	default:

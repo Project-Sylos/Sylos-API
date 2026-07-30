@@ -7,6 +7,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge/migrationops"
 	"codeberg.org/Sylos/Sylos-API/internal/routes/middleware"
 )
 
@@ -26,7 +27,7 @@ func (h handler) getLogs(ctx *middleware.Context, req corebridge.GetLogsRequest)
 		ctx.Error(http.StatusInternalServerError, "failed to get migration", err)
 		return
 	}
-	logs, err := corebridge.GetLogsFromMigration(mig, req)
+	logs, err := migrationops.GetLogsFromMigration(mig, req)
 	if err != nil {
 		ctx.Error(http.StatusInternalServerError, "failed to get logs", err)
 		return

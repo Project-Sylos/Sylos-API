@@ -40,5 +40,7 @@ func isUserInputError(err error) bool {
 	return strings.Contains(msg, "invalid") ||
 		strings.Contains(msg, "required") ||
 		strings.Contains(msg, "exists") ||
-		strings.Contains(msg, "mismatch")
+		strings.Contains(msg, "mismatch") ||
+		strings.Contains(msg, "excluded") ||
+		strings.Contains(msg, "included")
 }

@@ -13,10 +13,11 @@ import (
 
 // OAuthAppSummary is returned to the UI (no client secret).
 type OAuthAppSummary struct {
-	ProviderID    string     `json:"providerId"`
-	DisplayName   string     `json:"displayName"`
-	Configured    bool       `json:"configured"`
-	ClientID      string     `json:"clientId,omitempty"`
+	ProviderID           string     `json:"providerId"`
+	DisplayName          string     `json:"displayName"`
+	Configured           bool       `json:"configured"`
+	ClientID             string     `json:"clientId,omitempty"`
+	TenantID             string     `json:"tenantId,omitempty"`
 	HealthStatus         string     `json:"healthStatus"`
 	HealthError          string     `json:"healthError,omitempty"`
 	LastCheckedAt        *time.Time `json:"lastCheckedAt,omitempty"`
@@ -26,12 +27,17 @@ type OAuthAppSummary struct {
 type SaveOAuthAppRequest struct {
 	ClientID     string `json:"clientId"`
 	ClientSecret string `json:"clientSecret"`
+	TenantID     string `json:"tenantId,omitempty"`
 	DisplayName  string `json:"displayName"`
+	// AlsoApplyTo copies the same credentials to the sibling Microsoft provider
+	// ("onedrive" or "sharepoint") when saving OneDrive or SharePoint.
+	AlsoApplyTo string `json:"alsoApplyTo,omitempty"`
 }
 
 type TestOAuthAppRequest struct {
 	ClientID     string `json:"clientId"`
 	ClientSecret string `json:"clientSecret"`
+	TenantID     string `json:"tenantId,omitempty"`
 }
 
 func (m *Manager) ListOAuthApps(_ context.Context) ([]OAuthAppSummary, error) {
@@ -80,6 +86,7 @@ func (m *Manager) SaveOAuthApp(_ context.Context, providerID string, req SaveOAu
 		clientSecret = existing.ClientSecret
 	}
 
+	tenantID := strings.TrimSpace(req.TenantID)
 	displayName := req.DisplayName
 	if displayName == "" {
 		displayName = oauthProviderDisplayName(providerID)
@@ -88,14 +95,48 @@ func (m *Manager) SaveOAuthApp(_ context.Context, providerID string, req SaveOAu
 		ProviderID:   providerID,
 		ClientID:     clientID,
 		ClientSecret: clientSecret,
+		TenantID:     tenantID,
 		DisplayName:  displayName,
 		UpdatedAt:    time.Now().UTC(),
 	}); err != nil {
 		return err
 	}
+
+	if sibling := strings.TrimSpace(req.AlsoApplyTo); sibling != "" {
+		if err := validateMicrosoftSiblingApply(providerID, sibling); err != nil {
+			return err
+		}
+		if err := m.apiDB.UpsertProviderOAuthApp(apidb.ProviderOAuthApp{
+			ProviderID:   sibling,
+			ClientID:     clientID,
+			ClientSecret: clientSecret,
+			TenantID:     tenantID,
+			DisplayName:  oauthProviderDisplayName(sibling),
+			UpdatedAt:    time.Now().UTC(),
+		}); err != nil {
+			return err
+		}
+		_, _ = m.checkOAuthProviderHealth(sibling, false)
+	}
+
 	m.refreshOAuthCredsFromDB()
-	summary, _ := m.checkOAuthProviderHealth(providerID, false)
-	_ = summary
+	_, _ = m.checkOAuthProviderHealth(providerID, false)
+	return nil
+}
+
+func validateMicrosoftSiblingApply(providerID, sibling string) error {
+	switch providerID {
+	case "onedrive":
+		if sibling != "sharepoint" {
+			return fmt.Errorf("alsoApplyTo must be sharepoint when saving onedrive")
+		}
+	case "sharepoint":
+		if sibling != "onedrive" {
+			return fmt.Errorf("alsoApplyTo must be onedrive when saving sharepoint")
+		}
+	default:
+		return fmt.Errorf("alsoApplyTo is only supported for onedrive and sharepoint")
+	}
 	return nil
 }
 
@@ -133,6 +174,7 @@ func (m *Manager) TestOAuthApp(_ context.Context, providerID string, req TestOAu
 func (m *Manager) resolveOAuthAppCredentials(providerID string, req TestOAuthAppRequest) (oauthcreds.ProviderCredentials, error) {
 	clientID := strings.TrimSpace(req.ClientID)
 	clientSecret := strings.TrimSpace(req.ClientSecret)
+	tenantID := strings.TrimSpace(req.TenantID)
 
 	if m.apiDB != nil {
 		if app, err := m.apiDB.GetProviderOAuthApp(providerID); err == nil {
@@ -141,6 +183,9 @@ func (m *Manager) resolveOAuthAppCredentials(providerID string, req TestOAuthApp
 			}
 			if clientSecret == "" {
 				clientSecret = app.ClientSecret
+			}
+			if tenantID == "" {
+				tenantID = app.TenantID
 			}
 		}
 	}
@@ -151,6 +196,7 @@ func (m *Manager) resolveOAuthAppCredentials(providerID string, req TestOAuthApp
 	return oauthcreds.ProviderCredentials{
 		ClientID:     clientID,
 		ClientSecret: clientSecret,
+		TenantID:     tenantID,
 	}, nil
 }
 
@@ -167,6 +213,7 @@ func (m *Manager) refreshOAuthCredsFromDB() {
 		creds := &oauthcreds.ProviderCredentials{
 			ClientID:     app.ClientID,
 			ClientSecret: app.ClientSecret,
+			TenantID:     app.TenantID,
 		}
 		switch app.ProviderID {
 		case "google_drive":

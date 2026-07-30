@@ -300,6 +300,17 @@ func (m *ServiceManager) MountDrive(ctx context.Context, serviceID string, req c
 	return m.FS.MountDrive(ctx, serviceID, req.Device)
 }
 
+func (m *ServiceManager) GetStorageInfo(ctx context.Context, req corebridge.GetStorageInfoRequest) (fstypes.StorageInfo, error) {
+	return m.FS.GetStorageInfo(ctx, fslib.GetStorageInfoRequest{
+		ServiceID:    req.ServiceID,
+		Path:         req.Path,
+		ConnectionID: req.ConnectionID,
+		RootType:     req.RootType,
+		DriveID:      req.DriveID,
+		Role:         req.Role,
+	})
+}
+
 func (m *ServiceManager) CreateBrowseFolder(ctx context.Context, serviceID string, req corebridge.CreateBrowseFolderRequest) (fstypes.Folder, error) {
 	mutation := fstypes.BrowseMutationRequest{
 		ServiceID:    serviceID,

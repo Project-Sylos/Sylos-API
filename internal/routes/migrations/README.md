@@ -38,7 +38,12 @@ Set the source or destination root folder for a migration.
     "lastUpdated": "2025-01-15T10:30:45Z",
     "depthLevel": 0,
     "type": "folder"
-  }
+  },
+  "children": [
+    { "id": "child-1", "name": "Docs", "type": "folder" },
+    { "id": "child-2", "name": "skip-me", "type": "folder", "excluded": true }
+  ],
+  "excludedIds": ["child-2"]
 }
 ```
 
@@ -54,7 +59,9 @@ Set the source or destination root folder for a migration.
     "dstRoots": 0
   },
   "sourceConnectionId": "conn-123",
-  "destinationConnectionId": ""
+  "destinationConnectionId": "",
+  "sourceRootPrepared": true,
+  "destinationRootPrepared": false
 }
 ```
 
@@ -63,6 +70,9 @@ Set the source or destination root folder for a migration.
 - Returns `201 Created` when `ready: true` (both roots set)
 - Returns `200 OK` when only one root is set
 - Setting the source root creates a new migration if it doesn't exist
+- Optional `children` / `excludedIds` come from the root-pick review UI. They are held in memory (and `root_preparation.json` under the migration data dir) until **Start discovery**; DuckDB is not written at SetRoot time.
+- Source with children requires at least one non-excluded child. Destination children cannot set excludes. Off-path `excludedIds` (not in `children`) are ignored.
+- When Start runs `AddRoots`, prepared sides seed the root as traversal-successful plus depth-1 children and start queues at round 1; unprepared sides keep classic round 0.
 
 ---
 

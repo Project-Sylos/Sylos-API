@@ -46,6 +46,43 @@ func (m *Manager) migrationRoots(mig *migration.Migration) (source, destination 
 		m.rootInfoForRole(mig, migration.FSCredentialRoleDestination)
 }
 
+// cachedMigrationRoots returns roots from the in-memory root plan. Root bindings
+// are immutable during a live phase, so status polling must not re-read DuckDB.
+func (m *Manager) cachedMigrationRoots(migrationID string) (source, destination *corebridge.RootInfo, ok bool) {
+	if m.rootsMgr == nil {
+		return nil, nil, false
+	}
+	plan := m.rootsMgr.GetPlan(migrationID)
+	if plan == nil {
+		return nil, nil, false
+	}
+	if plan.HasSource {
+		source = &corebridge.RootInfo{
+			ServiceID:     plan.SourceDefinition.ID,
+			ConnectionID:  plan.SourceConnectionID,
+			ServiceName:   plan.SourceDefinition.Name,
+			ServiceType:   string(plan.SourceDefinition.Type),
+			Name:          plan.SourceRoot.DisplayName,
+			LocationPath:  plan.SourceRoot.LocationPath,
+			NativePath:    plan.SourceRoot.ServiceID,
+			Type:          plan.SourceRoot.Type,
+		}
+	}
+	if plan.HasDestination {
+		destination = &corebridge.RootInfo{
+			ServiceID:     plan.DestinationDefinition.ID,
+			ConnectionID:  plan.DestinationConnectionID,
+			ServiceName:   plan.DestinationDefinition.Name,
+			ServiceType:   string(plan.DestinationDefinition.Type),
+			Name:          plan.DestinationRoot.DisplayName,
+			LocationPath:  plan.DestinationRoot.LocationPath,
+			NativePath:    plan.DestinationRoot.ServiceID,
+			Type:          plan.DestinationRoot.Type,
+		}
+	}
+	return source, destination, true
+}
+
 // rootLabel returns a human-friendly label for a root, prefixed with the service name when known.
 func rootLabel(info *corebridge.RootInfo) string {
 	if info == nil {

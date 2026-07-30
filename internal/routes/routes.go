@@ -11,7 +11,6 @@ import (
 
 	"codeberg.org/Sylos/Sylos-API/internal/auth"
 	"codeberg.org/Sylos/Sylos-API/internal/auth/users"
-	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/manager"
 	adminroutes "codeberg.org/Sylos/Sylos-API/internal/routes/admin"
 	authroutes "codeberg.org/Sylos/Sylos-API/internal/routes/auth"
@@ -21,6 +20,7 @@ import (
 	oauthappsroutes "codeberg.org/Sylos/Sylos-API/internal/routes/oauthapps"
 	preferencesroutes "codeberg.org/Sylos/Sylos-API/internal/routes/preferences"
 	providerroutes "codeberg.org/Sylos/Sylos-API/internal/routes/providers"
+	scalingroutes "codeberg.org/Sylos/Sylos-API/internal/routes/scaling"
 	serviceroutes "codeberg.org/Sylos/Sylos-API/internal/routes/services"
 	setuproutes "codeberg.org/Sylos/Sylos-API/internal/routes/setup"
 	usersroutes "codeberg.org/Sylos/Sylos-API/internal/routes/users"
@@ -28,7 +28,6 @@ import (
 
 type Dependencies struct {
 	Logger      zerolog.Logger
-	CoreBridge  corebridge.Bridge
 	Manager     *manager.Manager
 	AuthManager *auth.Manager
 	Middleware  *middlewarepkg.Middleware
@@ -66,11 +65,12 @@ func New(deps Dependencies) chi.Router {
 	healthroutes.Register(apiRouter)
 	authroutes.RegisterProtected(apiRouter, deps.Logger, deps.UserStore, mw)
 	usersroutes.Register(apiRouter, deps.Logger, deps.UserStore, mw)
-	serviceroutes.Register(apiRouter, deps.Logger, deps.CoreBridge, deps.UserStore, mw)
+	serviceroutes.Register(apiRouter, deps.Logger, deps.Manager, deps.UserStore, mw)
 	providerroutes.Register(apiRouter, deps.Logger, deps.Manager, mw)
 	oauthappsroutes.Register(apiRouter, deps.Logger, deps.Manager, mw)
 	adminroutes.Register(apiRouter, deps.Logger, deps.Manager, mw)
 	migrationroutes.Register(apiRouter, deps.Logger, deps.Manager, mw)
+	scalingroutes.Register(apiRouter, deps.Logger, deps.Manager, mw)
 	preferencesroutes.Register(apiRouter, deps.Logger, deps.UserStore, mw)
 
 	router.Mount("/api", apiRouter)

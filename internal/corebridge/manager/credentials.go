@@ -8,6 +8,8 @@ import (
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/services"
+	"codeberg.org/Sylos/Sylos-FS/pkg/cloud"
+	fslib "codeberg.org/Sylos/Sylos-FS/pkg/fs"
 	fstypes "codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
@@ -58,7 +60,9 @@ func (m *Manager) persistFSCredentialBinding(migrationID, role string) error {
 	default:
 		return nil
 	}
-	if err := mig.UpsertFSCredentialBinding(binding); err != nil {
+	if err := mig.RunStore(func(s *migration.Store) error {
+		return s.UpsertFSCredentialBinding(binding)
+	}); err != nil {
 		return err
 	}
 	if binding.ConnectionID != "" {
@@ -183,4 +187,90 @@ func (m *Manager) rehydrateFSAdaptersIfNeeded(migrationID string, mig *migration
 		}
 	}
 	return nil
+}
+
+func (m *Manager) persistOAuthCredentials(mig *migration.Migration, connectionID string, credsJSON []byte) error {
+	if mig == nil || connectionID == "" || len(credsJSON) == 0 {
+		return nil
+	}
+	return mig.RunStore(func(s *migration.Store) error {
+		return s.UpsertOAuthCredentials(connectionID, credsJSON)
+	})
+}
+
+func (m *Manager) cloudCredentialsPersistHook(mig *migration.Migration, connectionID string) func(cloud.StoredCredentials) error {
+	if mig == nil || connectionID == "" {
+		return nil
+	}
+	return func(stored cloud.StoredCredentials) error {
+		credsJSON, err := json.Marshal(stored)
+		if err != nil {
+			return err
+		}
+		return m.persistOAuthCredentials(mig, connectionID, credsJSON)
+	}
+}
+
+func (m *Manager) loadStoredCloudCredentials(_ string, mig *migration.Migration, binding migration.FSCredentialBinding) (cloud.StoredCredentials, error) {
+	if binding.ConnectionID == "" {
+		return cloud.StoredCredentials{}, fmt.Errorf("connection id required")
+	}
+	if mig == nil {
+		return cloud.StoredCredentials{}, fmt.Errorf("no stored credentials for connection %q", binding.ConnectionID)
+	}
+	raw, err := mig.GetOAuthCredentials(binding.ConnectionID)
+	if err != nil || len(raw) == 0 {
+		return cloud.StoredCredentials{}, fmt.Errorf("no stored credentials for connection %q", binding.ConnectionID)
+	}
+	var stored cloud.StoredCredentials
+	if err := json.Unmarshal(raw, &stored); err != nil {
+		return cloud.StoredCredentials{}, fmt.Errorf("decode stored credentials: %w", err)
+	}
+	return stored, nil
+}
+
+func (m *Manager) initializePlanAdapters(migrationID string) error {
+	plan := m.rootsMgr.GetPlan(migrationID)
+	if plan == nil {
+		return nil
+	}
+	mig, err := m.GetMigration(context.Background(), migrationID)
+	if err != nil || mig == nil {
+		return err
+	}
+	if plan.SourceAdapter != nil && plan.SourceDefinition.Type == services.ServiceTypeCloud {
+		if err := m.persistLiveCloudCredentials(mig, plan.SourceConnectionID); err != nil {
+			m.logger.Warn().Err(err).Str("migration_id", migrationID).Str("connection_id", plan.SourceConnectionID).Msg("persist source cloud credentials")
+		}
+		if err := m.serviceMgr.FS.InitializeCloudAdapter(plan.SourceAdapter, nil, plan.SourceConnectionID); err != nil {
+			return fmt.Errorf("initialize source cloud adapter: %w", err)
+		}
+	}
+	if plan.DestinationAdapter != nil && plan.DestinationDefinition.Type == services.ServiceTypeCloud {
+		if err := m.persistLiveCloudCredentials(mig, plan.DestinationConnectionID); err != nil {
+			m.logger.Warn().Err(err).Str("migration_id", migrationID).Str("connection_id", plan.DestinationConnectionID).Msg("persist destination cloud credentials")
+		}
+		if err := m.serviceMgr.FS.InitializeCloudAdapter(plan.DestinationAdapter, nil, plan.DestinationConnectionID); err != nil {
+			return fmt.Errorf("initialize destination cloud adapter: %w", err)
+		}
+	}
+	return nil
+}
+
+func (m *Manager) rehydrateCloudConnection(migrationID string, binding migration.FSCredentialBinding, def services.ServiceDefinition, mig *migration.Migration) error {
+	stored, err := m.loadStoredCloudCredentials(migrationID, mig, binding)
+	if err != nil {
+		return err
+	}
+	credsJSON, err := json.Marshal(stored)
+	if err != nil {
+		return err
+	}
+	_, err = m.serviceMgr.FS.RegisterCloudConnection(fslib.CloudConnectionOptions{
+		ProviderID:         services.CloudProviderID(def),
+		ConnectionID:       binding.ConnectionID,
+		CredentialsJSON:    credsJSON,
+		PersistCredentials: m.cloudCredentialsPersistHook(mig, binding.ConnectionID),
+	})
+	return err
 }

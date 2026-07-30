@@ -58,7 +58,7 @@ func (m *Manager) TriggerRetrySweep(ctx context.Context, migrationID string, con
 	}
 	runCfg := m.buildTraversalConfig(corebridge.MigrationOptions{}, plan)
 	// Persist phase to traversal-in-progress before 202 so polls see the correct phase before the goroutine runs.
-	if err := mig.PrepareRetrySweep(); err != nil {
+	if err := mig.PreparePhase(migration.PreparePhaseRetrySweep); err != nil {
 		return corebridge.SweepResponse{
 			Success: false,
 			Error:   err.Error(),
@@ -107,29 +107,7 @@ func (m *Manager) TriggerRetrySweep(ctx context.Context, migrationID string, con
 }
 
 func (m *Manager) buildRetrySweepOptions(config corebridge.SweepConfigRequest) migration.RetrySweepOptions {
-	workerCount := config.WorkerCount
-	maxRetries := config.MaxRetries
-	if maxRetries <= 0 {
-		maxRetries = m.cfg.Runtime.DefaultMaxRetries
-	}
-	if maxRetries <= 0 {
-		maxRetries = 3
-	}
-	logAddress := config.LogAddress
-	if logAddress == "" {
-		logAddress = m.cfg.Runtime.LogAddress
-	}
-	logLevel := config.LogLevel
-	if logLevel == "" {
-		logLevel = m.cfg.Runtime.LogLevel
-	}
-	if logLevel == "" {
-		logLevel = "info"
-	}
-	skipListener := true
-	if config.SkipListener != nil {
-		skipListener = *config.SkipListener
-	}
+	workerCount, maxRetries, logAddress, logLevel, skipListener := m.sweepConfigFields(config)
 	return migration.RetrySweepOptions{
 		WorkerCount:   workerCount,
 		MaxRetries:    maxRetries,
@@ -138,4 +116,20 @@ func (m *Manager) buildRetrySweepOptions(config corebridge.SweepConfigRequest) m
 		MaxKnownDepth: config.MaxKnownDepth,
 		SkipListener:  skipListener,
 	}
+}
+
+func (m *Manager) GetBackgroundTasks(ctx context.Context, migrationID string) ([]corebridge.BackgroundTask, error) {
+	return m.bgTaskMgr.GetTasks(migrationID), nil
+}
+
+func (m *Manager) GetRunningBackgroundTasks(ctx context.Context, migrationID string) ([]corebridge.BackgroundTask, error) {
+	return m.bgTaskMgr.GetRunningTasks(migrationID), nil
+}
+
+func (m *Manager) GetBackgroundTask(ctx context.Context, migrationID, taskID string) (*corebridge.BackgroundTask, error) {
+	task, err := m.bgTaskMgr.GetBackgroundTask(migrationID, taskID)
+	if err != nil {
+		return nil, fmt.Errorf("get background task: %w", err)
+	}
+	return task, nil
 }

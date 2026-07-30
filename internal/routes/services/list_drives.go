@@ -17,7 +17,7 @@ func (h handler) listDrives(ctx *middleware.Context) {
 		return
 	}
 
-	drives, err := h.core.ListDrives(ctx.Request().Context(), serviceID)
+	drives, err := h.mgr.ListDrives(ctx.Request().Context(), serviceID)
 	if err != nil {
 		if errors.Is(err, corebridge.ErrServiceNotFound) {
 			ctx.Error(http.StatusNotFound, "service not found", err)

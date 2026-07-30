@@ -121,7 +121,6 @@ func Run(ctx context.Context, opts Options) error {
 
 	router := routes.New(routes.Dependencies{
 		Logger:      log,
-		CoreBridge:  coreBridge,
 		Manager:     coreBridge,
 		AuthManager: authManager,
 		Middleware:  apiMiddleware,
@@ -179,6 +178,7 @@ func loadOAuthConfigFromDB(db *apidb.DB) (oauthcreds.Config, error) {
 		creds := &oauthcreds.ProviderCredentials{
 			ClientID:     app.ClientID,
 			ClientSecret: app.ClientSecret,
+			TenantID:     app.TenantID,
 		}
 		switch app.ProviderID {
 		case "google_drive":

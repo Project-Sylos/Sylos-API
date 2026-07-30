@@ -7,6 +7,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge/migrationops"
 	"codeberg.org/Sylos/Sylos-API/internal/routes/middleware"
 )
 
@@ -31,7 +32,7 @@ func (h handler) stats(ctx *middleware.Context) {
 		ctx.Error(http.StatusBadRequest, "unsupported stats view", nil)
 		return
 	}
-	stats, err := corebridge.PathReviewStatsFromMigration(mig, view)
+	stats, err := migrationops.PathReviewStatsFromMigration(mig, view)
 	if err != nil {
 		ctx.Error(http.StatusInternalServerError, "failed to get path review stats", err)
 		return

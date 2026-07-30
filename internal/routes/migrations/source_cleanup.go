@@ -6,6 +6,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge/migrationops"
 	"codeberg.org/Sylos/Sylos-API/internal/routes/middleware"
 )
 
@@ -22,7 +23,7 @@ func (h handler) prepareSourceCleanup(ctx *middleware.Context, payload corebridg
 		return
 	}
 
-	result, err := corebridge.PrepareSourceCleanup(mig, payload)
+	result, err := migrationops.PrepareSourceCleanup(mig, payload)
 	if err != nil {
 		ctx.Error(http.StatusBadRequest, err.Error(), err)
 		return
@@ -46,7 +47,7 @@ func (h handler) handleSkipNodeDelete(ctx *middleware.Context) {
 		return
 	}
 
-	result, err := corebridge.SkipNodeDelete(mig, unescapedNodeID)
+	result, err := migrationops.SkipNodeDelete(mig, unescapedNodeID)
 	if err != nil {
 		ctx.Error(http.StatusBadRequest, err.Error(), err)
 		return
@@ -70,7 +71,7 @@ func (h handler) handleUnskipNodeDelete(ctx *middleware.Context) {
 		return
 	}
 
-	result, err := corebridge.UnskipNodeDelete(mig, unescapedNodeID)
+	result, err := migrationops.UnskipNodeDelete(mig, unescapedNodeID)
 	if err != nil {
 		ctx.Error(http.StatusBadRequest, err.Error(), err)
 		return

@@ -9,6 +9,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge/migrationops"
 	"codeberg.org/Sylos/Sylos-API/internal/routes/middleware"
 )
 
@@ -55,7 +56,7 @@ func (h handler) changePhase(ctx *middleware.Context, payload PhaseChangeRequest
 			return
 		}
 		h.mgr.SyncPathCheckProviders(migrationID, mig)
-		if err := corebridge.EnsurePathIssuesClearForCopy(mig); err != nil {
+		if err := migrationops.EnsurePathIssuesClearForCopy(mig); err != nil {
 			var remaining *corebridge.PathIssuesRemainingError
 			if errors.As(err, &remaining) {
 				ctx.Response(http.StatusConflict, map[string]any{

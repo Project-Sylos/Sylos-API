@@ -7,6 +7,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge/migrationops"
 	"codeberg.org/Sylos/Sylos-API/internal/routes/middleware"
 )
 
@@ -28,7 +29,7 @@ func (h handler) excludeNodes(ctx *middleware.Context, payload corebridge.Exclus
 		ctx.Error(http.StatusInternalServerError, "failed to get migration", err)
 		return
 	}
-	result, err := corebridge.SetNodesExcluded(mig, payload, true)
+	result, err := migrationops.SetNodesExcluded(mig, payload, true)
 	if err != nil {
 		ctx.Error(http.StatusInternalServerError, "failed to exclude nodes", err)
 		return
@@ -59,7 +60,7 @@ func (h handler) unexcludeNodes(ctx *middleware.Context, payload corebridge.Excl
 		ctx.Error(http.StatusInternalServerError, "failed to get migration", err)
 		return
 	}
-	result, err := corebridge.SetNodesExcluded(mig, payload, false)
+	result, err := migrationops.SetNodesExcluded(mig, payload, false)
 	if err != nil {
 		ctx.Error(http.StatusInternalServerError, "failed to unexclude nodes", err)
 		return

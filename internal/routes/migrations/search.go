@@ -9,16 +9,24 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge/migrationops"
 	"codeberg.org/Sylos/Sylos-API/internal/routes/middleware"
 )
 
 // search handles POST /api/migrations/{migrationID}/search
-// If no search parameters are provided (empty body or conditions array), lists all items (like diff endpoint with path="/")
-// Search results are path-joined (same format as diff endpoint)
+// Requires at least one narrowing filter (see migrationops.SearchRequestHasFilter).
+// Search results are path-joined (same format as diff endpoint). Pagination HasMore comes from the engine;
+// Total is omitted when unknown.
 func (h handler) search(ctx *middleware.Context, payload corebridge.SearchRequest) {
 	migrationID := chi.URLParam(ctx.Request(), "migrationID")
 	if migrationID == "" {
 		ctx.Error(http.StatusBadRequest, "migration id is required", nil)
+		return
+	}
+
+	normalizeSearchPayload(&payload)
+	if !migrationops.SearchRequestHasFilter(payload) {
+		ctx.Error(http.StatusBadRequest, "search requires at least one filter", migrationops.ErrSearchRequiresFilter)
 		return
 	}
 
@@ -53,13 +61,44 @@ func (h handler) search(ctx *middleware.Context, payload corebridge.SearchReques
 		}
 	}
 
-	// Lowercase search values defensively for path and name fields (case-insensitive search)
-	for i := range payload.Conditions {
-		if payload.Conditions[i].Field == "path" || payload.Conditions[i].Field == "name" {
-			if valueStr, ok := payload.Conditions[i].Value.(string); ok {
-				payload.Conditions[i].Value = strings.ToLower(valueStr)
-			}
+	mig, err := h.mgr.GetMigration(ctx.Request().Context(), migrationID)
+	if err != nil {
+		if errors.Is(err, corebridge.ErrMigrationNotFound) {
+			ctx.Error(http.StatusNotFound, "migration not found", err)
+			return
 		}
+		if errors.Is(err, corebridge.ErrDatabaseNotAvailable) {
+			ctx.Error(http.StatusServiceUnavailable, "database not available", err)
+			return
+		}
+		ctx.Error(http.StatusInternalServerError, "failed to get migration", err)
+		return
+	}
+	diffs, err := migrationops.SearchPathReviewItems(mig, payload, offset, limit)
+	if err != nil {
+		if errors.Is(err, migrationops.ErrSearchRequiresFilter) {
+			ctx.Error(http.StatusBadRequest, "search requires at least one filter", err)
+			return
+		}
+		ctx.Error(http.StatusInternalServerError, "failed to search", err)
+		return
+	}
+	ctx.Response(http.StatusOK, diffs)
+}
+
+// searchCount handles POST /api/migrations/{migrationID}/search/count
+// Same body as search; returns exact total/folder/file stats via GetSearchStats.
+func (h handler) searchCount(ctx *middleware.Context, payload corebridge.SearchRequest) {
+	migrationID := chi.URLParam(ctx.Request(), "migrationID")
+	if migrationID == "" {
+		ctx.Error(http.StatusBadRequest, "migration id is required", nil)
+		return
+	}
+
+	normalizeSearchPayload(&payload)
+	if !migrationops.SearchRequestHasFilter(payload) {
+		ctx.Error(http.StatusBadRequest, "search requires at least one filter", migrationops.ErrSearchRequiresFilter)
+		return
 	}
 
 	mig, err := h.mgr.GetMigration(ctx.Request().Context(), migrationID)
@@ -75,10 +114,25 @@ func (h handler) search(ctx *middleware.Context, payload corebridge.SearchReques
 		ctx.Error(http.StatusInternalServerError, "failed to get migration", err)
 		return
 	}
-	diffs, err := corebridge.SearchPathReviewItems(mig, payload, offset, limit)
+	stats, err := migrationops.GetSearchStats(mig, payload)
 	if err != nil {
-		ctx.Error(http.StatusInternalServerError, "failed to search", err)
+		if errors.Is(err, migrationops.ErrSearchRequiresFilter) {
+			ctx.Error(http.StatusBadRequest, "search requires at least one filter", err)
+			return
+		}
+		ctx.Error(http.StatusInternalServerError, "failed to get search count", err)
 		return
 	}
-	ctx.Response(http.StatusOK, diffs)
+	ctx.Response(http.StatusOK, stats)
+}
+
+// normalizeSearchPayload lowercases path/name values for case-insensitive search.
+func normalizeSearchPayload(payload *corebridge.SearchRequest) {
+	for i := range payload.Conditions {
+		if payload.Conditions[i].Field == "path" || payload.Conditions[i].Field == "name" {
+			if valueStr, ok := payload.Conditions[i].Value.(string); ok {
+				payload.Conditions[i].Value = strings.ToLower(valueStr)
+			}
+		}
+	}
 }

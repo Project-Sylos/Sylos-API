@@ -9,13 +9,9 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge/migrationops"
 	"codeberg.org/Sylos/Sylos-API/internal/routes/middleware"
 )
-
-// containsInsensitive reports whether substr appears in s, case-insensitively.
-func containsInsensitive(s, substr string) bool {
-	return strings.Contains(strings.ToLower(s), strings.ToLower(substr))
-}
 
 // checkPendingWork handles GET /api/migrations/{migrationID}/pending-work
 func (h handler) checkPendingWork(ctx *middleware.Context) {
@@ -43,7 +39,7 @@ func (h handler) checkPendingWork(ctx *middleware.Context) {
 	ctx.Response(http.StatusOK, response)
 }
 
-func (h handler) handleMarkNodeForRetry(ctx *middleware.Context, kind corebridge.RetryKind) {
+func (h handler) handleMarkNodeForRetry(ctx *middleware.Context, kind migrationops.RetryKind) {
 	migrationID, unescapedNodeID, ok := h.loadMigrationNode(ctx)
 	if !ok {
 		return
@@ -55,7 +51,7 @@ func (h handler) handleMarkNodeForRetry(ctx *middleware.Context, kind corebridge
 		return
 	}
 
-	result, err := corebridge.MarkNodesForRetry(mig, kind, corebridge.MarkRetryRequest{
+	result, err := migrationops.MarkNodesForRetry(mig, kind, corebridge.MarkRetryRequest{
 		NodeIDs: []string{unescapedNodeID},
 	})
 	if err != nil {
@@ -77,7 +73,7 @@ func (h handler) handleMarkNodeForRetry(ctx *middleware.Context, kind corebridge
 	ctx.Response(http.StatusOK, result)
 }
 
-func (h handler) handleUnmarkNodeForRetry(ctx *middleware.Context, kind corebridge.RetryKind) {
+func (h handler) handleUnmarkNodeForRetry(ctx *middleware.Context, kind migrationops.RetryKind) {
 	migrationID, unescapedNodeID, ok := h.loadMigrationNode(ctx)
 	if !ok {
 		return
@@ -89,7 +85,7 @@ func (h handler) handleUnmarkNodeForRetry(ctx *middleware.Context, kind corebrid
 		return
 	}
 
-	result, err := corebridge.UnmarkNodeForRetry(mig, kind, unescapedNodeID)
+	result, err := migrationops.UnmarkNodeForRetry(mig, kind, unescapedNodeID)
 	if err != nil {
 		errMsg := err.Error()
 		if isUnmarkRetryBenignError(kind, errMsg) {
@@ -143,29 +139,31 @@ func (h handler) writeMigrationLoadError(ctx *middleware.Context, err error) {
 	ctx.Error(http.StatusInternalServerError, "failed to get migration", err)
 }
 
-func isMarkRetryBenignError(kind corebridge.RetryKind, errMsg string) bool {
-	if containsInsensitive(errMsg, "not found") || containsInsensitive(errMsg, "not in failed status") {
+func isMarkRetryBenignError(kind migrationops.RetryKind, errMsg string) bool {
+	msg := strings.ToLower(errMsg)
+	if strings.Contains(msg, "not found") || strings.Contains(msg, "not in failed status") {
 		return true
 	}
-	return kind == corebridge.RetryKindCopy && containsInsensitive(errMsg, "copy retry only applies to src nodes")
+	return kind == migrationops.RetryKindCopy && strings.Contains(msg, "copy retry only applies to src nodes")
 }
 
-func isUnmarkRetryBenignError(kind corebridge.RetryKind, errMsg string) bool {
-	if containsInsensitive(errMsg, "not found") || containsInsensitive(errMsg, "not in pending status") {
+func isUnmarkRetryBenignError(kind migrationops.RetryKind, errMsg string) bool {
+	msg := strings.ToLower(errMsg)
+	if strings.Contains(msg, "not found") || strings.Contains(msg, "not in pending status") {
 		return true
 	}
-	return kind == corebridge.RetryKindCopy && containsInsensitive(errMsg, "copy retry only applies to src nodes")
+	return kind == migrationops.RetryKindCopy && strings.Contains(msg, "copy retry only applies to src nodes")
 }
 
-func markRetryErrorLabel(kind corebridge.RetryKind) string {
-	if kind == corebridge.RetryKindCopy {
+func markRetryErrorLabel(kind migrationops.RetryKind) string {
+	if kind == migrationops.RetryKindCopy {
 		return "failed to mark node for copy retry"
 	}
 	return "failed to mark node for discovery retry"
 }
 
-func unmarkRetryErrorLabel(kind corebridge.RetryKind) string {
-	if kind == corebridge.RetryKindCopy {
+func unmarkRetryErrorLabel(kind migrationops.RetryKind) string {
+	if kind == migrationops.RetryKindCopy {
 		return "failed to unmark node for copy retry"
 	}
 	return "failed to unmark node for discovery retry"
