@@ -28,7 +28,7 @@ func (h handler) stats(ctx *middleware.Context) {
 		return
 	}
 	view := ctx.Request().URL.Query().Get("view")
-	if view != "" && view != "source-cleanup" {
+	if view != "" && view != "source-cleanup" && view != "copy-plan" {
 		ctx.Error(http.StatusBadRequest, "unsupported stats view", nil)
 		return
 	}

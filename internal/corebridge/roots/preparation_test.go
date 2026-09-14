@@ -54,3 +54,22 @@ func TestNormalizeRootChildren_destNeverExclude(t *testing.T) {
 		t.Fatal("dstOnly should remain")
 	}
 }
+
+func TestNormalizeRootChildren_preservesTrailingSpace(t *testing.T) {
+	out, err := NormalizeRootChildren([]RootChildPlan{
+		{ID: "a", Name: "Extra Space ", Type: "folder"},
+		{ID: "b", Name: "Invalid Chars*", Type: "folder"},
+	}, nil, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 2 {
+		t.Fatalf("len=%d", len(out))
+	}
+	if out[0].Name != "Extra Space " {
+		t.Fatalf("name=%q want trailing space preserved", out[0].Name)
+	}
+	if out[1].Name != "Invalid Chars*" {
+		t.Fatalf("name=%q", out[1].Name)
+	}
+}

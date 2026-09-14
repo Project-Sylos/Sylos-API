@@ -36,13 +36,14 @@ func (h handler) stop(ctx *middleware.Context) {
 		"live":                   status.Live,
 		"stopped":                status.Stopped,
 		"softSuspendRequested":   status.SoftSuspendRequested,
+		"stopProgress":           status.StopProgress,
 		"completedAt":            status.CompletedAt,
 		"error":                  status.Error,
 	}
 	if status.AlreadyStopped {
 		response["message"] = "Migration is already stopped."
 	} else {
-		response["message"] = "Stop requested. If softSuspendRequested is true, poll status until phase is traversal-suspended or copy-suspended and live is false."
+		response["message"] = "Stop requested. Poll status for stopProgress until phase is traversal-suspended, copy-suspended, or delete-suspended and live is false."
 	}
 
 	ctx.Response(http.StatusOK, response)

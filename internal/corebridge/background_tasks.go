@@ -17,6 +17,7 @@ const (
 	BackgroundTaskTypeUnexclusionPropagate BackgroundTaskType = "unexclusion_propagate"
 	BackgroundTaskTypeExclusionSweep       BackgroundTaskType = "exclusion_sweep"
 	BackgroundTaskTypeRetrySweep           BackgroundTaskType = "retry_sweep"
+	BackgroundTaskTypeTraversalResume      BackgroundTaskType = "traversal_resume"
 	BackgroundTaskTypeCopyResume           BackgroundTaskType = "copy_resume"
 	BackgroundTaskTypeCopyRetry            BackgroundTaskType = "copy_retry"
 )

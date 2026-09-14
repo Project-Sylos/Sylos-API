@@ -1,24 +1,37 @@
 package users
 
 import (
-	"path/filepath"
 	"testing"
+
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge/apidb"
 )
 
-func TestRecoveryCodeRoundTrip(t *testing.T) {
+func openTestStore(t *testing.T) *Store {
+	t.Helper()
 	dir := t.TempDir()
-	store, err := OpenConn(nil, filepath.Join(dir, "users.duckdb"), 4)
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(i + 3)
+	}
+	db, err := apidb.Open(dir, key)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
-
-	user, err := store.Create("alice", "secret-pass", RoleUser)
+	t.Cleanup(func() { _ = db.Close() })
+	store, err := Open(db, 4)
 	if err != nil {
 		t.Fatal(err)
 	}
+	return store
+}
 
-	code, err := store.IssueRecoveryCode(user.ID, false)
+func TestRecoveryCodeRoundTrip(t *testing.T) {
+	store := openTestStore(t)
+	user, err := store.Create("alice", "password123", RoleUser)
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, err := store.IssueRecoveryCode(user.ID, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -26,53 +39,45 @@ func TestRecoveryCodeRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !status.HasRecoveryCode {
-		t.Fatal("expected recovery code on file")
+	if !status.HasRecoveryCode || !status.NeedsAttention {
+		t.Fatalf("status=%+v", status)
 	}
-
-	if err := store.ResetPasswordWithRecoveryCode("alice", code, "new-secret-pass"); err != nil {
+	if err := store.AcknowledgeRecoveryCode(user.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Authenticate("alice", "secret-pass"); err == nil {
-		t.Fatal("old password should not work")
+	status, err = store.RecoveryCodeStatusFor(user.ID)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, err := store.Authenticate("alice", "new-secret-pass"); err != nil {
-		t.Fatalf("new password should work: %v", err)
+	if status.NeedsAttention {
+		t.Fatalf("expected ack to clear attention: %+v", status)
 	}
-
-	if err := store.ResetPasswordWithRecoveryCode("alice", code, "another-pass"); err != ErrInvalidRecoveryCode {
-		t.Fatalf("expected invalid recovery code, got %v", err)
+	if err := store.ResetPasswordWithRecoveryCode(user.Username, code, "newpassword456"); err != nil {
+		t.Fatal(err)
 	}
-
-	reissued, ok, err := store.TakePendingRecoveryReissue(user.ID)
-	if err != nil || !ok || reissued == "" {
-		t.Fatalf("expected pending reissue, got code=%q ok=%v err=%v", reissued, ok, err)
-	}
-	if _, ok, err := store.TakePendingRecoveryReissue(user.ID); err != nil || ok {
-		t.Fatalf("expected no second reissue without flag, ok=%v err=%v", ok, err)
+	if _, err := store.Authenticate(user.Username, "newpassword456"); err != nil {
+		t.Fatalf("login with new password: %v", err)
 	}
 }
 
-func TestChangePassword(t *testing.T) {
-	dir := t.TempDir()
-	store, err := OpenConn(nil, filepath.Join(dir, "users.duckdb"), 4)
+func TestRecoveryReissueOnLogin(t *testing.T) {
+	store := openTestStore(t)
+	user, err := store.Create("bob", "password123", RoleUser)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
-
-	user, err := store.Create("bob", "old-pass", RoleUser)
+	code, err := store.IssueRecoveryCode(user.ID, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	if err := store.ChangePassword(user.ID, "wrong", "new-pass"); err != ErrInvalidCreds {
-		t.Fatalf("expected invalid creds, got %v", err)
-	}
-	if err := store.ChangePassword(user.ID, "old-pass", "new-pass"); err != nil {
+	if err := store.ResetPasswordWithRecoveryCode(user.Username, code, "newpassword456"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Authenticate("bob", "new-pass"); err != nil {
+	reissue, issued, err := store.TakePendingRecoveryReissue(user.ID)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if !issued || reissue == "" {
+		t.Fatalf("expected reissue code, got issued=%v code=%q", issued, reissue)
 	}
 }

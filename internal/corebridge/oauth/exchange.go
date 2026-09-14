@@ -27,10 +27,6 @@ var (
 	boxTokenURL     = "https://api.box.com/oauth2/token"
 )
 
-func microsoftTokenURL(tenantID string) string {
-	return msgraph.TokenURLForTenant(tenantID)
-}
-
 // ResolveMicrosoftTenant picks the Entra authority tenant for authorize/token.
 // Currently always "common" (multi-tenant + personal apps). Account type / configured
 // tenant are ignored until we need stricter authority selection again.
@@ -38,10 +34,6 @@ func ResolveMicrosoftTenant(configuredTenantID, accountType string) string {
 	_ = configuredTenantID
 	_ = accountType
 	return "common"
-}
-
-func ExchangeAuthCode(providerID string, creds oauthcreds.ProviderCredentials, code, redirectURI string) (TokenResponse, error) {
-	return ExchangeAuthCodeWithMicrosoftAccount(providerID, creds, code, redirectURI, "")
 }
 
 // ExchangeAuthCodeWithMicrosoftAccount exchanges an auth code; microsoftAccountType selects the Entra tenant for OneDrive/SharePoint.
@@ -54,7 +46,7 @@ func ExchangeAuthCodeWithMicrosoftAccount(providerID string, creds oauthcreds.Pr
 	case "onedrive", "sharepoint":
 		msCreds := creds
 		msCreds.TenantID = ResolveMicrosoftTenant(creds.TenantID, microsoftAccountType)
-		return postTokenExchange(microsoftTokenURL(msCreds.TenantID), msCreds, code, redirectURI)
+		return postTokenExchange(msgraph.TokenURLForTenant(msCreds.TenantID), msCreds, code, redirectURI)
 	case "box":
 		return postTokenExchange(boxTokenURL, creds, code, redirectURI)
 	default:

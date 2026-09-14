@@ -14,7 +14,6 @@ import (
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/apidb"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/masterkey"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/manager"
-	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
 	"codeberg.org/Sylos/Sylos-API/internal/routes"
 	"codeberg.org/Sylos/Sylos-API/internal/routes/middleware"
 	"codeberg.org/Sylos/Sylos-API/internal/server"
@@ -46,9 +45,9 @@ func Run(ctx context.Context, opts Options) error {
 		return fmt.Errorf("failed to resolve install master key: %w", err)
 	}
 
-	apiDBPath := filepath.Join(cfg.Runtime.DataDir, "sylos.duckdb")
+	apiDBPath := filepath.Join(cfg.Runtime.DataDir, "sylos.api")
 	if _, err := os.Stat(apiDBPath); os.IsNotExist(err) {
-		log.Warn().Str("path", apiDBPath).Msg("sylos.duckdb not found; creating a new API database")
+		log.Warn().Str("path", apiDBPath).Msg("sylos.api not found; creating a new API database")
 	}
 
 	apiDB, err := apidb.Open(cfg.Runtime.DataDir, masterKey)
@@ -57,7 +56,7 @@ func Run(ctx context.Context, opts Options) error {
 	}
 	defer apiDB.Close()
 
-	userStore, err := users.OpenConn(apiDB.SQL(), "", cfg.Auth.BcryptCost)
+	userStore, err := users.Open(apiDB, cfg.Auth.BcryptCost)
 	if err != nil {
 		return fmt.Errorf("failed to open user store: %w", err)
 	}
@@ -68,7 +67,7 @@ func Run(ctx context.Context, opts Options) error {
 		return fmt.Errorf("failed to count users: %w", err)
 	}
 
-	secret, generated, err := jwtsecret.LoadOrGenerate(apiDB.SQL(), cfg.JWT.Secret)
+	secret, generated, err := jwtsecret.LoadOrGenerate(apiDB, cfg.JWT.Secret)
 	if err != nil {
 		return fmt.Errorf("failed to load jwt secret: %w", err)
 	}
@@ -152,7 +151,9 @@ func Run(ctx context.Context, opts Options) error {
 		log.Info().Msg("shutdown signal received")
 	}
 
-	migrationShutdownCtx, migrationShutdownCancel := context.WithTimeout(context.Background(), migration.DefaultStopGracePeriod+5*time.Second)
+	// Soft Stop has no auto-abort; this timeout only bounds API process shutdown (soft drain + force).
+	const migrationShutdownTimeout = 35 * time.Second
+	migrationShutdownCtx, migrationShutdownCancel := context.WithTimeout(context.Background(), migrationShutdownTimeout)
 	coreBridge.Shutdown(migrationShutdownCtx)
 	migrationShutdownCancel()
 

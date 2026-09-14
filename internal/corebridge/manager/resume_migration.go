@@ -15,7 +15,8 @@ type phaseResumeSetup struct {
 }
 
 // ResumeMigration resumes a stopped or failed migration in the correct phase:
-// traversal-suspended / awaiting-traversal-review → retry sweep;
+// traversal-suspended → StartTraversal (continue saved round/cursor);
+// awaiting-traversal-review → retry sweep;
 // copy-suspended → StartCopy (full copy resume);
 // awaiting-copy-review → copy retry (failed copy items);
 // delete-suspended → StartDelete; awaiting-delete-review → delete retry.
@@ -36,17 +37,40 @@ func (m *Manager) ResumeMigration(ctx context.Context, migrationID string, confi
 		return corebridge.SweepResponse{Success: false, Error: err.Error()}, err
 	}
 
-	switch mig.Phase() {
-	case migration.PhaseCopySuspended:
+	switch resumeKind(mig.Phase()) {
+	case "retry-finalize":
+		return m.RetryFinalize(ctx, migrationID, config)
+	case "start-traversal":
+		return m.triggerTraversalStartResume(migrationID)
+	case "start-copy":
 		return m.triggerCopyStartResume(migrationID)
-	case migration.PhaseCopyReview:
+	case "copy-retry":
 		return m.triggerCopyRetryResume(migrationID, config)
-	case migration.PhaseDeleteSuspended:
+	case "start-delete":
 		return m.triggerDeleteStartResume(migrationID)
-	case migration.PhaseDeleteReview:
+	case "delete-retry":
 		return m.triggerDeleteRetryResume(migrationID, config)
 	default:
 		return m.TriggerRetrySweep(ctx, migrationID, config)
+	}
+}
+
+func resumeKind(phase string) string {
+	switch phase {
+	case migration.PhaseTraversalFinalizeFailed, migration.PhaseCopyFinalizeFailed, migration.PhaseDeleteFinalizeFailed:
+		return "retry-finalize"
+	case migration.PhaseTraversalSuspended:
+		return "start-traversal"
+	case migration.PhaseCopySuspended:
+		return "start-copy"
+	case migration.PhaseCopyReview:
+		return "copy-retry"
+	case migration.PhaseDeleteSuspended:
+		return "start-delete"
+	case migration.PhaseDeleteReview:
+		return "delete-retry"
+	default:
+		return "retry-sweep"
 	}
 }
 
@@ -132,15 +156,29 @@ func (m *Manager) finishRuntimeAfterBackgroundPhase(migrationID string, mig *mig
 	m.mu.Lock()
 	if rec := m.runtimeByID[migrationID]; rec != nil {
 		rec.CompletedAt = &doneAt
-		if runErr != nil {
-			rec.Status = corebridge.MigrationStatusFailed
-			rec.Error = runErr.Error()
-		} else {
-			rec.Status = mig.Phase()
-			rec.Error = ""
-		}
+		applyRunResultToRuntime(rec, mig, runErr)
 	}
 	m.mu.Unlock()
+}
+
+func applyRunResultToRuntime(rec *runtimeMigration, mig *migration.Migration, runErr error) {
+	if rec == nil {
+		return
+	}
+	if runErr != nil {
+		if mig != nil && migration.IsFinalizeFailedPhase(mig.Phase()) {
+			rec.Status = mig.Phase()
+			rec.Error = runErr.Error()
+			return
+		}
+		rec.Status = corebridge.MigrationStatusFailed
+		rec.Error = runErr.Error()
+		return
+	}
+	if mig != nil {
+		rec.Status = mig.Phase()
+	}
+	rec.Error = ""
 }
 
 func (m *Manager) sweepConfigFields(config corebridge.SweepConfigRequest) (workerCount, maxRetries int, logAddress, logLevel string, skipListener bool) {
@@ -168,6 +206,30 @@ func (m *Manager) sweepConfigFields(config corebridge.SweepConfigRequest) (worke
 		skipListener = *config.SkipListener
 	}
 	return workerCount, maxRetries, logAddress, logLevel, skipListener
+}
+
+func (m *Manager) triggerTraversalStartResume(migrationID string) (corebridge.SweepResponse, error) {
+	setup, early, done, err := m.preparePhaseResume(migrationID, true)
+	if err != nil || done {
+		return early, err
+	}
+	m.setRuntimePhaseStatus(migrationID, migration.PhaseTraversing)
+
+	taskID := m.bgTaskMgr.StartTaskWithPath(migrationID, corebridge.BackgroundTaskTypeTraversalResume, "")
+	go func() {
+		_, runErr := setup.mig.StartTraversal(setup.cfg)
+		m.finishRuntimeAfterBackgroundPhase(migrationID, setup.mig, runErr)
+		if runErr != nil {
+			m.bgTaskMgr.FailTask(migrationID, taskID, runErr)
+			return
+		}
+		m.bgTaskMgr.CompleteTask(migrationID, taskID)
+	}()
+
+	return corebridge.SweepResponse{
+		Success: true,
+		Message: "Traversal resume started",
+	}, nil
 }
 
 func (m *Manager) triggerCopyStartResume(migrationID string) (corebridge.SweepResponse, error) {

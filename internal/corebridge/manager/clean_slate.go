@@ -68,7 +68,7 @@ func (m *Manager) ClearAllMigrations(ctx context.Context) (AdminActionResponse, 
 }
 
 // WipeInstall removes all migration data plus users, cloud provider OAuth apps, and install config.
-// The install master key and encrypted sylos.duckdb file are preserved; complete initial setup again afterward.
+// The install master key and sylos.api/ store are preserved; complete initial setup again afterward.
 func (m *Manager) WipeInstall(ctx context.Context) (AdminActionResponse, error) {
 	if err := m.clearMigrationRuntimeAndDisk(ctx); err != nil {
 		return AdminActionResponse{}, err

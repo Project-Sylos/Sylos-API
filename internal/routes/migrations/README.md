@@ -105,8 +105,7 @@ Get a list of all migrations.
 
 Start a new migration or resume an existing one.
 
-**Endpoint:** `POST /migrations`  
-**Legacy:** `POST /migrate/start`
+**Endpoint:** `POST /migrations`
 
 **Request Body:**
 ```json
@@ -180,58 +179,38 @@ Load and resume a migration from its YAML config file.
 
 ### Stop Migration
 
-Stop a running migration and save its state for resumption.
+Request a soft stop for a live traversal, copy, or delete run. The API returns immediately with `softSuspendRequested` and `stopProgress`; it does not wait for the drain to finish. Queues are paused so no new work is leased; in-flight tasks finish, then the engine checkpoints and moves to `traversal-suspended`, `copy-suspended`, or `delete-suspended`.
 
 **Endpoint:** `POST /migrations/{migrationID}/stop`
 
 **Request:** No body required
 
-**Response (200 OK):**
-```json
-{
-  "id": "d4ob1s530fei623t8sdg",
-  "status": "suspended",
-  "result": {
-    "rootSummary": {
-      "srcRoots": 1,
-      "dstRoots": 1
-    },
-    "runtime": {
-      "duration": "2h30m15s",
-      "src": {
-        "name": "src",
-        "round": 5,
-        "pending": 0,
-        "inProgress": 0,
-        "totalTracked": 0,
-        "workers": 0
-      },
-      "dst": {
-        "name": "dst",
-        "round": 4,
-        "pending": 0,
-        "inProgress": 0,
-        "totalTracked": 0,
-        "workers": 0
-      }
-    },
-    "verification": {
-      "srcTotal": 1000,
-      "dstTotal": 1000,
-      "srcPending": 0,
-      "dstPending": 0,
-      "srcFailed": 0,
-      "dstFailed": 0,
-      "dstNotOnSrc": 0
-    }
-  },
-  "message": "Migration suspended. State saved for resumption."
-}
-```
+**Response (200 OK):** Includes current status fields plus:
+- `softSuspendRequested`: true when soft stop was armed
+- `stopProgress`: checklist (`steps`, `step`, `label`, `inProgress`, `mode`) for the UI popover
+- `live`: may still be true while draining
+
+Poll `GET /migrations/{migrationID}` until `live` is false and phase is a `*-suspended` (or `aborted` if the user force-stopped). Soft stop has no automatic timeout kill; use force-stop only when stuck.
 
 **Error Responses:**
 - `404 Not Found`: Migration not found
-- `400 Bad Request`: Migration not running
+- `400 Bad Request`: Migration not in a stoppable live phase
+
+---
+
+### Force-Stop Migration
+
+Hard-kill a stuck soft stop (or any live traversal/copy/delete). Cancels the run context, abandons in-flight queue work, and sets phase to `aborted` (not resumable). Prefer soft stop unless the drain is stuck.
+
+**Endpoint:** `POST /migrations/{migrationID}/force-stop`
+
+**Request:** No body required
+
+**Response (200 OK):** Status with `status` / phase `aborted` and `stopProgress` reflecting the force path.
+
+**Error Responses:**
+- `404 Not Found`: Migration not found
+- `400 Bad Request`: Migration not force-stoppable
 
 ---
 
@@ -241,8 +220,7 @@ Stop a running migration and save its state for resumption.
 
 Get the current status of a migration.
 
-**Endpoint:** `GET /migrations/{migrationID}`  
-**Legacy:** `GET /migrate/status/{migrationID}`
+**Endpoint:** `GET /migrations/{migrationID}`
 
 **Request:** No body required
 
@@ -384,8 +362,7 @@ Get real-time queue statistics for a running migration.
 
 Stream real-time migration progress events via Server-Sent Events (SSE).
 
-**Endpoint:** `GET /migrations/{migrationID}/stream`  
-**Legacy:** `GET /migrate/status/{migrationID}/stream`
+**Endpoint:** `GET /migrations/{migrationID}/stream`
 
 **Request:** No body required
 

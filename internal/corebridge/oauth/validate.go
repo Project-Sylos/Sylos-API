@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"codeberg.org/Sylos/Sylos-API/pkg/oauthcreds"
+	"codeberg.org/Sylos/Sylos-FS/pkg/fs/msgraph"
 )
 
 type tokenErrorResponse struct {
@@ -32,7 +33,7 @@ func ValidateAppCredentials(providerID string, creds oauthcreds.ProviderCredenti
 	case "dropbox":
 		tokenURL = dropboxTokenURL
 	case "onedrive", "sharepoint":
-		tokenURL = microsoftTokenURL(ResolveMicrosoftTenant(creds.TenantID, ""))
+		tokenURL = msgraph.TokenURLForTenant(ResolveMicrosoftTenant(creds.TenantID, ""))
 	case "box":
 		tokenURL = boxTokenURL
 	default:

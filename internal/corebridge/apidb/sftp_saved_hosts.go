@@ -2,31 +2,33 @@ package apidb
 
 import (
 	"crypto/rand"
-	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	"codeberg.org/Sylos/Sylos-FS/pkg/credentials"
+	badger "github.com/dgraph-io/badger/v4"
 )
 
 // SFTPSavedHost is a FileZilla-style remembered SFTP site (no live health checks).
 type SFTPSavedHost struct {
-	ID           string
-	DisplayName  string
-	Host         string
-	Port         int
-	Username     string
-	AuthMethod   string // "password" | "pem"
-	Password     string // decrypted; omitted from list responses
-	PrivateKey   string
-	KeyPassphrase string
-	HostKey      string
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
-	LastUsedAt   *time.Time
+	ID            string     `json:"id"`
+	DisplayName   string     `json:"displayName"`
+	Host          string     `json:"host"`
+	Port          int        `json:"port"`
+	Username      string     `json:"username"`
+	AuthMethod    string     `json:"authMethod"`
+	Password      string     `json:"-"`
+	PrivateKey    string     `json:"-"`
+	KeyPassphrase string     `json:"-"`
+	SecretsBlob   []byte     `json:"secretsBlob"`
+	HostKey       string     `json:"hostKey,omitempty"`
+	CreatedAt     time.Time  `json:"createdAt"`
+	UpdatedAt     time.Time  `json:"updatedAt"`
+	LastUsedAt    *time.Time `json:"lastUsedAt,omitempty"`
 }
 
 type sftpSavedSecrets struct {
@@ -86,37 +88,42 @@ func normalizeSFTPSavedHostInput(host *SFTPSavedHost) error {
 
 // ListSFTPSavedHosts returns remembered hosts without decrypted secrets.
 func (d *DB) ListSFTPSavedHosts() ([]SFTPSavedHost, error) {
-	rows, err := d.sql.Query(`
-		SELECT id, display_name, host, port, username, auth_method, host_key, created_at, updated_at, last_used_at
-		FROM sftp_saved_hosts
-		ORDER BY COALESCE(last_used_at, updated_at) DESC, display_name ASC
-	`)
+	var out []SFTPSavedHost
+	err := d.view(func(txn *badger.Txn) error {
+		recs, err := listPrefixJSON[SFTPSavedHost](txn, prefixSftpSaved, func(k []byte) bool {
+			return strings.HasPrefix(string(k), prefixSftpSavedEp)
+		})
+		if err != nil {
+			return err
+		}
+		out = recs
+		return nil
+	})
 	if err != nil {
 		return nil, fmt.Errorf("list sftp saved hosts: %w", err)
 	}
-	defer rows.Close()
+	sortSFTPSavedHosts(out)
+	return out, nil
+}
 
-	var out []SFTPSavedHost
-	for rows.Next() {
-		var h SFTPSavedHost
-		var lastUsed sql.NullTime
-		var hostKey sql.NullString
-		if err := rows.Scan(
-			&h.ID, &h.DisplayName, &h.Host, &h.Port, &h.Username, &h.AuthMethod, &hostKey,
-			&h.CreatedAt, &h.UpdatedAt, &lastUsed,
-		); err != nil {
-			return nil, err
+func sortSFTPSavedHosts(hosts []SFTPSavedHost) {
+	for i := 0; i < len(hosts); i++ {
+		for j := i + 1; j < len(hosts); j++ {
+			a := savedHostSortKey(hosts[i])
+			b := savedHostSortKey(hosts[j])
+			if b > a {
+				hosts[i], hosts[j] = hosts[j], hosts[i]
+			}
 		}
-		if hostKey.Valid {
-			h.HostKey = hostKey.String
-		}
-		if lastUsed.Valid {
-			t := lastUsed.Time
-			h.LastUsedAt = &t
-		}
-		out = append(out, h)
 	}
-	return out, rows.Err()
+}
+
+func savedHostSortKey(h SFTPSavedHost) string {
+	t := h.UpdatedAt
+	if h.LastUsedAt != nil {
+		t = *h.LastUsedAt
+	}
+	return t.Format(time.RFC3339Nano) + h.DisplayName
 }
 
 // GetSFTPSavedHost returns one host with secrets decrypted for reconnect.
@@ -126,36 +133,22 @@ func (d *DB) GetSFTPSavedHost(id string) (SFTPSavedHost, error) {
 		return SFTPSavedHost{}, fmt.Errorf("saved host id is required")
 	}
 	var h SFTPSavedHost
-	var blob []byte
-	var lastUsed sql.NullTime
-	var hostKey sql.NullString
-	err := d.sql.QueryRow(`
-		SELECT id, display_name, host, port, username, auth_method, secrets_blob, host_key, created_at, updated_at, last_used_at
-		FROM sftp_saved_hosts WHERE id = ?
-	`, id).Scan(
-		&h.ID, &h.DisplayName, &h.Host, &h.Port, &h.Username, &h.AuthMethod, &blob, &hostKey,
-		&h.CreatedAt, &h.UpdatedAt, &lastUsed,
-	)
-	if err == sql.ErrNoRows {
+	err := d.view(func(txn *badger.Txn) error {
+		return getJSON(txn, keySftpSaved(id), &h)
+	})
+	if errors.Is(err, ErrNotFound) {
 		return SFTPSavedHost{}, fmt.Errorf("saved host not found")
 	}
 	if err != nil {
 		return SFTPSavedHost{}, err
 	}
-	secrets, err := d.decryptSFTPSavedSecrets(blob)
+	secrets, err := d.decryptSFTPSavedSecrets(h.SecretsBlob)
 	if err != nil {
 		return SFTPSavedHost{}, fmt.Errorf("decrypt saved host secrets: %w", err)
 	}
 	h.Password = secrets.Password
 	h.PrivateKey = secrets.PrivateKey
 	h.KeyPassphrase = secrets.KeyPassphrase
-	if hostKey.Valid {
-		h.HostKey = hostKey.String
-	}
-	if lastUsed.Valid {
-		t := lastUsed.Time
-		h.LastUsedAt = &t
-	}
 	return h, nil
 }
 
@@ -172,70 +165,48 @@ func (d *DB) UpsertSFTPSavedHost(host SFTPSavedHost) (SFTPSavedHost, error) {
 	if err != nil {
 		return SFTPSavedHost{}, fmt.Errorf("encrypt saved host secrets: %w", err)
 	}
+	host.SecretsBlob = blob
 
 	now := time.Now().UTC()
-	if host.ID == "" {
-		var existingID string
-		lookupErr := d.sql.QueryRow(`
-			SELECT id FROM sftp_saved_hosts WHERE host = ? AND port = ? AND username = ?
-		`, host.Host, host.Port, host.Username).Scan(&existingID)
-		if lookupErr == nil {
-			host.ID = existingID
-		} else if lookupErr != sql.ErrNoRows {
-			return SFTPSavedHost{}, lookupErr
+	err = d.update(func(txn *badger.Txn) error {
+		if host.ID == "" {
+			if id, lookupErr := lookupID(txn, keySftpSavedEp(host.Host, host.Port, host.Username)); lookupErr == nil {
+				host.ID = id
+			} else if errors.Is(lookupErr, ErrNotFound) {
+				host.ID = newSFTPSavedHostID()
+			} else {
+				return lookupErr
+			}
+		}
+
+		var existing SFTPSavedHost
+		exists := getJSON(txn, keySftpSaved(host.ID), &existing) == nil
+		if exists {
+			host.CreatedAt = existing.CreatedAt
+			if !strings.EqualFold(existing.Host, host.Host) || existing.Port != host.Port || existing.Username != host.Username {
+				if err := clearIndex(txn, keySftpSavedEp(existing.Host, existing.Port, existing.Username)); err != nil {
+					return err
+				}
+			}
 		} else {
-			host.ID = newSFTPSavedHostID()
+			host.CreatedAt = now
 		}
+		host.UpdatedAt = now
+		host.LastUsedAt = &now
+
+		if err := putJSON(txn, keySftpSaved(host.ID), host); err != nil {
+			return fmt.Errorf("upsert sftp saved host: %w", err)
+		}
+		return setIndex(txn, keySftpSavedEp(host.Host, host.Port, host.Username), host.ID)
+	})
+	if err != nil {
+		return SFTPSavedHost{}, err
 	}
 
-	var existingCreated time.Time
-	lookupErr := d.sql.QueryRow(`SELECT created_at FROM sftp_saved_hosts WHERE id = ?`, host.ID).Scan(&existingCreated)
-	exists := lookupErr == nil
-	if lookupErr != nil && lookupErr != sql.ErrNoRows {
-		return SFTPSavedHost{}, lookupErr
-	}
-	if exists {
-		host.CreatedAt = existingCreated
-	} else {
-		host.CreatedAt = now
-	}
-	host.UpdatedAt = now
-	host.LastUsedAt = &now
-
-	if exists {
-		res, execErr := d.sql.Exec(`
-			UPDATE sftp_saved_hosts SET
-				display_name = ?,
-				auth_method = ?,
-				secrets_blob = ?,
-				host_key = ?,
-				updated_at = ?,
-				last_used_at = ?
-			WHERE id = ?
-		`, host.DisplayName, host.AuthMethod, blob, nullIfEmpty(host.HostKey),
-			host.UpdatedAt, host.LastUsedAt, host.ID)
-		if execErr != nil {
-			return SFTPSavedHost{}, fmt.Errorf("upsert sftp saved host: %w", execErr)
-		}
-		if n, _ := res.RowsAffected(); n == 0 {
-			return SFTPSavedHost{}, fmt.Errorf("upsert sftp saved host: row disappeared")
-		}
-	} else {
-		_, execErr := d.sql.Exec(`
-			INSERT INTO sftp_saved_hosts (
-				id, display_name, host, port, username, auth_method, secrets_blob, host_key, created_at, updated_at, last_used_at
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		`, host.ID, host.DisplayName, host.Host, host.Port, host.Username, host.AuthMethod, blob, nullIfEmpty(host.HostKey),
-			host.CreatedAt, host.UpdatedAt, host.LastUsedAt)
-		if execErr != nil {
-			return SFTPSavedHost{}, fmt.Errorf("upsert sftp saved host: %w", execErr)
-		}
-	}
-
-	// Never return secrets on write responses used for list-style UIs; caller can Get if needed.
 	host.Password = ""
 	host.PrivateKey = ""
 	host.KeyPassphrase = ""
+	host.SecretsBlob = nil
 	return host, nil
 }
 
@@ -245,8 +216,15 @@ func (d *DB) TouchSFTPSavedHostLastUsed(id string) error {
 	if id == "" {
 		return nil
 	}
-	_, err := d.sql.Exec(`UPDATE sftp_saved_hosts SET last_used_at = ? WHERE id = ?`, time.Now().UTC(), id)
-	return err
+	return d.update(func(txn *badger.Txn) error {
+		var h SFTPSavedHost
+		if err := getJSON(txn, keySftpSaved(id), &h); err != nil {
+			return err
+		}
+		now := time.Now().UTC()
+		h.LastUsedAt = &now
+		return putJSON(txn, keySftpSaved(id), h)
+	})
 }
 
 // DeleteSFTPSavedHost removes one remembered host.
@@ -255,30 +233,29 @@ func (d *DB) DeleteSFTPSavedHost(id string) error {
 	if id == "" {
 		return fmt.Errorf("saved host id is required")
 	}
-	res, err := d.sql.Exec(`DELETE FROM sftp_saved_hosts WHERE id = ?`, id)
-	if err != nil {
-		return fmt.Errorf("delete sftp saved host: %w", err)
-	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		return fmt.Errorf("saved host not found")
-	}
-	return nil
+	return d.update(func(txn *badger.Txn) error {
+		var h SFTPSavedHost
+		if err := getJSON(txn, keySftpSaved(id), &h); err != nil {
+			if errors.Is(err, ErrNotFound) {
+				return fmt.Errorf("saved host not found")
+			}
+			return err
+		}
+		if err := clearIndex(txn, keySftpSavedEp(h.Host, h.Port, h.Username)); err != nil {
+			return err
+		}
+		return deleteKey(txn, keySftpSaved(id))
+	})
 }
 
 // DeleteAllSFTPSavedHosts clears remembered SFTP sites (wipe-install).
 func (d *DB) DeleteAllSFTPSavedHosts() error {
-	if _, err := d.sql.Exec(`DELETE FROM sftp_saved_hosts`); err != nil {
-		return fmt.Errorf("delete sftp saved hosts: %w", err)
-	}
-	return nil
-}
-
-func nullIfEmpty(s string) any {
-	if strings.TrimSpace(s) == "" {
-		return nil
-	}
-	return s
+	return d.update(func(txn *badger.Txn) error {
+		if err := deletePrefix(txn, prefixSftpSavedEp); err != nil {
+			return err
+		}
+		return deletePrefix(txn, prefixSftpSaved)
+	})
 }
 
 func newSFTPSavedHostID() string {

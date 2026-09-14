@@ -44,15 +44,17 @@ type StartMigrationRequest struct {
 	Options     MigrationOptions `json:"options"`
 }
 
-// RootChildPlan is an immediate child of the migration root from the root-pick review UI.
+// RootChildPlan is a reviewed child under the migration root (nested Children = sparse forest).
 type RootChildPlan struct {
-	ID       string `json:"id"`
-	Name     string `json:"name"`
-	Type     string `json:"type"` // folder | file
-	Size     int64  `json:"size,omitempty"`
-	MTime    string `json:"mtime,omitempty"`
-	Excluded bool   `json:"excluded,omitempty"`
-	DstOnly  bool   `json:"dstOnly,omitempty"`
+	ID          string          `json:"id"`
+	Name        string          `json:"name"`
+	Type        string          `json:"type"` // folder | file
+	Size        int64           `json:"size,omitempty"`
+	MTime       string          `json:"mtime,omitempty"`
+	Excluded    bool            `json:"excluded,omitempty"`
+	DstOnly     bool            `json:"dstOnly,omitempty"`
+	Children    []RootChildPlan `json:"children,omitempty"`
+	IncludeOnly []string        `json:"includeOnly,omitempty"`
 }
 
 type SetRootRequest struct {
@@ -101,6 +103,8 @@ type RootInfo struct {
 	LocationPath string `json:"locationPath,omitempty"` // Root-relative path ("/" for a drive/service root)
 	NativePath   string `json:"nativePath,omitempty"`   // OS-native absolute path/id (e.g. "C:\\Users\\Logan", "/mnt/2tb-ssd")
 	Type         string `json:"type,omitempty"`
+	// ParentID is the cloud drive/namespace id (Folder.ParentId), used for storage quota queries.
+	ParentID string `json:"parentId,omitempty"`
 }
 
 // RenameMigrationRequest sets a migration's display name.
@@ -119,8 +123,10 @@ type Status struct {
 	// SourceRootPrepared / DestinationRootPrepared: UI reviewed immediate children (seed at round 1).
 	SourceRootPrepared      bool `json:"sourceRootPrepared,omitempty"`
 	DestinationRootPrepared bool `json:"destinationRootPrepared,omitempty"`
-	// SourceRootChildNames are display names from the source root review (for dest greying).
+	// SourceRootChildNames are included source root child names (for dest matching).
 	SourceRootChildNames []string `json:"sourceRootChildNames,omitempty"`
+	// SourceRootChildren is the full sparse include tree for browse reconfirm.
+	SourceRootChildren []RootChildPlan `json:"sourceRootChildren,omitempty"`
 	// Live is true when the engine migration has an active run (traversal, copy, sweep, etc.).
 	Live bool `json:"live,omitempty"`
 	// SoftSuspendRequested is true after Stop() accepted a soft suspend; poll until phase is traversal-suspended or copy-suspended and live is false.
@@ -131,7 +137,29 @@ type Status struct {
 	AlreadyStopped bool `json:"alreadyStopped,omitempty"`
 	// PossibleStall is true when a queue watchdog recently detected no progress while the migration was live.
 	PossibleStall bool `json:"possibleStall,omitempty"`
+	// StopProgress is the live soft/force stop checklist for the UI (empty when not stopping).
+	StopProgress *StopProgressView `json:"stopProgress,omitempty"`
+	// DbActivity is a human-readable DuckDB wait label (index rebuild, checkpoint) while finalizing.
+	DbActivity string `json:"dbActivity,omitempty"`
 	// Status field in Migration is the lifecycle phase (engine lowercase-with-hyphens, e.g. traversal-in-progress, traversal-suspended).
+}
+
+// StopProgressView mirrors engine stop progress for API/UI.
+type StopProgressView struct {
+	Active     bool           `json:"active"`
+	Mode       string         `json:"mode,omitempty"`
+	Step       string         `json:"step,omitempty"`
+	Label      string         `json:"label,omitempty"`
+	Detail     string         `json:"detail,omitempty"`
+	InProgress int            `json:"inProgress,omitempty"`
+	Steps      []StopStepView `json:"steps,omitempty"`
+}
+
+// StopStepView is one checklist row.
+type StopStepView struct {
+	ID     string `json:"id"`
+	Label  string `json:"label"`
+	Status string `json:"status"`
 }
 
 type ResultView struct {
@@ -195,16 +223,25 @@ type ExternalQueueMetrics struct {
 	// Traversal phase metrics
 	FilesDiscoveredTotal     int64   `json:"files_discovered_total,omitempty"`
 	FoldersDiscoveredTotal   int64   `json:"folders_discovered_total,omitempty"`
-	DiscoveryRateItemsPerSec float64 `json:"discovery_rate_items_per_sec,omitempty"`
-	TotalDiscovered          int64   `json:"total_discovered,omitempty"` // files + folders
+	DiscoveryRateItemsPerSec float64 `json:"discovery_rate_items_per_sec"`
+	TotalDiscovered          int64   `json:"total_discovered"` // files + folders
 
 	// Copy phase metrics (new format from engine)
-	Folders        int64   `json:"folders,omitempty"`          // Total folders created
-	Files          int64   `json:"files,omitempty"`            // Total files created
-	Total          int64   `json:"total,omitempty"`            // Total items (folders + files)
-	Bytes          int64   `json:"bytes,omitempty"`            // Bytes transferred (done)
-	ItemsPerSecond float64 `json:"items_per_second,omitempty"` // Combined items/sec (EMA-smoothed)
-	BytesPerSecond float64 `json:"bytes_per_second,omitempty"` // Bytes/sec transfer rate (EMA-smoothed)
+	Folders        int64   `json:"folders,omitempty"` // Total folders created
+	Files          int64   `json:"files,omitempty"`   // Total files created
+	Total          int64   `json:"total,omitempty"`   // Total items (folders + files)
+	Bytes          int64   `json:"bytes,omitempty"`   // Bytes transferred (done)
+	ItemsPerSecond float64 `json:"items_per_second"`  // Combined items/sec (windowed)
+	BytesPerSecond float64 `json:"bytes_per_second"`  // Bytes/sec transfer rate (windowed)
+
+	// Already-on-destination (copy) or not-deleting (delete).
+	FoldersAlreadyExists int64 `json:"folders_already_exists,omitempty"`
+	FilesAlreadyExists   int64 `json:"files_already_exists,omitempty"`
+	BytesAlreadyExists   int64 `json:"bytes_already_exists,omitempty"`
+
+	// Permanent failures after seal accept (folder/file split for UI grid).
+	FoldersFailed int64 `json:"folders_failed,omitempty"`
+	FilesFailed   int64 `json:"files_failed,omitempty"`
 
 	// Migration-wide expected denominators (copy/delete).
 	FoldersExpected int64 `json:"folders_expected,omitempty"`
@@ -215,13 +252,18 @@ type ExternalQueueMetrics struct {
 	ItemsCompleted       int64   `json:"items_completed,omitempty"`
 	ItemsTotal           int64   `json:"items_total,omitempty"`
 	ItemsProgressPercent float64 `json:"items_progress_percent,omitempty"`
+	// Segment shares of ItemsTotal for stacked bars: ok → already_exists → failed.
+	ItemsOkPercent            float64 `json:"items_ok_percent,omitempty"`
+	ItemsAlreadyExistsPercent float64 `json:"items_already_exists_percent,omitempty"`
 
 	// Bytes progress (copy/delete): done vs fixed migration-wide eligible file size.
-	BytesTotal           int64   `json:"bytes_total,omitempty"`
-	BytesFailed          int64   `json:"bytes_failed,omitempty"`
-	BytesProgressPercent float64 `json:"bytes_progress_percent,omitempty"`
-	BytesFailedPercent   float64 `json:"bytes_failed_percent,omitempty"`
-	ItemsFailedPercent   float64 `json:"items_failed_percent,omitempty"`
+	BytesTotal                int64   `json:"bytes_total,omitempty"`
+	BytesFailed               int64   `json:"bytes_failed,omitempty"`
+	BytesProgressPercent      float64 `json:"bytes_progress_percent,omitempty"`
+	BytesOkPercent            float64 `json:"bytes_ok_percent,omitempty"`
+	BytesAlreadyExistsPercent float64 `json:"bytes_already_exists_percent,omitempty"`
+	BytesFailedPercent        float64 `json:"bytes_failed_percent,omitempty"`
+	ItemsFailedPercent        float64 `json:"items_failed_percent,omitempty"`
 
 	// Deterministic copy/delete progress (0–100). Alias of items_progress_percent. Omitted for traversal.
 	ProgressPercent float64 `json:"progress_percent,omitempty"`
@@ -264,6 +306,8 @@ type QueueMetricsResponse struct {
 	DstTraversal  *ExternalQueueMetrics `json:"dstTraversal,omitempty"`
 	Copy          *ExternalQueueMetrics `json:"copy,omitempty"`
 	Delete        *ExternalQueueMetrics `json:"delete,omitempty"`
+	// SizeFold is set while finalizing computes folder identity sizes.
+	SizeFold      *ExternalQueueMetrics `json:"sizeFold,omitempty"`
 	PossibleStall bool                  `json:"possibleStall,omitempty"`
 }
 
@@ -318,7 +362,6 @@ type MigrationDBInfo struct {
 type MigrationMetadata struct {
 	ID             string    `json:"id"`
 	Name           string    `json:"name"`
-	ConfigPath     string    `json:"configPath"`   // Legacy path retained for older metadata files
 	DatabasePath   string    `json:"databasePath"` // Canonical DB path in DB-only mode
 	CreatedAt      time.Time `json:"createdAt"`
 	IsNewMigration bool      `json:"isNewMigration"` // Flag to indicate this is a new migration (not a resume)

@@ -19,11 +19,11 @@ func (m *Manager) getMigrationPhase(migrationID string) (string, error) {
 	switch p {
 	case migration.PhaseCreated, migration.PhaseFiltersSet:
 		return "roots", nil
-	case migration.PhaseTraversing, migration.PhaseTraversalSuspended, migration.PhaseTraversalReview:
+	case migration.PhaseTraversing, migration.PhaseTraversalSuspended, migration.PhaseTraversalFinalizing, migration.PhaseTraversalFinalizeFailed, migration.PhaseTraversalReview:
 		return "traversal", nil
-	case migration.PhaseCopying, migration.PhaseCopySuspended, migration.PhaseCopyReview:
+	case migration.PhaseCopying, migration.PhaseCopySuspended, migration.PhaseCopyFinalizing, migration.PhaseCopyFinalizeFailed, migration.PhaseCopyReview:
 		return "copy", nil
-	case migration.PhaseDeleting, migration.PhaseDeleteSuspended, migration.PhaseDeleteReview:
+	case migration.PhaseDeleting, migration.PhaseDeleteSuspended, migration.PhaseDeleteFinalizing, migration.PhaseDeleteFinalizeFailed, migration.PhaseDeleteReview:
 		return "delete", nil
 	default:
 		return "unknown", nil
@@ -66,23 +66,10 @@ func (m *Manager) CheckPendingWork(ctx context.Context, migrationID string) (cor
 	if err != nil {
 		return corebridge.PendingWorkResponse{}, err
 	}
-	srcPending, err := mig.QueryNodes(migration.NodeQueryFilter{
-		Queue:  "SRC",
-		Status: "pending",
-		Limit:  1000,
-	})
+	retriesCount, err := mig.PathReviewPendingRetryCount()
 	if err != nil {
-		return corebridge.PendingWorkResponse{}, fmt.Errorf("failed to query pending source nodes: %w", err)
+		return corebridge.PendingWorkResponse{}, fmt.Errorf("read pending retry stats: %w", err)
 	}
-	dstPending, err := mig.QueryNodes(migration.NodeQueryFilter{
-		Queue:  "DST",
-		Status: "pending",
-		Limit:  1000,
-	})
-	if err != nil {
-		return corebridge.PendingWorkResponse{}, fmt.Errorf("failed to query pending destination nodes: %w", err)
-	}
-	retriesCount := len(srcPending) + len(dstPending)
 
 	rec, err := m.getMigrationRecord(migrationID)
 	hasUnsavedChanges := false

@@ -16,21 +16,21 @@ import (
 func (h handler) handleStream(w http.ResponseWriter, r *http.Request) {
 	migrationID := chi.URLParam(r, "migrationID")
 	if migrationID == "" {
-		httputil.WriteError(h.logger, w, http.StatusBadRequest, "migration id is required")
+		httputil.WriteJSON(h.logger, w, http.StatusBadRequest, map[string]string{"error": "migration id is required"})
 		return
 	}
 
 	updates, cancel, err := h.mgr.SubscribeProgress(r.Context(), migrationID)
 	if err != nil {
 		if errors.Is(err, corebridge.ErrMigrationNotFound) {
-			httputil.WriteError(h.logger, w, http.StatusNotFound, "migration not found")
+			httputil.WriteJSON(h.logger, w, http.StatusNotFound, map[string]string{"error": "migration not found"})
 			return
 		}
 		h.logger.Error().
 			Err(err).
 			Str("migration_id", migrationID).
 			Msg("failed to subscribe to migration progress")
-		httputil.WriteError(h.logger, w, http.StatusInternalServerError, "failed to subscribe to migration progress")
+		httputil.WriteJSON(h.logger, w, http.StatusInternalServerError, map[string]string{"error": "failed to subscribe to migration progress"})
 		return
 	}
 	defer cancel()

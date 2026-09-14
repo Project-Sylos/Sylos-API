@@ -49,11 +49,14 @@ func (h handler) handleSkipNodeDelete(ctx *middleware.Context) {
 
 	result, err := migrationops.SkipNodeDelete(mig, unescapedNodeID)
 	if err != nil {
+		if writeReviewOpBusy(ctx, err) {
+			return
+		}
 		ctx.Error(http.StatusBadRequest, err.Error(), err)
 		return
 	}
 	if !result.Success {
-		ctx.Response(http.StatusOK, result)
+		ctx.Error(http.StatusBadRequest, result.Error, nil)
 		return
 	}
 	ctx.Response(http.StatusOK, result)
@@ -73,11 +76,14 @@ func (h handler) handleUnskipNodeDelete(ctx *middleware.Context) {
 
 	result, err := migrationops.UnskipNodeDelete(mig, unescapedNodeID)
 	if err != nil {
+		if writeReviewOpBusy(ctx, err) {
+			return
+		}
 		ctx.Error(http.StatusBadRequest, err.Error(), err)
 		return
 	}
 	if !result.Success {
-		ctx.Response(http.StatusOK, result)
+		ctx.Error(http.StatusBadRequest, result.Error, nil)
 		return
 	}
 	ctx.Response(http.StatusOK, result)

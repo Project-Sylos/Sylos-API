@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	"codeberg.org/Sylos/Migration-Engine/pkg/filter"
 	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
 )
@@ -33,12 +34,21 @@ func TestSearchRequestHasFilter(t *testing.T) {
 		{name: "type_folder", req: corebridge.SearchRequest{Conditions: []corebridge.SearchCondition{{Field: "type", Value: "folder"}}}, want: true},
 		{name: "traversal_status", req: corebridge.SearchRequest{Conditions: []corebridge.SearchCondition{{Field: "traversalStatus", Value: "failed"}}}, want: true},
 		{name: "copy_status", req: corebridge.SearchRequest{Conditions: []corebridge.SearchCondition{{Field: "copyStatus", Value: "pending"}}}, want: true},
-		{name: "delete_status", req: corebridge.SearchRequest{Conditions: []corebridge.SearchCondition{{Field: "deleteStatus", Value: "pending"}}}, want: true},
+		{name: "delete_status", req: corebridge.SearchRequest{Conditions: []corebridge.SearchCondition{{Field: "deleteStatus", Value: "pending_explicit"}}}, want: true},
 		{name: "path_issue_status", req: corebridge.SearchRequest{Conditions: []corebridge.SearchCondition{{Field: "pathIssueStatus", Value: "issues"}}}, want: true},
 		{name: "path_issue_category", req: corebridge.SearchRequest{Conditions: []corebridge.SearchCondition{{Field: "pathIssueCategory", Value: "InvalidChar"}}}, want: true},
 		{name: "depth", req: corebridge.SearchRequest{Conditions: []corebridge.SearchCondition{{Field: "depth", Operator: "gte", Value: float64(2)}}}, want: true},
 		{name: "size", req: corebridge.SearchRequest{Conditions: []corebridge.SearchCondition{{Field: "size", Operator: "gt", Value: 100}}}, want: true},
 		{name: "blank_status", req: corebridge.SearchRequest{Conditions: []corebridge.SearchCondition{{Field: "traversalStatus", Value: "  "}}}, want: false},
+		{name: "under_path", req: corebridge.SearchRequest{UnderPath: "/reports"}, want: true},
+		{name: "under_path_root", req: corebridge.SearchRequest{UnderPath: "/"}, want: false},
+		{name: "under_path_blank", req: corebridge.SearchRequest{UnderPath: "  "}, want: false},
+		{name: "ruleset_alone", req: corebridge.SearchRequest{Ruleset: &filter.Ruleset{
+			SchemaVersion: filter.SchemaVersion,
+			RootGroup: filter.Group{Op: filter.OpAND, Children: []filter.Child{{
+				Condition: &filter.Condition{ID: "r1", Field: "name", Operator: "contains", Value: "x", AppliesTo: "both"},
+			}}},
+		}}, want: true},
 	}
 
 	for _, tc := range cases {
@@ -118,7 +128,8 @@ func TestSearchListResponseKeepsKnownTotalZero(t *testing.T) {
 func TestDiffListResponseSetsTotalAndHasMore(t *testing.T) {
 	t.Parallel()
 
-	resp := diffListResponse(nil, 0, 10, 25)
+	total := 25
+	resp := diffListResponse(nil, 0, 10, &total, false)
 	if resp.Pagination.Total == nil || *resp.Pagination.Total != 25 {
 		t.Fatalf("Total = %v, want 25", resp.Pagination.Total)
 	}
@@ -126,8 +137,16 @@ func TestDiffListResponseSetsTotalAndHasMore(t *testing.T) {
 		t.Fatal("HasMore = false, want true")
 	}
 
-	resp = diffListResponse(nil, 20, 10, 25)
+	resp = diffListResponse(nil, 20, 10, &total, true)
 	if resp.Pagination.HasMore {
 		t.Fatal("HasMore = true, want false at last page")
+	}
+
+	resp = diffListResponse(nil, 0, 10, nil, true)
+	if resp.Pagination.Total != nil {
+		t.Fatalf("Total = %v, want nil", resp.Pagination.Total)
+	}
+	if !resp.Pagination.HasMore {
+		t.Fatal("HasMore = false, want true when total unknown")
 	}
 }

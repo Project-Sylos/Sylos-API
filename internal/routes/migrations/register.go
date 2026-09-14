@@ -4,21 +4,30 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/rs/zerolog"
 
+	"codeberg.org/Sylos/Sylos-API/internal/auth/users"
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/manager"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/migrationops"
 	"codeberg.org/Sylos/Sylos-API/internal/routes/middleware"
 )
 
 type handler struct {
-	logger zerolog.Logger
-	mgr    *manager.Manager
+	logger    zerolog.Logger
+	mgr       *manager.Manager
+	userStore *users.Store
 }
 
 // Register mounts migration orchestration endpoints.
 func Register(router chi.Router, logger zerolog.Logger, mgr *manager.Manager, mw *middleware.Middleware) {
+	RegisterWithUsers(router, logger, mgr, nil, mw)
+}
+
+// RegisterWithUsers mounts migration endpoints and optionally applies per-user review query prefs.
+func RegisterWithUsers(router chi.Router, logger zerolog.Logger, mgr *manager.Manager, userStore *users.Store, mw *middleware.Middleware) {
 	h := handler{
-		logger: logger,
-		mgr:    mgr,
+		logger:    logger,
+		mgr:       mgr,
+		userStore: userStore,
 	}
 
 	router.Post("/migrations/roots", middleware.JSON(mw, h.setRoot))
@@ -26,6 +35,7 @@ func Register(router chi.Router, logger zerolog.Logger, mgr *manager.Manager, mw
 	router.Post("/migrations/{migrationID}/phase-change", middleware.JSON(mw, h.changePhase))
 	router.Post("/migrations/{migrationID}/retry-sweep", middleware.JSON(mw, h.retrySweep))
 	router.Post("/migrations/{migrationID}/resume", middleware.JSON(mw, h.resume))
+	router.Post("/migrations/{migrationID}/retry-finalize", middleware.JSON(mw, h.retryFinalize))
 	router.Post("/migrations/log-terminal", middleware.JSON(mw, h.toggleLogTerminal))
 	router.Post("/migrations/{migrationID}/upload", middleware.MultipartForm(mw, h.uploadUnified))
 	router.Get("/migrations/db/list", middleware.NoBody(mw, h.listDBs))
@@ -33,14 +43,23 @@ func Register(router chi.Router, logger zerolog.Logger, mgr *manager.Manager, mw
 	router.Post("/migrations/{migrationID}/load", middleware.NoBody(mw, h.load))
 	router.Post("/migrations/{migrationID}/rename", middleware.JSON(mw, h.rename))
 	router.Post("/migrations/{migrationID}/stop", middleware.NoBody(mw, h.stop))
+	router.Post("/migrations/{migrationID}/force-stop", middleware.NoBody(mw, h.forceStop))
 	router.Get("/migrations/{migrationID}", middleware.NoBody(mw, h.status))
 	router.Get("/migrations/{migrationID}/inspect", middleware.NoBody(mw, h.inspect))
 	router.Get("/migrations/{migrationID}/queue-metrics", middleware.NoBody(mw, h.queueMetrics))
+	router.Get("/migrations/{migrationID}/db-ops", middleware.NoBody(mw, h.dbOps))
 	router.Post("/migrations/{migrationID}/logs", middleware.JSON(mw, h.getLogs))
 	router.Get("/migrations/{migrationID}/diffs/stats", middleware.NoBody(mw, h.diffsStats))
 	router.Get("/migrations/{migrationID}/diffs", middleware.NoBody(mw, h.listDiffs))
+	router.Get("/migrations/{migrationID}/review-ops", middleware.NoBody(mw, h.reviewOps))
 	router.Post("/migrations/{migrationID}/exclude", middleware.JSON(mw, h.excludeNodes))
 	router.Post("/migrations/{migrationID}/unexclude", middleware.JSON(mw, h.unexcludeNodes))
+	router.Post("/migrations/{migrationID}/mark-retry", middleware.JSON(mw, func(ctx *middleware.Context, payload corebridge.MarkRetryRequest) {
+		h.handleBulkRetry(ctx, payload, true)
+	}))
+	router.Post("/migrations/{migrationID}/unmark-retry", middleware.JSON(mw, func(ctx *middleware.Context, payload corebridge.MarkRetryRequest) {
+		h.handleBulkRetry(ctx, payload, false)
+	}))
 	router.Post("/migrations/{migrationID}/node/{nodeID}/mark-retry-discovery", middleware.NoBody(mw, func(ctx *middleware.Context) {
 		h.handleMarkNodeForRetry(ctx, migrationops.RetryKindDiscovery)
 	}))
@@ -83,5 +102,7 @@ func Register(router chi.Router, logger zerolog.Logger, mgr *manager.Manager, mw
 	router.Put("/migrations/{migrationID}/scaling", middleware.JSON(mw, h.putScaling))
 	router.Post("/migrations/{migrationID}/search/count", middleware.JSON(mw, h.searchCount))
 	router.Post("/migrations/{migrationID}/search", middleware.JSON(mw, h.search))
+	router.Get("/migrations/{migrationID}/ruleset", middleware.NoBody(mw, h.getMigrationRuleset))
+	router.Put("/migrations/{migrationID}/ruleset", middleware.JSON(mw, h.setMigrationRuleset))
 	router.Get("/migrations/{migrationID}/stream", h.handleStream)
 }

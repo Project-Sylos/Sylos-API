@@ -1,33 +1,26 @@
 package users
 
 import (
-	"database/sql"
 	"errors"
+
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge/apidb"
 )
 
 func (s *Store) GetPreferencesJSON(id string) (string, error) {
-	var prefs sql.NullString
-	err := s.db.QueryRow(`SELECT preferences FROM users WHERE id = ?`, id).Scan(&prefs)
+	prefs, err := s.db.GetUserPreferences(id)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
+		if errors.Is(err, apidb.ErrNotFound) {
 			return "", ErrNotFound
 		}
 		return "", err
 	}
-	if !prefs.Valid || prefs.String == "" {
-		return "", nil
-	}
-	return prefs.String, nil
+	return prefs, nil
 }
 
 func (s *Store) SetPreferencesJSON(id string, prefsJSON string) error {
-	res, err := s.db.Exec(`UPDATE users SET preferences = ? WHERE id = ?`, prefsJSON, id)
-	if err != nil {
-		return err
-	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
+	err := s.db.SetUserPreferences(id, prefsJSON)
+	if errors.Is(err, apidb.ErrNotFound) {
 		return ErrNotFound
 	}
-	return nil
+	return err
 }

@@ -239,7 +239,6 @@ func (p ProvidersConfig) applyDefaults() {
 				"files.content.write",
 				"account_info.read",
 				"sharing.read",
-				"team_data.team_space",
 			},
 		}
 	}

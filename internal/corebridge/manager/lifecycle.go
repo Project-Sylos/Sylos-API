@@ -40,8 +40,15 @@ func (m *Manager) StartMigration(ctx context.Context, req corebridge.StartMigrat
 	cfg := m.buildTraversalConfig(req.Options, plan)
 	prep := m.rootsMgr.PreparationFor(mig.ID)
 	cfg.RootPreparation = prep
+	// Path checks must be on the migration before AddRoots so prepared depth-1
+	// children get the same GPL pass as traversal-discovered nodes.
+	m.SyncPathCheckProviders(mig.ID, mig)
+	mig.SetWindowsCompat(cfg.WindowsCompat)
 	if _, err := mig.AddRoots(plan.SourceRoot, plan.DestinationRoot, prep); err != nil && mig.Phase() == migration.PhaseCreated {
 		return corebridge.Migration{}, fmt.Errorf("failed to add roots: %w", err)
+	}
+	if err := m.applyMigrationFilterRuleset(mig.ID, mig, &cfg); err != nil {
+		return corebridge.Migration{}, fmt.Errorf("load filter ruleset: %w", err)
 	}
 
 	now := time.Now().UTC()
@@ -62,12 +69,7 @@ func (m *Manager) StartMigration(ctx context.Context, req corebridge.StartMigrat
 		if rec := m.runtimeByID[mig.ID]; rec != nil {
 			doneAt := time.Now().UTC()
 			rec.CompletedAt = &doneAt
-			if runErr != nil {
-				rec.Status = corebridge.MigrationStatusFailed
-				rec.Error = runErr.Error()
-			} else {
-				rec.Status = mig.Phase()
-			}
+			applyRunResultToRuntime(rec, mig, runErr)
 		}
 	}()
 
@@ -314,7 +316,11 @@ func (m *Manager) ChangePhase(ctx context.Context, migrationID string, phase str
 				runErr = fmt.Errorf("roots not configured for migration %s", migrationID)
 			} else {
 				cfg := m.buildTraversalConfig(req.Options, plan)
-				_, runErr = mig.StartTraversal(cfg)
+				if err := m.applyMigrationFilterRuleset(migrationID, mig, &cfg); err != nil {
+					runErr = fmt.Errorf("load filter ruleset: %w", err)
+				} else {
+					_, runErr = mig.StartTraversal(cfg)
+				}
 			}
 		}
 		// Forced-sync: update runtime cache from engine state when goroutine ends.
@@ -323,12 +329,7 @@ func (m *Manager) ChangePhase(ctx context.Context, migrationID string, phase str
 		defer m.mu.Unlock()
 		if rec := m.runtimeByID[migrationID]; rec != nil {
 			rec.CompletedAt = &doneAt
-			if runErr != nil {
-				rec.Status = corebridge.MigrationStatusFailed
-				rec.Error = runErr.Error()
-			} else {
-				rec.Status = mig.Phase()
-			}
+			applyRunResultToRuntime(rec, mig, runErr)
 		}
 	}()
 
@@ -374,21 +375,40 @@ func (m *Manager) GetMigrationStatus(ctx context.Context, id string) (corebridge
 		errText = rec.Error
 		completedAt = rec.CompletedAt
 	}
-	// Engine wins once soft suspend has persisted (runtime cache may still show *-in-progress).
-	if mig.Phase() == migration.PhaseTraversalSuspended || mig.Phase() == migration.PhaseCopySuspended || mig.Phase() == migration.PhaseDeleteSuspended {
-		status = mig.Phase()
+	// Engine wins once soft suspend / finalize states have persisted (runtime cache may still show *-in-progress or generic failed).
+	engPhase := mig.Phase()
+	if engPhase == migration.PhaseTraversalSuspended || engPhase == migration.PhaseCopySuspended || engPhase == migration.PhaseDeleteSuspended || engPhase == migration.PhaseAborted ||
+		migration.IsFinalizeFailedPhase(engPhase) || migration.IsFinalizingPhase(engPhase) {
+		status = engPhase
+	}
+	if migration.IsFinalizeFailedPhase(engPhase) {
+		if fe := mig.FinalizeError(); fe != "" {
+			errText = fe
+		}
 	}
 	// Background phase-change goroutine sets completedAt when the run ends; prefer engine phase over stale runtime status.
 	// Do not override an explicit failed runtime status — that hides the real error behind a stuck *-in-progress phase.
 	if completedAt != nil && !mig.IsLive() && status != corebridge.MigrationStatusFailed {
-		status = mig.Phase()
+		status = engPhase
+	}
+	if completedAt != nil && !mig.IsLive() && (migration.IsFinalizeFailedPhase(engPhase) || migration.IsFinalizingPhase(engPhase)) {
+		status = engPhase
+		if fe := mig.FinalizeError(); fe != "" {
+			errText = fe
+		}
 	}
 
 	sourceRoot, destinationRoot, rootsCached := m.cachedMigrationRoots(id)
-	if !rootsCached && !mig.IsLive() {
+	if !mig.IsLive() && (!rootsCached || sourceRoot == nil || destinationRoot == nil) {
 		// Historical/inactive migrations may not have an in-process root plan.
-		// Never query root bindings from DuckDB on a live status request.
-		sourceRoot, destinationRoot = m.migrationRoots(mig)
+		// PreparationFor can insert an empty stub plan; backfill any missing side from ops bindings.
+		dbSource, dbDest := m.migrationRoots(mig)
+		if sourceRoot == nil {
+			sourceRoot = dbSource
+		}
+		if destinationRoot == nil {
+			destinationRoot = dbDest
+		}
 	}
 	name := strings.TrimSpace(mig.GetName())
 	if isUnnamedMigration(mig) || isPlaceholderAutoMigrationName(name) {
@@ -399,8 +419,14 @@ func (m *Manager) GetMigrationStatus(ctx context.Context, id string) (corebridge
 
 	srcPrep, dstPrep := m.rootsMgr.PreparationSummary(id)
 	srcChildNames := m.rootsMgr.SourceChildrenNames(id)
+	prep := m.rootsMgr.PersistedPreparationFor(id)
 
-	return corebridge.Status{
+	dbActivity := ""
+	if mig.DB != nil {
+		dbActivity = mig.DB.ActivityLabel()
+	}
+
+	st := corebridge.Status{
 		Migration: corebridge.Migration{
 			ID:            id,
 			Name:          name,
@@ -418,7 +444,32 @@ func (m *Manager) GetMigrationStatus(ctx context.Context, id string) (corebridge
 		SourceRootPrepared:      srcPrep,
 		DestinationRootPrepared: dstPrep,
 		SourceRootChildNames:    srcChildNames,
-	}, nil
+		SourceRootChildren:      mapRootChildPlansToCore(prep.SourceChildren),
+		StopProgress:            mapStopProgress(mig.GetStopProgress()),
+		DbActivity:              dbActivity,
+	}
+	return st, nil
+}
+
+func mapStopProgress(p migration.StopProgress) *corebridge.StopProgressView {
+	if !p.Active && len(p.Steps) == 0 {
+		return nil
+	}
+	out := &corebridge.StopProgressView{
+		Active:     p.Active,
+		Mode:       p.Mode,
+		Step:       p.Step,
+		Label:      p.Label,
+		Detail:     p.Detail,
+		InProgress: p.InProgress,
+	}
+	if len(p.Steps) > 0 {
+		out.Steps = make([]corebridge.StopStepView, len(p.Steps))
+		for i, s := range p.Steps {
+			out.Steps[i] = corebridge.StopStepView{ID: s.ID, Label: s.Label, Status: string(s.Status)}
+		}
+	}
+	return out
 }
 
 func (m *Manager) LoadMigration(ctx context.Context, migrationID string) (corebridge.Migration, error) {
@@ -461,21 +512,6 @@ func (m *Manager) StopMigration(ctx context.Context, migrationID string) (corebr
 		return corebridge.Status{}, err
 	}
 
-	const stopGracePeriod = migration.DefaultStopGracePeriod
-	if stopResult.SoftSuspendRequested {
-		deadline := time.Now().Add(stopGracePeriod)
-		for mig.IsLive() && time.Now().Before(deadline) {
-			time.Sleep(200 * time.Millisecond)
-		}
-		if mig.IsLive() {
-			forceResult, forceErr := mig.ForceStop()
-			if forceErr != nil {
-				return corebridge.Status{}, forceErr
-			}
-			stopResult = forceResult
-		}
-	}
-
 	st, statusErr := m.GetMigrationStatus(ctx, migrationID)
 	if statusErr != nil {
 		return corebridge.Status{
@@ -487,19 +523,59 @@ func (m *Manager) StopMigration(ctx context.Context, migrationID string) (corebr
 			Live:                 mig.IsLive(),
 			SoftSuspendRequested: stopResult.SoftSuspendRequested,
 			Stopped:              stopResult.Stopped,
+			StopProgress:         mapStopProgress(mig.GetStopProgress()),
 		}, nil
 	}
 	st.Live = mig.IsLive()
 	st.SoftSuspendRequested = stopResult.SoftSuspendRequested
 	st.Stopped = stopResult.Stopped
-	if stopResult.ForceStopped {
-		st.Status = corebridge.MigrationStatusSuspended
+	st.StopProgress = mapStopProgress(mig.GetStopProgress())
+	st.Success = true
+	return st, nil
+}
+
+// ForceStopMigration aborts a live run immediately and marks the migration aborted (not resumable).
+func (m *Manager) ForceStopMigration(ctx context.Context, migrationID string) (corebridge.Status, error) {
+	mig, err := m.GetMigration(context.TODO(), migrationID)
+	if err != nil {
+		return corebridge.Status{}, err
 	}
-	// Soft suspend: keep engine phase until drain finishes (e.g. still traversal-in-progress); do not force generic "suspended".
-	// Hard cancel / other stopped paths: surface legacy suspended label for clients that expect it.
-	if stopResult.Stopped && !stopResult.SoftSuspendRequested && !stopResult.ForceStopped {
-		st.Status = corebridge.MigrationStatusSuspended
+	if !mig.IsLive() && mig.Phase() != migration.PhaseTraversing && mig.Phase() != migration.PhaseCopying && mig.Phase() != migration.PhaseDeleting {
+		st, statusErr := m.GetMigrationStatus(ctx, migrationID)
+		if statusErr != nil {
+			return corebridge.Status{
+				Migration: corebridge.Migration{
+					ID:      migrationID,
+					Status:  mig.Phase(),
+					Success: false,
+				},
+				Live:           false,
+				AlreadyStopped: true,
+			}, nil
+		}
+		st.AlreadyStopped = true
+		st.Success = false
+		return st, nil
 	}
+	if _, err := mig.Abort(); err != nil {
+		return corebridge.Status{}, err
+	}
+	st, statusErr := m.GetMigrationStatus(ctx, migrationID)
+	if statusErr != nil {
+		return corebridge.Status{
+			Migration: corebridge.Migration{
+				ID:      migrationID,
+				Status:  migration.PhaseAborted,
+				Success: true,
+			},
+			Live:         mig.IsLive(),
+			Stopped:      true,
+			StopProgress: mapStopProgress(mig.GetStopProgress()),
+		}, nil
+	}
+	st.Live = mig.IsLive()
+	st.Stopped = true
+	st.StopProgress = mapStopProgress(mig.GetStopProgress())
 	st.Success = true
 	return st, nil
 }
@@ -509,5 +585,5 @@ func migrationStopAllowed(phase string, live bool) bool {
 	if !live {
 		return false
 	}
-	return phase == migration.PhaseTraversing || phase == migration.PhaseCopying
+	return phase == migration.PhaseTraversing || phase == migration.PhaseCopying || phase == migration.PhaseDeleting
 }

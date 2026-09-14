@@ -1,6 +1,10 @@
 package corebridge
 
-import "fmt"
+import (
+	"fmt"
+
+	"codeberg.org/Sylos/Migration-Engine/pkg/filter"
+)
 
 // ListChildrenDiffsRequest represents a request to list children diffs from migration database
 type ListChildrenDiffsRequest struct {
@@ -11,27 +15,39 @@ type ListChildrenDiffsRequest struct {
 	AfterPath   string      // Keyset cursor: return children with path > AfterPath (empty = first page)
 	FoldersOnly bool        // If true, only return folders and apply limit to folders only
 	Sort        *SortOption `json:"sort,omitempty"` // Sort options (field and direction); keyset uses path order
-	// IncludeDestinationOnly when false hides destination-only rows. Nil means include (legacy default).
+	// IncludeDestinationOnly when false hides destination-only rows. Nil means include.
 	IncludeDestinationOnly *bool `json:"includeDestinationOnly,omitempty"`
+}
+
+// RuleExclusion attributes a path review node to a filter rule exclusion.
+type RuleExclusion struct {
+	RuleID          string `json:"ruleId"`
+	Label           string `json:"label"`
+	EvalPhase       string `json:"evalPhase,omitempty"`
+	ExclusionSource string `json:"exclusionSource,omitempty"`
+	ApplicationID   string `json:"applicationId,omitempty"`
 }
 
 // PathNodeItem represents a single node (from either SRC or DST) with its metadata
 type PathNodeItem struct {
-	Queue           string `json:"queue"` // "SRC" or "DST"
-	Id              string `json:"id"`
-	ParentId        string `json:"parentId,omitempty"`
-	ParentPath      string `json:"parentPath,omitempty"`
-	Name            string `json:"name"`
-	LocationPath    string `json:"locationPath"`
-	LastUpdated     string `json:"lastUpdated,omitempty"`
-	DepthLevel      int    `json:"depthLevel"`
-	Type            string `json:"type"`
-	Size            int64  `json:"size,omitempty"`
-	TraversalStatus string `json:"traversalStatus"`
-	CopyStatus      string `json:"copyStatus,omitempty"`
-	DeleteStatus    string `json:"deleteStatus,omitempty"`
-	FailureLogID    string `json:"failureLogId,omitempty"`
-	FailureMessage  string `json:"failureMessage,omitempty"`
+	Queue        string `json:"queue"` // "SRC" or "DST"
+	Id           string `json:"id"`
+	ParentId     string `json:"parentId,omitempty"`
+	ParentPath   string `json:"parentPath,omitempty"`
+	Name         string `json:"name"`
+	LocationPath string `json:"locationPath"`
+	// DisplayPath is the friendly name path for UI; LocationPath remains id_path for tree nav.
+	DisplayPath     string         `json:"displayPath,omitempty"`
+	LastUpdated     string         `json:"lastUpdated,omitempty"`
+	DepthLevel      int            `json:"depthLevel"`
+	Type            string         `json:"type"`
+	Size            int64          `json:"size,omitempty"` // file bytes, or folder identity child size
+	TraversalStatus string         `json:"traversalStatus"`
+	CopyStatus      string         `json:"copyStatus,omitempty"`
+	DeleteStatus    string         `json:"deleteStatus,omitempty"` // pending_explicit, pending_inherited, skipped, deleted, failed
+	FailureLogID    string         `json:"failureLogId,omitempty"`
+	FailureMessage  string         `json:"failureMessage,omitempty"`
+	RuleExclusion   *RuleExclusion `json:"ruleExclusion,omitempty"`
 }
 
 // PathNodes represents the src and dst nodes for a given path
@@ -56,8 +72,9 @@ type PrepareSourceCleanupRequest struct {
 }
 
 // PathReviewStats is the phase-aware path review stats from the engine (GetPathReviewStatsForView). Returned as JSON for GET /migrations/{id}/stats.
+// PendingCount is omitted when the review view has no Pending column (Discover / delete results).
 type PathReviewStats struct {
-	PendingCount        int           `json:"pendingCount"`
+	PendingCount        *int          `json:"pendingCount,omitempty"`
 	FailedCount         int           `json:"failedCount"`
 	ExcludedCount       int           `json:"excludedCount"`
 	PendingRetriesCount int           `json:"pendingRetriesCount"`
@@ -78,16 +95,25 @@ type ListChildrenDiffsResponse struct {
 
 // DiffsStatsResponse is returned by the separate diffs stats endpoint (total and folder/file counts for a path).
 type DiffsStatsResponse struct {
-	Total        int `json:"total"`
-	TotalFolders int `json:"totalFolders"`
-	TotalFiles   int `json:"totalFiles"`
+	Total        int  `json:"total"`
+	TotalFolders int  `json:"totalFolders"`
+	TotalFiles   int  `json:"totalFiles"`
+	// Truncated means Total is a lower bound (count stopped early, e.g. query deadline).
+	Truncated bool `json:"truncated,omitempty"`
+}
+
+// ReviewOpsResponse is returned by GET .../review-ops (in-flight path-review writers).
+type ReviewOpsResponse struct {
+	BulkMutationInProgress bool `json:"bulkMutationInProgress"`
 }
 
 // ExclusionRequest represents a request to exclude/unexclude nodes
 type ExclusionRequest struct {
-	NodeIDs []string `json:"nodeIDs,omitempty"` // Array of node IDs to exclude/unexclude
-	All     bool     `json:"all,omitempty"`     // If true, mark all matching items
-	Filter  *struct {
+	NodeIDs       []string       `json:"nodeIDs,omitempty"` // Array of node IDs to exclude/unexclude
+	All           bool           `json:"all,omitempty"`     // If true, mark all matching items
+	Search        *SearchRequest `json:"search,omitempty"`
+	ExceptNodeIDs []string       `json:"except,omitempty"`
+	Filter        *struct {
 		Status string `json:"status,omitempty"` // Optional status filter (e.g., "failed")
 	} `json:"filter,omitempty"`
 }
@@ -96,11 +122,19 @@ type ExclusionRequest struct {
 // AffectedCount and Deltas come from the engine's PathReviewActionResult so the UI can update local stats without refetching.
 // Delta keys (traversal only): traversalPending, traversalFailed, excluded. Apply to the phase's pending/failed/excluded counts.
 type ExclusionResponse struct {
-	Success       bool             `json:"success"`
-	Error         string           `json:"error,omitempty"`
-	TaskID        string           `json:"taskID,omitempty"` // Background task ID for 'all' operations
-	AffectedCount int64            `json:"affectedCount"`
-	Deltas        map[string]int64 `json:"deltas"` // Engine keys: traversalPending, traversalFailed, excluded; only keys that changed are present
+	Success          bool              `json:"success"`
+	Error            string            `json:"error,omitempty"`
+	TaskID           string            `json:"taskID,omitempty"` // Background task ID for bulk operations
+	AffectedCount    int64             `json:"affectedCount"`
+	UnchangedCount   int64             `json:"unchangedCount,omitempty"`
+	UnchangedReasons []BulkReasonGroup `json:"unchangedReasons,omitempty"`
+	Deltas           map[string]int64  `json:"deltas"` // Engine keys: traversalPending, traversalFailed, excluded
+}
+
+// BulkReasonGroup summarizes why some selected nodes did not change.
+type BulkReasonGroup struct {
+	Reason string `json:"reason"`
+	Count  int    `json:"count"`
 }
 
 // SweepConfigRequest represents the configuration for exclusion or retry sweeps
@@ -113,6 +147,9 @@ type SweepConfigRequest struct {
 	SkipListener       *bool  `json:"skipListener,omitempty"`
 	StartupDelaySec    int    `json:"startupDelaySeconds,omitempty"`
 	ProgressTickMillis int    `json:"progressTickMillis,omitempty"`
+	// Used when resuming *-finalize-failed (index/checkpoint retry).
+	MemoryLimitGB int `json:"memoryLimitGB,omitempty"` // 0 = default 2GB for index build
+	Threads       int `json:"threads,omitempty"`       // 0 = default 1; max 4
 }
 
 // SweepResponse represents the response from triggering a sweep
@@ -125,9 +162,9 @@ type SweepResponse struct {
 
 // PendingWorkResponse represents the response for checking pending work
 type PendingWorkResponse struct {
-	HasPendingRetries    bool `json:"hasPendingRetries"`    // True if count > 0
+	HasPendingRetries    bool `json:"hasPendingRetries"`    // True if PathReview pendingRetriesCount > 0
 	HasPathReviewChanges bool `json:"hasPathReviewChanges"` // True if user made changes (exclusions/retries) since last sweep completion
-	PendingRetriesCount  int  `json:"pendingRetriesCount"`  // Number of items marked as "pending" in status-lookup buckets (actual retry count)
+	PendingRetriesCount  int  `json:"pendingRetriesCount"`  // Same O(1) counter as GET /stats pendingRetriesCount
 }
 
 // MarkRetryRequest represents a request to mark nodes for retry
@@ -135,6 +172,8 @@ type MarkRetryRequest struct {
 	NodeIDs      []string `json:"nodeIDs,omitempty"`      // Array of node IDs to mark for retry
 	All          bool     `json:"all,omitempty"`          // If true, mark all failed items
 	MarkAsFailed bool     `json:"markAsFailed,omitempty"` // If true, mark nodes as failed instead of retry
+	// Kind selects discovery | copy | delete. Empty means infer from migration phase.
+	Kind string `json:"kind,omitempty"`
 }
 
 // MarkRetryResponse represents the response from marking/unmarking a node for retry.
@@ -146,11 +185,13 @@ type MarkRetryRequest struct {
 //
 // UI should apply traversal keys to traversal review counters and copy keys to copy review counters.
 type MarkRetryResponse struct {
-	Success       bool             `json:"success"`
-	Error         string           `json:"error,omitempty"`
-	TaskID        string           `json:"taskID,omitempty"` // Background task ID for 'all' operations
-	AffectedCount int64            `json:"affectedCount"`
-	Deltas        map[string]int64 `json:"deltas"` // Engine keys above; only keys that changed are present
+	Success          bool              `json:"success"`
+	Error            string            `json:"error,omitempty"`
+	TaskID           string            `json:"taskID,omitempty"` // Background task ID for 'all' operations
+	AffectedCount    int64             `json:"affectedCount"`
+	UnchangedCount   int64             `json:"unchangedCount,omitempty"`
+	UnchangedReasons []BulkReasonGroup `json:"unchangedReasons,omitempty"`
+	Deltas           map[string]int64  `json:"deltas"` // Engine keys above; only keys that changed are present
 }
 
 // SearchCondition represents a single search condition
@@ -166,9 +207,16 @@ type SearchRequest struct {
 	Conditions       []SearchCondition `json:"conditions,omitempty"`       // Search conditions
 	Sort             *SortOption       `json:"sort,omitempty"`             // Sort options (field and direction)
 	StatusSearchType string            `json:"statusSearchType,omitempty"` // Which status type(s) to search by: "traversal", "copy", or "both" (default: "both")
-	// IncludeDestinationOnly when false hides destination-only rows. Nil means include (legacy default).
+	// UnderPath scopes search to a folder and descendants (id_path prefix). Empty or "/" = global.
+	UnderPath string `json:"underPath,omitempty"`
+	// AfterPath / AfterID are keyset cursors (path ASC, id ASC). When set, offset is ignored for filtering.
+	AfterPath string `json:"afterPath,omitempty"`
+	AfterID   string `json:"afterId,omitempty"`
+	// IncludeDestinationOnly when false hides destination-only rows. Nil means include.
 	// Explicitly false counts as a search filter (matches engine ExcludeDestinationOnly).
 	IncludeDestinationOnly *bool `json:"includeDestinationOnly,omitempty"`
+	// Ruleset is an optional filter-rules predicate compiled to SQL and ANDed into search.
+	Ruleset *filter.Ruleset `json:"ruleset,omitempty"`
 }
 
 // SortOption represents sorting options for search results

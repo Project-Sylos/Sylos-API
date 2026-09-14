@@ -2,7 +2,6 @@ package manager
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -91,10 +90,9 @@ func NewManager(logger zerolog.Logger, cfg config.Config, apiDB *apidb.DB) (*Man
 			Engine:  engineMgr,
 			DataDir: cfg.Runtime.DataDir,
 		}
-		if err := apiDB.ImportLegacySFTPKnownHostsFile(cfg.Runtime.DataDir); err != nil {
-			logger.Warn().Err(err).Msg("import legacy sftp known hosts file")
-		}
 	}
+
+	mgr.ApplyStoredDuckDBMemoryLimit()
 
 	return mgr, nil
 }
@@ -182,7 +180,7 @@ func (m *Manager) migrationDirFor(migrationID string) (string, error) {
 // FS adapters are not rehydrated here; call ensureFSAdaptersRehydrated before traversal, copy, or live FS browse.
 func (m *Manager) GetMigration(_ context.Context, migrationID string) (*migration.Migration, error) {
 	// Live/recent runtime migrations are already open and carry their decrypted key.
-	// API polling must not re-query sylos.duckdb for the key on every request.
+	// API polling must not re-query sylos.api for the key on every request.
 	m.mu.RLock()
 	if rec := m.runtimeByID[migrationID]; rec != nil && rec.Migration != nil {
 		mig := rec.Migration
@@ -209,7 +207,7 @@ func (m *Manager) getMigrationRecord(migrationID string) (apidb.MigrationRecord,
 	}
 	rec, err := m.apiDB.GetMigration(migrationID)
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
+		if errors.Is(err, apidb.ErrNotFound) {
 			return apidb.MigrationRecord{ID: migrationID, Name: migrationID}, nil
 		}
 		return apidb.MigrationRecord{}, err

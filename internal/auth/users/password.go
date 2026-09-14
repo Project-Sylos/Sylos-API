@@ -4,11 +4,11 @@
 package users
 
 import (
-	"database/sql"
 	"errors"
 	"fmt"
 	"strings"
 
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge/apidb"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -44,12 +44,15 @@ func (s *Store) ChangePassword(userID, currentPassword, newPassword string) erro
 	if err != nil {
 		return err
 	}
-	_, err = s.db.Exec(`UPDATE users SET password_hash = ? WHERE id = ?`, string(newHash), userID)
-	return err
+	rec, err := s.db.GetUser(userID)
+	if err != nil {
+		return err
+	}
+	rec.PasswordHash = string(newHash)
+	return s.db.UpdateUser(rec)
 }
 
 // IssueRecoveryCode replaces any existing recovery code and returns the plaintext once.
-// When pendingAck is true, the user must acknowledge storing the code before the attention flag clears.
 func (s *Store) IssueRecoveryCode(userID string, pendingAck bool) (string, error) {
 	if _, err := s.GetByID(userID); err != nil {
 		return "", err
@@ -62,11 +65,14 @@ func (s *Store) IssueRecoveryCode(userID string, pendingAck bool) (string, error
 	if err != nil {
 		return "", err
 	}
-	_, err = s.db.Exec(
-		`UPDATE users SET recovery_code_hash = ?, recovery_reissue_on_login = false, recovery_ack_pending = ? WHERE id = ?`,
-		recoveryHash, pendingAck, userID,
-	)
+	rec, err := s.db.GetUser(userID)
 	if err != nil {
+		return "", err
+	}
+	rec.RecoveryCodeHash = recoveryHash
+	rec.RecoveryReissueOnLogin = false
+	rec.RecoveryAckPending = pendingAck
+	if err := s.db.UpdateUser(rec); err != nil {
 		return "", err
 	}
 	return display, nil
@@ -74,50 +80,37 @@ func (s *Store) IssueRecoveryCode(userID string, pendingAck bool) (string, error
 
 // AcknowledgeRecoveryCode clears the pending acknowledgement flag after the user confirms storage.
 func (s *Store) AcknowledgeRecoveryCode(userID string) error {
-	res, err := s.db.Exec(`UPDATE users SET recovery_ack_pending = false WHERE id = ?`, userID)
+	rec, err := s.db.GetUser(userID)
 	if err != nil {
+		if errors.Is(err, apidb.ErrNotFound) {
+			return ErrNotFound
+		}
 		return err
 	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if n == 0 {
-		return ErrNotFound
-	}
-	return nil
+	rec.RecoveryAckPending = false
+	return s.db.UpdateUser(rec)
 }
 
 // RecoveryCodeStatusFor returns whether the user currently has a recovery code on file.
 func (s *Store) RecoveryCodeStatusFor(userID string) (RecoveryCodeStatus, error) {
-	var hash sql.NullString
-	var ackPending sql.NullBool
-	err := s.db.QueryRow(
-		`SELECT recovery_code_hash, recovery_ack_pending FROM users WHERE id = ?`,
-		userID,
-	).Scan(&hash, &ackPending)
+	rec, err := s.db.GetUser(userID)
 	if err != nil {
 		return RecoveryCodeStatus{}, err
 	}
-	hasCode := hash.Valid && hash.String != ""
-	needsAck := ackPending.Valid && ackPending.Bool
+	hasCode := rec.RecoveryCodeHash != ""
 	return RecoveryCodeStatus{
 		HasRecoveryCode: hasCode,
-		NeedsAttention:  !hasCode || needsAck,
+		NeedsAttention:  !hasCode || rec.RecoveryAckPending,
 	}, nil
 }
 
 // TakePendingRecoveryReissue issues a new recovery code when the user must receive one after login.
 func (s *Store) TakePendingRecoveryReissue(userID string) (string, bool, error) {
-	var pending sql.NullBool
-	err := s.db.QueryRow(
-		`SELECT recovery_reissue_on_login FROM users WHERE id = ?`,
-		userID,
-	).Scan(&pending)
+	rec, err := s.db.GetUser(userID)
 	if err != nil {
 		return "", false, err
 	}
-	if !pending.Valid || !pending.Bool {
+	if !rec.RecoveryReissueOnLogin {
 		return "", false, nil
 	}
 	code, err := s.IssueRecoveryCode(userID, true)
@@ -149,15 +142,11 @@ func (s *Store) ResetPasswordWithRecoveryCode(username, recoveryCode, newPasswor
 		return ErrDisabled
 	}
 
-	var recoveryHash sql.NullString
-	err = s.db.QueryRow(
-		`SELECT recovery_code_hash FROM users WHERE id = ?`,
-		user.ID,
-	).Scan(&recoveryHash)
+	rec, err := s.db.GetUser(user.ID)
 	if err != nil {
 		return err
 	}
-	if !recoveryHash.Valid || recoveryHash.String == "" || !verifyRecoveryCode(normalized, recoveryHash.String) {
+	if rec.RecoveryCodeHash == "" || !verifyRecoveryCode(normalized, rec.RecoveryCodeHash) {
 		return ErrInvalidRecoveryCode
 	}
 
@@ -165,9 +154,8 @@ func (s *Store) ResetPasswordWithRecoveryCode(username, recoveryCode, newPasswor
 	if err != nil {
 		return err
 	}
-	_, err = s.db.Exec(
-		`UPDATE users SET password_hash = ?, recovery_code_hash = NULL, recovery_reissue_on_login = true WHERE id = ?`,
-		string(pwHash), user.ID,
-	)
-	return err
+	rec.PasswordHash = string(pwHash)
+	rec.RecoveryCodeHash = ""
+	rec.RecoveryReissueOnLogin = true
+	return s.db.UpdateUser(rec)
 }

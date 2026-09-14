@@ -3,12 +3,15 @@ package corebridge
 import (
 	"context"
 	"errors"
+
+	fstypes "codeberg.org/Sylos/Sylos-FS/pkg/types"
 )
 
 var (
 	ErrMigrationNotFound    = errors.New("migration not found")
 	ErrServiceNotFound      = errors.New("service not found")
 	ErrDatabaseNotAvailable = errors.New("database not available")
+	ErrHomeUnsupported      = fstypes.ErrHomeUnsupported
 )
 
 type Bridge interface {
@@ -17,6 +20,7 @@ type Bridge interface {
 	CreateBrowseFolder(ctx context.Context, serviceID string, req CreateBrowseFolderRequest) (FolderDescriptor, error)
 	DeleteBrowseNodes(ctx context.Context, serviceID string, req DeleteBrowseNodesRequest) (DeleteBrowseNodesResponse, error)
 	ListDrives(ctx context.Context, serviceID string) ([]DriveInfo, error)
+	GetHomeFolder(ctx context.Context, serviceID string) (FolderDescriptor, error)
 	GetStorageInfo(ctx context.Context, req GetStorageInfoRequest) (StorageInfo, error)
 	MountDrive(ctx context.Context, serviceID string, req MountDriveRequest) (DriveInfo, error)
 	SetRoot(ctx context.Context, req SetRootRequest) (SetRootResponse, error)
