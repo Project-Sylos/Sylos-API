@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge/apidb"
 	"github.com/oklog/ulid/v2"
 )
 
@@ -36,26 +37,24 @@ func (s *Store) RecordAuditEvent(ev AuditEvent) error {
 	if ev.OccurredAt.IsZero() {
 		ev.OccurredAt = time.Now().UTC()
 	}
-	_, err := s.db.Exec(
-		`INSERT INTO user_audit_events (id, occurred_at, actor_user_id, target_user_id, action, metadata)
-		 VALUES (?, ?, ?, ?, ?, ?)`,
-		ev.ID,
-		ev.OccurredAt.Format(time.RFC3339),
-		nullIfEmpty(ev.ActorUserID),
-		nullIfEmpty(ev.TargetUserID),
-		ev.Action,
-		nullIfEmpty(ev.Metadata),
-	)
-	return err
+	return s.db.PutUserAudit(apidb.UserAuditRecord{
+		ID:           ev.ID,
+		OccurredAt:   ev.OccurredAt,
+		ActorUserID:  ev.ActorUserID,
+		TargetUserID: ev.TargetUserID,
+		Action:       ev.Action,
+		Metadata:     ev.Metadata,
+	})
 }
 
 func (s *Store) RecordLogin(userID string) error {
 	now := time.Now().UTC()
-	if _, err := s.db.Exec(
-		`UPDATE users SET last_login_at = ? WHERE id = ?`,
-		now.Format(time.RFC3339),
-		userID,
-	); err != nil {
+	rec, err := s.db.GetUser(userID)
+	if err != nil {
+		return err
+	}
+	rec.LastLoginAt = &now
+	if err := s.db.UpdateUser(rec); err != nil {
 		return err
 	}
 	return s.RecordAuditEvent(AuditEvent{
@@ -68,11 +67,12 @@ func (s *Store) RecordLogin(userID string) error {
 
 func (s *Store) RecordLogout(userID string) error {
 	now := time.Now().UTC()
-	if _, err := s.db.Exec(
-		`UPDATE users SET last_logout_at = ? WHERE id = ?`,
-		now.Format(time.RFC3339),
-		userID,
-	); err != nil {
+	rec, err := s.db.GetUser(userID)
+	if err != nil {
+		return err
+	}
+	rec.LastLogoutAt = &now
+	if err := s.db.UpdateUser(rec); err != nil {
 		return err
 	}
 	return s.RecordAuditEvent(AuditEvent{
@@ -89,12 +89,4 @@ func (s *Store) RecordLoginFailed(username string) error {
 		Action:   AuditLoginFailed,
 		Metadata: string(meta),
 	})
-}
-
-func nullIfEmpty(value string) any {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return nil
-	}
-	return value
 }

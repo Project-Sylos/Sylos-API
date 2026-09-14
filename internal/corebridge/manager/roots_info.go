@@ -32,6 +32,7 @@ func (m *Manager) rootInfoForRole(mig *migration.Migration, role string) *corebr
 		LocationPath: folder.LocationPath,
 		NativePath:   folder.ServiceID,
 		Type:         folder.Type,
+		ParentID:     folder.ParentId,
 	}
 	if def, err := m.serviceMgr.GetServiceDefinition(binding.ServiceID); err == nil {
 		info.ServiceName = def.Name
@@ -66,6 +67,7 @@ func (m *Manager) cachedMigrationRoots(migrationID string) (source, destination 
 			LocationPath:  plan.SourceRoot.LocationPath,
 			NativePath:    plan.SourceRoot.ServiceID,
 			Type:          plan.SourceRoot.Type,
+			ParentID:      plan.SourceRoot.ParentId,
 		}
 	}
 	if plan.HasDestination {
@@ -78,9 +80,10 @@ func (m *Manager) cachedMigrationRoots(migrationID string) (source, destination 
 			LocationPath:  plan.DestinationRoot.LocationPath,
 			NativePath:    plan.DestinationRoot.ServiceID,
 			Type:          plan.DestinationRoot.Type,
+			ParentID:      plan.DestinationRoot.ParentId,
 		}
 	}
-	return source, destination, true
+	return source, destination, source != nil || destination != nil
 }
 
 // rootLabel returns a human-friendly label for a root, prefixed with the service name when known.

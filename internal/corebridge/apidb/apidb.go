@@ -2,210 +2,99 @@ package apidb
 
 import (
 	"crypto/rand"
-	"database/sql"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
-	_ "github.com/marcboeker/go-duckdb"
-	enginedb "codeberg.org/Sylos/Migration-Engine/pkg/db"
-	_ "codeberg.org/Sylos/Migration-Engine/pkg/db/seal"
-	"codeberg.org/Sylos/Sylos-API/internal/corebridge/migrationkey"
+	"codeberg.org/Sylos/Sylos-FS/pkg/credentials"
+	badger "github.com/dgraph-io/badger/v4"
 )
-
-const defaultDBName = "sylos.duckdb"
 
 // DB is the Sylos API database (users, migrations registry, encrypted per-migration keys, provider OAuth apps).
 type DB struct {
-	path      string
+	dir       string
 	masterKey []byte
-	sql       *sql.DB
+	db        *badger.DB
 }
 
-// Open opens or creates the API database. masterKey must be the 32-byte install key from masterkey.Resolve.
+// Open opens or creates the API Badger store (sylos.api/). masterKey must be the 32-byte install key from masterkey.Resolve.
 func Open(dataDir string, masterKey []byte) (*DB, error) {
 	if len(masterKey) != 32 {
 		return nil, fmt.Errorf("master key must be 32 bytes")
 	}
-
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
 		return nil, err
 	}
-	path := filepath.Join(dataDir, defaultDBName)
-
-	engine, err := enginedb.Open(enginedb.Options{
-		Path: path,
-	})
+	dir := filepath.Join(dataDir, defaultStoreDirName)
+	bopts := badger.DefaultOptions(filepath.Clean(dir))
+	bopts.Logger = nil
+	bopts.SyncWrites = false
+	bopts.MemTableSize = 128 << 20
+	bopts.NumMemtables = 5
+	bopts.NumLevelZeroTables = 10
+	bopts.NumLevelZeroTablesStall = 30
+	bopts.NumCompactors = 8
+	bopts.ValueLogFileSize = 256 << 20
+	bopts.IndexCacheSize = 64 << 20
+	raw, err := badger.Open(bopts)
 	if err != nil {
 		return nil, fmt.Errorf("open API database: %w", err)
 	}
-	conn, err := engine.GetDB()
-	if err != nil {
-		_ = engine.Close()
-		return nil, err
+	d := &DB{dir: dir, masterKey: masterKey, db: raw}
+	if err := d.db.Update(initSchema); err != nil {
+		_ = raw.Close()
+		return nil, fmt.Errorf("init API database schema: %w", err)
 	}
-
-	db := &DB{path: path, masterKey: masterKey, sql: conn}
-	if err := db.migrate(); err != nil {
-		_ = conn.Close()
-		return nil, err
+	if err := d.SeedBuiltinRulesets(); err != nil {
+		_ = raw.Close()
+		return nil, fmt.Errorf("seed builtin rulesets: %w", err)
 	}
-	return db, nil
-}
-
-func (d *DB) SQL() *sql.DB {
-	return d.sql
+	return d, nil
 }
 
 func (d *DB) Path() string {
-	return d.path
+	return d.dir
 }
 
 func (d *DB) Close() error {
-	if d.sql != nil {
-		err := d.sql.Close()
-		d.sql = nil
+	if d.db != nil {
+		err := d.db.Close()
+		d.db = nil
 		return err
 	}
 	return nil
 }
 
-func (d *DB) migrate() error {
-	stmts := []string{
-		`CREATE TABLE IF NOT EXISTS users (
-			id VARCHAR PRIMARY KEY,
-			username VARCHAR NOT NULL,
-			password_hash VARCHAR NOT NULL,
-			role VARCHAR NOT NULL,
-			created_at VARCHAR NOT NULL,
-			disabled BOOLEAN NOT NULL DEFAULT false,
-			preferences VARCHAR
-		)`,
-		`CREATE UNIQUE INDEX IF NOT EXISTS users_username_lower ON users (lower(username))`,
-		`CREATE TABLE IF NOT EXISTS api_migrations (
-			id VARCHAR PRIMARY KEY,
-			name VARCHAR NOT NULL,
-			database_path VARCHAR,
-			created_at TIMESTAMP NOT NULL,
-			is_new_migration BOOLEAN NOT NULL DEFAULT false,
-			has_path_review_changes BOOLEAN NOT NULL DEFAULT false
-		)`,
-		// Store encrypted migration keys (not plaintext!).
-		`CREATE TABLE IF NOT EXISTS migration_keys (
-			migration_id VARCHAR PRIMARY KEY,
-			encrypted_encryption_key BLOB NOT NULL,
-			created_at TIMESTAMP NOT NULL
-		)`,
-		`CREATE TABLE IF NOT EXISTS provider_oauth_apps (
-			provider_id VARCHAR PRIMARY KEY,
-			client_id VARCHAR NOT NULL,
-			client_secret VARCHAR NOT NULL,
-			display_name VARCHAR,
-			is_default BOOLEAN NOT NULL DEFAULT false,
-			updated_at TIMESTAMP NOT NULL
-		)`,
-		`CREATE TABLE IF NOT EXISTS install_config (
-			key VARCHAR PRIMARY KEY,
-			value VARCHAR NOT NULL
-		)`,
-		`CREATE TABLE IF NOT EXISTS sftp_known_hosts (
-			host_port VARCHAR PRIMARY KEY,
-			host_key VARCHAR NOT NULL,
-			fingerprint VARCHAR NOT NULL,
-			updated_at TIMESTAMP NOT NULL
-		)`,
-		`CREATE TABLE IF NOT EXISTS sftp_saved_hosts (
-			id VARCHAR PRIMARY KEY,
-			display_name VARCHAR NOT NULL,
-			host VARCHAR NOT NULL,
-			port INTEGER NOT NULL,
-			username VARCHAR NOT NULL,
-			auth_method VARCHAR NOT NULL,
-			secrets_blob BLOB NOT NULL,
-			host_key VARCHAR,
-			created_at TIMESTAMP NOT NULL,
-			updated_at TIMESTAMP NOT NULL,
-			last_used_at TIMESTAMP
-		)`,
-		`CREATE UNIQUE INDEX IF NOT EXISTS sftp_saved_hosts_endpoint
-			ON sftp_saved_hosts (host, port, username)`,
-		`CREATE TABLE IF NOT EXISTS scaling_overrides (
-			scope TEXT NOT NULL,
-			scope_key TEXT NOT NULL,
-			mode TEXT NOT NULL,
-			max_workers INTEGER NOT NULL,
-			updated_at TIMESTAMP NOT NULL,
-			PRIMARY KEY (scope, scope_key, mode)
-		)`,
-	}
-	for _, stmt := range stmts {
-		if _, err := d.sql.Exec(stmt); err != nil {
-			return fmt.Errorf("api db migrate: %w", err)
-		}
-	}
-	return d.migrateProviderOAuthHealthColumns()
-}
-
-func (d *DB) migrateProviderOAuthHealthColumns() error {
-	for _, col := range []struct{ name, ddl string }{
-		{"health_status", `ALTER TABLE provider_oauth_apps ADD COLUMN health_status VARCHAR`},
-		{"health_checked_at", `ALTER TABLE provider_oauth_apps ADD COLUMN health_checked_at TIMESTAMP`},
-		{"health_error", `ALTER TABLE provider_oauth_apps ADD COLUMN health_error VARCHAR`},
-		{"health_monitor_enabled", `ALTER TABLE provider_oauth_apps ADD COLUMN health_monitor_enabled BOOLEAN`},
-		{"tenant_id", `ALTER TABLE provider_oauth_apps ADD COLUMN tenant_id VARCHAR`},
-	} {
-		var exists int64
-		err := d.sql.QueryRow(
-			`SELECT COUNT(*) FROM information_schema.columns WHERE table_name = 'provider_oauth_apps' AND column_name = ?`,
-			col.name,
-		).Scan(&exists)
-		if err != nil {
-			return err
-		}
-		if exists > 0 {
-			continue
-		}
-		if _, err := d.sql.Exec(col.ddl); err != nil {
-			if !strings.Contains(strings.ToLower(err.Error()), "already exists") {
-				return err
-			}
-		}
-	}
-	_, _ = d.sql.Exec(`UPDATE provider_oauth_apps SET health_monitor_enabled = false WHERE health_monitor_enabled IS NULL`)
-	_, _ = d.sql.Exec(`UPDATE provider_oauth_apps SET health_monitor_enabled = true WHERE health_status = 'healthy'`)
-	return nil
-}
-
 const InstallConfigJWTSecret = "jwt_secret"
 
-// GetInstallConfig returns a value from install_config, or sql.ErrNoRows if missing.
+// GetInstallConfig returns a value from install config, or ErrNotFound if missing.
 func (d *DB) GetInstallConfig(key string) (string, error) {
 	var value string
-	err := d.sql.QueryRow(`SELECT value FROM install_config WHERE key = ?`, key).Scan(&value)
+	err := d.view(func(txn *badger.Txn) error {
+		var err error
+		value, err = getString(txn, keyCfg(key))
+		return err
+	})
 	return value, err
 }
 
-// SetInstallConfig upserts a value in install_config.
+// SetInstallConfig upserts a value in install config.
 func (d *DB) SetInstallConfig(key, value string) error {
-	_, err := d.sql.Exec(
-		`INSERT INTO install_config (key, value) VALUES (?, ?)
-		 ON CONFLICT (key) DO UPDATE SET value = excluded.value`,
-		key, value,
-	)
-	return err
+	return d.update(func(txn *badger.Txn) error {
+		return putString(txn, keyCfg(key), value)
+	})
 }
 
 // MigrationRecord mirrors metadata.MigrationMetadata for API DB storage.
 type MigrationRecord struct {
-	ID                   string
-	Name                 string
-	DatabasePath         string
-	CreatedAt            time.Time
-	IsNewMigration       bool
-	HasPathReviewChanges bool
+	ID                   string    `json:"id"`
+	Name                 string    `json:"name"`
+	DatabasePath         string    `json:"databasePath"`
+	CreatedAt            time.Time `json:"createdAt"`
+	IsNewMigration       bool      `json:"isNewMigration"`
+	HasPathReviewChanges bool      `json:"hasPathReviewChanges"`
 }
 
 func (d *DB) UpsertMigration(rec MigrationRecord) error {
@@ -215,140 +104,134 @@ func (d *DB) UpsertMigration(rec MigrationRecord) error {
 	if rec.CreatedAt.IsZero() {
 		rec.CreatedAt = time.Now().UTC()
 	}
-	_, err := d.sql.Exec(
-		`INSERT INTO api_migrations (id, name, database_path, created_at, is_new_migration, has_path_review_changes)
-		 VALUES (?, ?, ?, ?, ?, ?)
-		 ON CONFLICT (id) DO UPDATE SET
-		 name = excluded.name,
-		 database_path = excluded.database_path,
-		 is_new_migration = excluded.is_new_migration,
-		 has_path_review_changes = excluded.has_path_review_changes`,
-		rec.ID, rec.Name, rec.DatabasePath, rec.CreatedAt, rec.IsNewMigration, rec.HasPathReviewChanges,
-	)
-	return err
+	return d.update(func(txn *badger.Txn) error {
+		return putJSON(txn, keyMig(rec.ID), rec)
+	})
 }
 
 func (d *DB) GetMigration(id string) (MigrationRecord, error) {
 	var rec MigrationRecord
-	var createdAt time.Time
-	err := d.sql.QueryRow(
-		`SELECT id, name, database_path, created_at, is_new_migration, has_path_review_changes
-		 FROM api_migrations WHERE id = ?`, id,
-	).Scan(&rec.ID, &rec.Name, &rec.DatabasePath, &createdAt, &rec.IsNewMigration, &rec.HasPathReviewChanges)
-	if err != nil {
-		return MigrationRecord{}, err
-	}
-	rec.CreatedAt = createdAt
-	return rec, nil
+	err := d.view(func(txn *badger.Txn) error {
+		return getJSON(txn, keyMig(id), &rec)
+	})
+	return rec, err
 }
 
 func (d *DB) ListMigrations() ([]MigrationRecord, error) {
-	rows, err := d.sql.Query(
-		`SELECT id, name, database_path, created_at, is_new_migration, has_path_review_changes
-		 FROM api_migrations ORDER BY created_at DESC`,
-	)
+	var out []MigrationRecord
+	err := d.view(func(txn *badger.Txn) error {
+		recs, err := listPrefixJSON[MigrationRecord](txn, prefixMig, nil)
+		if err != nil {
+			return err
+		}
+		out = recs
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var out []MigrationRecord
-	for rows.Next() {
-		var rec MigrationRecord
-		if err := rows.Scan(&rec.ID, &rec.Name, &rec.DatabasePath, &rec.CreatedAt, &rec.IsNewMigration, &rec.HasPathReviewChanges); err != nil {
-			return nil, err
+	sortMigrationsByCreatedAtDesc(out)
+	return out, nil
+}
+
+func sortMigrationsByCreatedAtDesc(recs []MigrationRecord) {
+	for i := 0; i < len(recs); i++ {
+		for j := i + 1; j < len(recs); j++ {
+			if recs[j].CreatedAt.After(recs[i].CreatedAt) {
+				recs[i], recs[j] = recs[j], recs[i]
+			}
 		}
-		out = append(out, rec)
 	}
-	return out, rows.Err()
 }
 
 // DeleteAllMigrationRegistry removes migration registry rows and per-migration encryption keys.
 func (d *DB) DeleteAllMigrationRegistry() error {
-	if _, err := d.sql.Exec(`DELETE FROM migration_keys`); err != nil {
-		return fmt.Errorf("delete migration keys: %w", err)
-	}
-	if _, err := d.sql.Exec(`DELETE FROM api_migrations`); err != nil {
-		return fmt.Errorf("delete api migrations: %w", err)
-	}
-	return nil
+	return d.update(func(txn *badger.Txn) error {
+		if err := deletePrefix(txn, prefixMigKey); err != nil {
+			return fmt.Errorf("delete migration keys: %w", err)
+		}
+		if err := deletePrefix(txn, prefixMig); err != nil {
+			return fmt.Errorf("delete api migrations: %w", err)
+		}
+		return nil
+	})
 }
 
-// WipeInstallUserData removes users, cloud provider OAuth apps, install config, SFTP host pins, and scaling overrides from the API database.
-// Migration registry rows should be cleared separately via DeleteAllMigrationRegistry.
+// WipeInstallUserData removes users, cloud provider OAuth apps, install config, SFTP host pins, and scaling overrides.
 func (d *DB) WipeInstallUserData() error {
-	if _, err := d.sql.Exec(`DELETE FROM users`); err != nil {
-		return fmt.Errorf("delete users: %w", err)
-	}
-	if _, err := d.sql.Exec(`DELETE FROM user_audit_events`); err != nil {
-		return fmt.Errorf("delete user audit events: %w", err)
-	}
-	if _, err := d.sql.Exec(`DELETE FROM provider_oauth_apps`); err != nil {
-		return fmt.Errorf("delete provider oauth apps: %w", err)
-	}
-	if _, err := d.sql.Exec(`DELETE FROM install_config`); err != nil {
-		return fmt.Errorf("delete install config: %w", err)
-	}
-	if err := d.DeleteAllSFTPKnownHosts(); err != nil {
-		return err
-	}
-	if err := d.DeleteAllSFTPSavedHosts(); err != nil {
-		return err
-	}
-	if _, err := d.sql.Exec(`DELETE FROM scaling_overrides`); err != nil {
-		return fmt.Errorf("delete scaling overrides: %w", err)
-	}
-	return nil
+	return d.update(func(txn *badger.Txn) error {
+		if err := deletePrefix(txn, prefixUser); err != nil {
+			return fmt.Errorf("delete users: %w", err)
+		}
+		if err := deletePrefix(txn, prefixUserAudit); err != nil {
+			return fmt.Errorf("delete user audit events: %w", err)
+		}
+		if err := deletePrefix(txn, prefixOAuth); err != nil {
+			return fmt.Errorf("delete provider oauth apps: %w", err)
+		}
+		if err := deletePrefix(txn, prefixCfg); err != nil {
+			return fmt.Errorf("delete install config: %w", err)
+		}
+		if err := deletePrefix(txn, prefixSftpKnown); err != nil {
+			return fmt.Errorf("delete sftp known hosts: %w", err)
+		}
+		if err := deletePrefix(txn, prefixSftpSaved); err != nil {
+			return fmt.Errorf("delete sftp saved hosts: %w", err)
+		}
+		if err := deletePrefix(txn, prefixScale); err != nil {
+			return fmt.Errorf("delete scaling overrides: %w", err)
+		}
+		return nil
+	})
+}
+
+type migrationKeyRecord struct {
+	MigrationID string    `json:"migrationId"`
+	Encrypted   []byte    `json:"encrypted"`
+	CreatedAt   time.Time `json:"createdAt"`
 }
 
 // EnsureMigrationKey returns the decrypted per-migration key for the given migrationID,
 // creating a new one if not present (and storing it encrypted with the master key).
 func (d *DB) EnsureMigrationKey(migrationID string) ([]byte, error) {
-	var encryptedKey []byte
-	err := d.sql.QueryRow(
-		`SELECT encrypted_encryption_key FROM migration_keys WHERE migration_id = ?`, migrationID,
-	).Scan(&encryptedKey)
+	key, err := d.MigrationKey(migrationID)
 	if err == nil {
-		key, err := migrationkey.DecryptMigrationKey(encryptedKey, d.masterKey)
-		if err == nil && len(key) == 32 {
-			return key, nil
-		}
-		if err != nil {
-			return nil, fmt.Errorf("failed to decrypt migration key: %w", err)
-		}
+		return key, nil
 	}
-	if err != nil && err != sql.ErrNoRows {
+	if err != ErrNotFound {
 		return nil, err
 	}
-	// No key found, so generate a new per-migration key, encrypt it, and store.
-	key := make([]byte, 32)
-	if _, err := io.ReadFull(rand.Reader, key); err != nil {
+	newKey := make([]byte, 32)
+	if _, err := io.ReadFull(rand.Reader, newKey); err != nil {
 		return nil, err
 	}
-	encryptedKey, err = migrationkey.EncryptMigrationKey(key, d.masterKey)
+	encryptedKey, err := credentials.Encrypt(newKey, d.masterKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to encrypt migration key: %w", err)
 	}
-	now := time.Now().UTC()
-	_, err = d.sql.Exec(
-		`INSERT INTO migration_keys (migration_id, encrypted_encryption_key, created_at) VALUES (?, ?, ?)`,
-		migrationID, encryptedKey, now,
-	)
-	if err != nil {
+	rec := migrationKeyRecord{
+		MigrationID: migrationID,
+		Encrypted:   encryptedKey,
+		CreatedAt:   time.Now().UTC(),
+	}
+	if err := d.update(func(txn *badger.Txn) error {
+		return putJSON(txn, keyMigKey(migrationID), rec)
+	}); err != nil {
 		return nil, err
 	}
-	return key, nil
+	return newKey, nil
 }
 
 // MigrationKey returns the decrypted per-migration key for the given migrationID.
 func (d *DB) MigrationKey(migrationID string) ([]byte, error) {
-	var encryptedKey []byte
-	err := d.sql.QueryRow(
-		`SELECT encrypted_encryption_key FROM migration_keys WHERE migration_id = ?`, migrationID,
-	).Scan(&encryptedKey)
+	var rec migrationKeyRecord
+	err := d.view(func(txn *badger.Txn) error {
+		return getJSON(txn, keyMigKey(migrationID), &rec)
+	})
 	if err != nil {
 		return nil, err
 	}
-	key, err := migrationkey.DecryptMigrationKey(encryptedKey, d.masterKey)
+	key, err := credentials.Decrypt(rec.Encrypted, d.masterKey)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decrypt migration key: %w", err)
 	}
@@ -358,126 +241,108 @@ func (d *DB) MigrationKey(migrationID string) ([]byte, error) {
 	return key, nil
 }
 
+// PutMigrationKeyEncrypted stores an imported encrypted migration key blob.
+func (d *DB) PutMigrationKeyEncrypted(migrationID string, encrypted []byte, createdAt time.Time) error {
+	if createdAt.IsZero() {
+		createdAt = time.Now().UTC()
+	}
+	rec := migrationKeyRecord{
+		MigrationID: migrationID,
+		Encrypted:   encrypted,
+		CreatedAt:   createdAt,
+	}
+	return d.update(func(txn *badger.Txn) error {
+		return putJSON(txn, keyMigKey(migrationID), rec)
+	})
+}
+
 type ProviderOAuthApp struct {
-	ProviderID           string
-	ClientID             string
-	ClientSecret         string
-	TenantID             string
-	DisplayName          string
-	IsDefault            bool
-	UpdatedAt            time.Time
-	HealthStatus         string
-	HealthCheckedAt      *time.Time
-	HealthError          string
-	HealthMonitorEnabled bool
+	ProviderID           string     `json:"providerId"`
+	ClientID             string     `json:"clientId"`
+	ClientSecret         string     `json:"clientSecret"`
+	TenantID             string     `json:"tenantId"`
+	DisplayName          string     `json:"displayName"`
+	IsDefault            bool       `json:"isDefault"`
+	UpdatedAt            time.Time  `json:"updatedAt"`
+	HealthStatus         string     `json:"healthStatus"`
+	HealthCheckedAt      *time.Time `json:"healthCheckedAt,omitempty"`
+	HealthError          string     `json:"healthError"`
+	HealthMonitorEnabled bool       `json:"healthMonitorEnabled"`
 }
 
 func (d *DB) UpsertProviderOAuthApp(app ProviderOAuthApp) error {
 	if app.UpdatedAt.IsZero() {
 		app.UpdatedAt = time.Now().UTC()
 	}
-	_, err := d.sql.Exec(
-		`INSERT INTO provider_oauth_apps (provider_id, client_id, client_secret, tenant_id, display_name, is_default, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)
-		 ON CONFLICT (provider_id) DO UPDATE SET
-		 client_id = excluded.client_id,
-		 client_secret = excluded.client_secret,
-		 tenant_id = excluded.tenant_id,
-		 display_name = excluded.display_name,
-		 is_default = excluded.is_default,
-		 updated_at = excluded.updated_at`,
-		app.ProviderID, app.ClientID, app.ClientSecret, app.TenantID, app.DisplayName, app.IsDefault, app.UpdatedAt,
-	)
-	return err
+	return d.update(func(txn *badger.Txn) error {
+		return putJSON(txn, keyOAuth(app.ProviderID), app)
+	})
 }
 
 func (d *DB) GetProviderOAuthApp(providerID string) (ProviderOAuthApp, error) {
 	var app ProviderOAuthApp
-	var checkedAt sql.NullTime
-	var healthStatus, healthError sql.NullString
-	var healthMonitor bool
-	err := d.sql.QueryRow(
-		`SELECT provider_id, client_id, client_secret, COALESCE(tenant_id, ''), display_name, is_default, updated_at,
-		        health_status, health_checked_at, health_error, COALESCE(health_monitor_enabled, false)
-		 FROM provider_oauth_apps WHERE provider_id = ?`, providerID,
-	).Scan(
-		&app.ProviderID, &app.ClientID, &app.ClientSecret, &app.TenantID, &app.DisplayName, &app.IsDefault, &app.UpdatedAt,
-		&healthStatus, &checkedAt, &healthError, &healthMonitor,
-	)
-	if err != nil {
-		return ProviderOAuthApp{}, err
-	}
-	if healthStatus.Valid {
-		app.HealthStatus = healthStatus.String
-	}
-	if healthError.Valid {
-		app.HealthError = healthError.String
-	}
-	if checkedAt.Valid {
-		t := checkedAt.Time
-		app.HealthCheckedAt = &t
-	}
-	app.HealthMonitorEnabled = healthMonitor
-	return app, nil
+	err := d.view(func(txn *badger.Txn) error {
+		return getJSON(txn, keyOAuth(providerID), &app)
+	})
+	return app, err
 }
 
 func (d *DB) UpdateProviderOAuthHealth(providerID, status string, checkedAt time.Time, healthError string) error {
-	_, err := d.sql.Exec(
-		`UPDATE provider_oauth_apps SET health_status = ?, health_checked_at = ?, health_error = ? WHERE provider_id = ?`,
-		status, checkedAt, healthError, providerID,
-	)
-	return err
+	return d.update(func(txn *badger.Txn) error {
+		var app ProviderOAuthApp
+		if err := getJSON(txn, keyOAuth(providerID), &app); err != nil {
+			return err
+		}
+		app.HealthStatus = status
+		t := checkedAt
+		app.HealthCheckedAt = &t
+		app.HealthError = healthError
+		return putJSON(txn, keyOAuth(providerID), app)
+	})
 }
 
 func (d *DB) SetProviderOAuthHealthMonitor(providerID string, enabled bool) error {
-	_, err := d.sql.Exec(
-		`UPDATE provider_oauth_apps SET health_monitor_enabled = ? WHERE provider_id = ?`,
-		enabled, providerID,
-	)
-	return err
+	return d.update(func(txn *badger.Txn) error {
+		var app ProviderOAuthApp
+		if err := getJSON(txn, keyOAuth(providerID), &app); err != nil {
+			return err
+		}
+		app.HealthMonitorEnabled = enabled
+		return putJSON(txn, keyOAuth(providerID), app)
+	})
 }
 
 func (d *DB) DeleteProviderOAuthApp(providerID string) error {
-	_, err := d.sql.Exec(`DELETE FROM provider_oauth_apps WHERE provider_id = ?`, providerID)
-	return err
+	return d.update(func(txn *badger.Txn) error {
+		return deleteKey(txn, keyOAuth(providerID))
+	})
 }
 
 func (d *DB) ListProviderOAuthApps() ([]ProviderOAuthApp, error) {
-	rows, err := d.sql.Query(
-		`SELECT provider_id, client_id, client_secret, COALESCE(tenant_id, ''), display_name, is_default, updated_at,
-		        health_status, health_checked_at, health_error, COALESCE(health_monitor_enabled, false)
-		 FROM provider_oauth_apps ORDER BY provider_id`,
-	)
+	var out []ProviderOAuthApp
+	err := d.view(func(txn *badger.Txn) error {
+		recs, err := listPrefixJSON[ProviderOAuthApp](txn, prefixOAuth, nil)
+		if err != nil {
+			return err
+		}
+		out = recs
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	var out []ProviderOAuthApp
-	for rows.Next() {
-		var app ProviderOAuthApp
-		var checkedAt sql.NullTime
-		var healthStatus, healthError sql.NullString
-		var healthMonitor bool
-		if err := rows.Scan(
-			&app.ProviderID, &app.ClientID, &app.ClientSecret, &app.TenantID, &app.DisplayName, &app.IsDefault, &app.UpdatedAt,
-			&healthStatus, &checkedAt, &healthError, &healthMonitor,
-		); err != nil {
-			return nil, err
+	sortOAuthAppsByProviderID(out)
+	return out, nil
+}
+
+func sortOAuthAppsByProviderID(apps []ProviderOAuthApp) {
+	for i := 0; i < len(apps); i++ {
+		for j := i + 1; j < len(apps); j++ {
+			if apps[j].ProviderID < apps[i].ProviderID {
+				apps[i], apps[j] = apps[j], apps[i]
+			}
 		}
-		if healthStatus.Valid {
-			app.HealthStatus = healthStatus.String
-		}
-		if healthError.Valid {
-			app.HealthError = healthError.String
-		}
-		if checkedAt.Valid {
-			t := checkedAt.Time
-			app.HealthCheckedAt = &t
-		}
-		app.HealthMonitorEnabled = healthMonitor
-		out = append(out, app)
 	}
-	return out, rows.Err()
 }
 
 func (d *DB) LoadOAuthCredsConfig() (map[string]ProviderOAuthApp, error) {

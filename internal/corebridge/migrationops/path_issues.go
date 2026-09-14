@@ -9,7 +9,7 @@ import (
 	"codeberg.org/Sylos/go-path-linter/pkg/issue"
 )
 
-// ListPathIssues loads the destination-name queue, including ignored warnings.
+// ListPathIssues loads the naming-compatibility queue, including ignored warnings.
 // Count is the number of active (non-ignored) issues that still block copy.
 func ListPathIssues(mig *migration.Migration, limit int) (corebridge.PathIssuesListResponse, error) {
 	if mig == nil {
@@ -64,7 +64,7 @@ func AcceptPathChange(mig *migration.Migration, nodeID, proposedPath string, for
 	}
 	if force {
 		if proposedPath == "" {
-			return corebridge.PathIssuesMutationResponse{Success: false, Message: "A destination name is required.", PathChecksEnabled: true}, nil
+			return corebridge.PathIssuesMutationResponse{Success: false, Message: "A name is required.", PathChecksEnabled: true}, nil
 		}
 		if err := mig.AcceptPathChange(nodeID, proposedPath, true); err != nil {
 			return pathValidationOrErr(err)
@@ -84,7 +84,7 @@ func AcceptPathChange(mig *migration.Migration, nodeID, proposedPath string, for
 		}
 	}
 	if proposedPath == "" {
-		return corebridge.PathIssuesMutationResponse{Success: false, Message: "No suggested destination name is available for this item.", PathChecksEnabled: true}, nil
+		return corebridge.PathIssuesMutationResponse{Success: false, Message: "No suggested name is available for this item.", PathChecksEnabled: true}, nil
 	}
 	if err := mig.AcceptPathChange(nodeID, proposedPath, false); err != nil {
 		return pathValidationOrErr(err)

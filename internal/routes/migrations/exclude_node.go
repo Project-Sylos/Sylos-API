@@ -18,8 +18,6 @@ func (h handler) excludeNodes(ctx *middleware.Context, payload corebridge.Exclus
 		ctx.Error(http.StatusBadRequest, "migration id is required", nil)
 		return
 	}
-	h.logger.Info().Str("migration_id", migrationID).Interface("request", payload).Msg("excluding nodes")
-
 	mig, err := h.mgr.GetMigration(ctx.Request().Context(), migrationID)
 	if err != nil {
 		if errors.Is(err, corebridge.ErrMigrationNotFound) {
@@ -29,8 +27,35 @@ func (h handler) excludeNodes(ctx *middleware.Context, payload corebridge.Exclus
 		ctx.Error(http.StatusInternalServerError, "failed to get migration", err)
 		return
 	}
+	if payload.Search != nil {
+		if !migrationops.SearchRequestHasFilter(*payload.Search) {
+			ctx.Error(http.StatusBadRequest, "exclude-by-search requires a search predicate", nil)
+			return
+		}
+		h.logger.Info().Str("migration_id", migrationID).Msg("excluding nodes by search")
+		result, err := migrationops.ExcludeBySearch(mig, *payload.Search, payload.ExceptNodeIDs)
+		if err != nil {
+			if writeReviewOpBusy(ctx, err) {
+				return
+			}
+			ctx.Error(http.StatusInternalServerError, "failed to exclude by search", err)
+			return
+		}
+		if !result.Success {
+			ctx.Error(http.StatusBadRequest, result.Error, nil)
+			return
+		}
+		_ = h.mgr.MarkPathReviewChanges(ctx.Request().Context(), migrationID, true)
+		ctx.Response(http.StatusOK, result)
+		return
+	}
+	h.logger.Info().Str("migration_id", migrationID).Interface("request", payload).Msg("excluding nodes")
+
 	result, err := migrationops.SetNodesExcluded(mig, payload, true)
 	if err != nil {
+		if writeReviewOpBusy(ctx, err) {
+			return
+		}
 		ctx.Error(http.StatusInternalServerError, "failed to exclude nodes", err)
 		return
 	}
@@ -60,8 +85,33 @@ func (h handler) unexcludeNodes(ctx *middleware.Context, payload corebridge.Excl
 		ctx.Error(http.StatusInternalServerError, "failed to get migration", err)
 		return
 	}
+	if payload.Search != nil {
+		if !migrationops.SearchRequestHasFilter(*payload.Search) {
+			ctx.Error(http.StatusBadRequest, "unexclude-by-search requires a search predicate", nil)
+			return
+		}
+		h.logger.Info().Str("migration_id", migrationID).Msg("unexcluding nodes by search")
+		result, err := migrationops.UnexcludeBySearch(mig, *payload.Search, payload.ExceptNodeIDs)
+		if err != nil {
+			if writeReviewOpBusy(ctx, err) {
+				return
+			}
+			ctx.Error(http.StatusInternalServerError, "failed to unexclude by search", err)
+			return
+		}
+		if !result.Success {
+			ctx.Error(http.StatusBadRequest, result.Error, nil)
+			return
+		}
+		_ = h.mgr.MarkPathReviewChanges(ctx.Request().Context(), migrationID, true)
+		ctx.Response(http.StatusOK, result)
+		return
+	}
 	result, err := migrationops.SetNodesExcluded(mig, payload, false)
 	if err != nil {
+		if writeReviewOpBusy(ctx, err) {
+			return
+		}
 		ctx.Error(http.StatusInternalServerError, "failed to unexclude nodes", err)
 		return
 	}

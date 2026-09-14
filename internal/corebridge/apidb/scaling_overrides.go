@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	badger "github.com/dgraph-io/badger/v4"
 )
 
 const (
@@ -13,45 +15,49 @@ const (
 
 // ScalingOverrideRow is one persisted MaxWorkers override cell.
 type ScalingOverrideRow struct {
-	Scope      string
-	ScopeKey   string
-	Mode       string
-	MaxWorkers int
-	UpdatedAt  time.Time
+	Scope      string    `json:"scope"`
+	ScopeKey   string    `json:"scopeKey"`
+	Mode       string    `json:"mode"`
+	MaxWorkers int       `json:"maxWorkers"`
+	UpdatedAt  time.Time `json:"updatedAt"`
 }
 
 // ListAll returns every scaling override row.
 func (d *DB) ListAll() ([]ScalingOverrideRow, error) {
-	rows, err := d.sql.Query(`
-		SELECT scope, scope_key, mode, max_workers, updated_at
-		FROM scaling_overrides
-		ORDER BY scope, scope_key, mode
-	`)
+	var out []ScalingOverrideRow
+	err := d.view(func(txn *badger.Txn) error {
+		recs, err := listPrefixJSON[ScalingOverrideRow](txn, prefixScale, nil)
+		if err != nil {
+			return err
+		}
+		out = recs
+		return nil
+	})
 	if err != nil {
 		return nil, fmt.Errorf("list scaling overrides: %w", err)
 	}
-	defer rows.Close()
-	return scanScalingOverrideRows(rows)
+	sortScalingOverrides(out)
+	return out, nil
 }
 
 // ListByScope returns overrides for one scope (all keys).
 func (d *DB) ListByScope(scope string) ([]ScalingOverrideRow, error) {
 	scope = strings.TrimSpace(scope)
-	rows, err := d.sql.Query(`
-		SELECT scope, scope_key, mode, max_workers, updated_at
-		FROM scaling_overrides
-		WHERE scope = ?
-		ORDER BY scope_key, mode
-	`, scope)
+	all, err := d.ListAll()
 	if err != nil {
-		return nil, fmt.Errorf("list scaling overrides by scope: %w", err)
+		return nil, err
 	}
-	defer rows.Close()
-	return scanScalingOverrideRows(rows)
+	var out []ScalingOverrideRow
+	for _, row := range all {
+		if row.Scope == scope {
+			out = append(out, row)
+		}
+	}
+	sortScalingOverrides(out)
+	return out, nil
 }
 
 // UpsertModes replaces all modes for (scope, key) with modes.
-// An empty modes map clears the scope key.
 func (d *DB) UpsertModes(scope, key string, modes map[string]int) error {
 	scope = strings.TrimSpace(scope)
 	key = strings.TrimSpace(key)
@@ -64,33 +70,34 @@ func (d *DB) UpsertModes(scope, key string, modes map[string]int) error {
 	if len(modes) == 0 {
 		return d.DeleteScope(scope, key)
 	}
-
-	tx, err := d.sql.Begin()
-	if err != nil {
-		return fmt.Errorf("begin scaling override upsert: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	if _, err := tx.Exec(`DELETE FROM scaling_overrides WHERE scope = ? AND scope_key = ?`, scope, key); err != nil {
-		return fmt.Errorf("clear scaling override scope: %w", err)
-	}
 	now := time.Now().UTC()
-	for mode, maxWorkers := range modes {
-		mode = strings.TrimSpace(mode)
-		if mode == "" {
-			return fmt.Errorf("mode is required")
+	return d.update(func(txn *badger.Txn) error {
+		prefix := keyScalePrefix(scope, key)
+		it := txn.NewIterator(badger.DefaultIteratorOptions)
+		defer it.Close()
+		for it.Seek(prefix); it.ValidForPrefix(prefix); it.Next() {
+			if err := txn.Delete(it.Item().KeyCopy(nil)); err != nil {
+				return fmt.Errorf("clear scaling override scope: %w", err)
+			}
 		}
-		if _, err := tx.Exec(`
-			INSERT INTO scaling_overrides (scope, scope_key, mode, max_workers, updated_at)
-			VALUES (?, ?, ?, ?, ?)
-		`, scope, key, mode, maxWorkers, now); err != nil {
-			return fmt.Errorf("insert scaling override %s/%s/%s: %w", scope, key, mode, err)
+		for mode, maxWorkers := range modes {
+			mode = strings.TrimSpace(mode)
+			if mode == "" {
+				return fmt.Errorf("mode is required")
+			}
+			row := ScalingOverrideRow{
+				Scope:      scope,
+				ScopeKey:   key,
+				Mode:       mode,
+				MaxWorkers: maxWorkers,
+				UpdatedAt:  now,
+			}
+			if err := putJSON(txn, keyScale(scope, key, mode), row); err != nil {
+				return fmt.Errorf("insert scaling override %s/%s/%s: %w", scope, key, mode, err)
+			}
 		}
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit scaling override upsert: %w", err)
-	}
-	return nil
+		return nil
+	})
 }
 
 // DeleteScope removes all modes for (scope, key).
@@ -103,10 +110,9 @@ func (d *DB) DeleteScope(scope, key string) error {
 	if key == "" {
 		return fmt.Errorf("scope key is required")
 	}
-	if _, err := d.sql.Exec(`DELETE FROM scaling_overrides WHERE scope = ? AND scope_key = ?`, scope, key); err != nil {
-		return fmt.Errorf("delete scaling override scope: %w", err)
-	}
-	return nil
+	return d.update(func(txn *badger.Txn) error {
+		return deletePrefix(txn, string(keyScalePrefix(scope, key)))
+	})
 }
 
 // DeleteMode removes one mode for (scope, key).
@@ -123,29 +129,19 @@ func (d *DB) DeleteMode(scope, key, mode string) error {
 	if mode == "" {
 		return fmt.Errorf("mode is required")
 	}
-	if _, err := d.sql.Exec(
-		`DELETE FROM scaling_overrides WHERE scope = ? AND scope_key = ? AND mode = ?`,
-		scope, key, mode,
-	); err != nil {
-		return fmt.Errorf("delete scaling override mode: %w", err)
-	}
-	return nil
+	return d.update(func(txn *badger.Txn) error {
+		return deleteKey(txn, keyScale(scope, key, mode))
+	})
 }
 
-type scalingOverrideScanner interface {
-	Next() bool
-	Scan(dest ...any) error
-	Err() error
-}
-
-func scanScalingOverrideRows(rows scalingOverrideScanner) ([]ScalingOverrideRow, error) {
-	var out []ScalingOverrideRow
-	for rows.Next() {
-		var row ScalingOverrideRow
-		if err := rows.Scan(&row.Scope, &row.ScopeKey, &row.Mode, &row.MaxWorkers, &row.UpdatedAt); err != nil {
-			return nil, err
+func sortScalingOverrides(rows []ScalingOverrideRow) {
+	for i := 0; i < len(rows); i++ {
+		for j := i + 1; j < len(rows); j++ {
+			a := rows[i].Scope + rows[i].ScopeKey + rows[i].Mode
+			b := rows[j].Scope + rows[j].ScopeKey + rows[j].Mode
+			if b < a {
+				rows[i], rows[j] = rows[j], rows[i]
+			}
 		}
-		out = append(out, row)
 	}
-	return out, rows.Err()
 }

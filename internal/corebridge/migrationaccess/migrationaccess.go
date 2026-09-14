@@ -11,7 +11,7 @@ import (
 )
 
 // Opener resolves per-migration keys from the API database and opens plaintext migration DuckDBs.
-// Per-migration keys are stored encrypted in sylos.duckdb (wrapped by the install master key from the OS keyring).
+// Per-migration keys are stored encrypted in sylos.api/ (wrapped by the install master key from the OS keyring).
 // Token encryption inside migration DBs uses the decrypted per-migration key via the engine.
 type Opener struct {
 	APIDB   *apidb.DB

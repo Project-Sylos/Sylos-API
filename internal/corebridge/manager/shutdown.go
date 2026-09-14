@@ -24,7 +24,9 @@ func (m *Manager) Shutdown(ctx context.Context) {
 
 	m.logger.Info().Int("count", len(live)).Msg("stopping live migrations for API shutdown")
 
-	grace := migration.DefaultStopGracePeriod
+	// Process shutdown only: wait for soft drains, then ForceStop. Soft Stop itself has no auto-abort timer.
+	const shutdownSoftGrace = 30 * time.Second
+	grace := shutdownSoftGrace
 	for _, mig := range live {
 		if _, err := mig.Stop(); err != nil {
 			m.logger.Warn().Err(err).Str("migration_id", mig.ID).Msg("stop migration during shutdown")

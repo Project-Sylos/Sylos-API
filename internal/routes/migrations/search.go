@@ -74,7 +74,8 @@ func (h handler) search(ctx *middleware.Context, payload corebridge.SearchReques
 		ctx.Error(http.StatusInternalServerError, "failed to get migration", err)
 		return
 	}
-	diffs, err := migrationops.SearchPathReviewItems(mig, payload, offset, limit)
+	h.applyReviewQueryPrefs(ctx, mig)
+	diffs, err := migrationops.SearchPathReviewItems(ctx.Request().Context(), mig, payload, offset, limit)
 	if err != nil {
 		if errors.Is(err, migrationops.ErrSearchRequiresFilter) {
 			ctx.Error(http.StatusBadRequest, "search requires at least one filter", err)
@@ -87,7 +88,7 @@ func (h handler) search(ctx *middleware.Context, payload corebridge.SearchReques
 }
 
 // searchCount handles POST /api/migrations/{migrationID}/search/count
-// Same body as search; returns exact total/folder/file stats via GetSearchStats.
+// Same body as search; returns total/folder/file stats via GetSearchStats (may set truncated).
 func (h handler) searchCount(ctx *middleware.Context, payload corebridge.SearchRequest) {
 	migrationID := chi.URLParam(ctx.Request(), "migrationID")
 	if migrationID == "" {
@@ -114,7 +115,8 @@ func (h handler) searchCount(ctx *middleware.Context, payload corebridge.SearchR
 		ctx.Error(http.StatusInternalServerError, "failed to get migration", err)
 		return
 	}
-	stats, err := migrationops.GetSearchStats(mig, payload)
+	h.applyReviewQueryPrefs(ctx, mig)
+	stats, err := migrationops.GetSearchStats(ctx.Request().Context(), mig, payload)
 	if err != nil {
 		if errors.Is(err, migrationops.ErrSearchRequiresFilter) {
 			ctx.Error(http.StatusBadRequest, "search requires at least one filter", err)

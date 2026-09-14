@@ -39,6 +39,70 @@ func (h handler) checkPendingWork(ctx *middleware.Context) {
 	ctx.Response(http.StatusOK, response)
 }
 
+func (h handler) handleBulkRetry(ctx *middleware.Context, payload corebridge.MarkRetryRequest, mark bool) {
+	migrationID := chi.URLParam(ctx.Request(), "migrationID")
+	if migrationID == "" {
+		ctx.Error(http.StatusBadRequest, "migration id is required", nil)
+		return
+	}
+	if len(payload.NodeIDs) == 0 && !payload.All {
+		ctx.Error(http.StatusBadRequest, "nodeIDs required", nil)
+		return
+	}
+	mig, err := h.mgr.GetMigration(ctx.Request().Context(), migrationID)
+	if err != nil {
+		h.writeMigrationLoadError(ctx, err)
+		return
+	}
+	kind := migrationops.RetryKindDiscovery
+	switch strings.ToLower(strings.TrimSpace(payload.Kind)) {
+	case "copy":
+		kind = migrationops.RetryKindCopy
+	case "delete":
+		kind = migrationops.RetryKindDelete
+	case "discovery", "traversal":
+		kind = migrationops.RetryKindDiscovery
+	default:
+		phase := mig.Phase()
+		switch {
+		case strings.Contains(phase, "delete"):
+			kind = migrationops.RetryKindDelete
+		case strings.Contains(phase, "copy"):
+			kind = migrationops.RetryKindCopy
+		}
+	}
+	var result *corebridge.MarkRetryResponse
+	if mark {
+		if payload.MarkAsFailed {
+			result, err = migrationops.UnmarkNodesForRetry(mig, kind, payload)
+		} else {
+			result, err = migrationops.MarkNodesForRetry(mig, kind, payload)
+		}
+	} else {
+		result, err = migrationops.UnmarkNodesForRetry(mig, kind, payload)
+	}
+	if err != nil && (result == nil || (!result.Success && result.AffectedCount == 0)) {
+		if writeReviewOpBusy(ctx, err) {
+			return
+		}
+		errMsg := err.Error()
+		if isMarkRetryBenignError(kind, errMsg) || isUnmarkRetryBenignError(kind, errMsg) {
+			ctx.Response(http.StatusOK, &corebridge.MarkRetryResponse{
+				Success: false,
+				Error:   errMsg,
+				Deltas:  map[string]int64{},
+			})
+			return
+		}
+		ctx.Error(http.StatusInternalServerError, markRetryErrorLabel(kind), err)
+		return
+	}
+	if result != nil && result.Success {
+		_ = h.mgr.MarkPathReviewChanges(ctx.Request().Context(), migrationID, true)
+	}
+	ctx.Response(http.StatusOK, result)
+}
+
 func (h handler) handleMarkNodeForRetry(ctx *middleware.Context, kind migrationops.RetryKind) {
 	migrationID, unescapedNodeID, ok := h.loadMigrationNode(ctx)
 	if !ok {
@@ -55,6 +119,9 @@ func (h handler) handleMarkNodeForRetry(ctx *middleware.Context, kind migrationo
 		NodeIDs: []string{unescapedNodeID},
 	})
 	if err != nil {
+		if writeReviewOpBusy(ctx, err) {
+			return
+		}
 		errMsg := err.Error()
 		if isMarkRetryBenignError(kind, errMsg) {
 			ctx.Response(http.StatusOK, &corebridge.MarkRetryResponse{
@@ -87,6 +154,9 @@ func (h handler) handleUnmarkNodeForRetry(ctx *middleware.Context, kind migratio
 
 	result, err := migrationops.UnmarkNodeForRetry(mig, kind, unescapedNodeID)
 	if err != nil {
+		if writeReviewOpBusy(ctx, err) {
+			return
+		}
 		errMsg := err.Error()
 		if isUnmarkRetryBenignError(kind, errMsg) {
 			ctx.Response(http.StatusOK, &corebridge.MarkRetryResponse{

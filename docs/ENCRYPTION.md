@@ -1,4 +1,4 @@
-# DuckDB envelope encryption
+# Install data encryption
 
 Sylos uses a two-tier encryption model for data at rest.
 
@@ -6,8 +6,8 @@ Sylos uses a two-tier encryption model for data at rest.
 
 | Key | Storage | Protects |
 |-----|---------|----------|
-| **Install master key** (32 bytes) | OS keyring (`Sylos` / `install-master-key`) by default, or `creds/.env` with `--use-env-keys` | `sylos.duckdb` (users, migration registry, per-migration keys, provider OAuth app credentials) |
-| **Per-migration key** (32 bytes) | Plaintext row in `migration_keys` inside encrypted `sylos.duckdb` | Each `{dataDir}/{id}/{id}.db` migration database |
+| **Install master key** (32 bytes) | OS keyring (`Sylos` / `install-master-key`) by default, or `creds/.env` with `--use-env-keys` | `sylos.api/` Badger store (users, migration registry, per-migration keys, provider OAuth app credentials) |
+| **Per-migration key** (32 bytes) | Encrypted row in `sylos.api/` | Each migration engine store (ops Badger + catalog DuckDB on ME branch) |
 
 Default mode requires a working OS keyring; startup fails if the key cannot be read or stored there.
 
@@ -17,25 +17,26 @@ There is no plaintext fallback file for the install master key in default mode.
 
 ## What is encrypted
 
-- API database file (`sylos.duckdb`), including WAL and temp files (DuckDB 1.4+ native encryption)
-- Per-migration DuckDB files when opened through the API
+- Per-migration encryption keys at rest in `sylos.api/` (AES-GCM via install master key)
+- SFTP saved-host secrets in `sylos.api/`
+- Per-migration engine stores when opened through the API (ME catalog DuckDB + ops Badger)
 - OAuth refresh tokens are stored as plaintext JSON rows inside encrypted migration DBs (not field-level AES)
 
 ## What is not encrypted
 
-- DuckDB main header metadata (version/canary) — documented DuckDB limitation
-- JWT signing secret (`install_config` row in encrypted `sylos.duckdb`, or `SYLOS_JWT_SECRET` / `jwt.secret` in config)
+- JWT signing secret (`install_config` in `sylos.api/`, or `SYLOS_JWT_SECRET` / `jwt.secret` in config)
 - In-memory OAuth access tokens
+- Badger value logs for `sylos.api/` (filesystem permissions apply)
 
 ## Backup and recovery
 
-**Losing the install master key means total loss of `sylos.duckdb` and all per-migration keys.** Back up one of:
+**Losing the install master key means total loss of `sylos.api/` and all per-migration keys.** Back up one of:
 
 - OS keyring export for service `Sylos` / user `install-master-key`
 - `creds/.env` when using `--use-env-keys`
 - `creds/.env` or `SYLOS_MASTER_KEY` when using `--use-env-keys`
 
-Per-migration `.db` files are useless without both the file and the corresponding key from `migration_keys`.
+Per-migration engine data is useless without both the on-disk folders and the corresponding key from the API store.
 
 ## Operator flags
 
@@ -48,15 +49,12 @@ Per-migration `.db` files are useless without both the file and the correspondin
 
 Before relying on encryption in production:
 
-- [ ] Bundled DuckDB ≥ 1.4.0 with encryption enabled
-- [ ] WAL and temp files encrypted (create migration, checkpoint, inspect `.wal`)
-- [ ] Stolen `sylos.duckdb` without master key is unreadable
-- [ ] Stolen migration `.db` without per-migration key is unreadable
+- [ ] Stolen `sylos.api/` without master key cannot decrypt migration keys or SFTP secrets
+- [ ] Stolen migration data without per-migration key is unreadable
 - [ ] Wrong master key fails fast at startup with a clear error
 - [ ] `pkg/tests` scenarios still use plaintext DBs (`EncryptionKey == nil`)
 
 ## Threat model notes
 
-- DuckDB encryption does not yet meet NIST requirements (per DuckDB docs).
-- Provider OAuth app credentials (`client_id` / `client_secret`) live in the encrypted API DB; configure in the UI when choosing a cloud service or under Settings → Cloud providers.
+- Provider OAuth app credentials (`client_id` / `client_secret`) live in the API store; configure in the UI when choosing a cloud service or under Settings → Cloud providers.
 - No legacy import from `users.duckdb`, `.enc` files, or `migrations.yaml`.

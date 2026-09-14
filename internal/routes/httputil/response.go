@@ -15,8 +15,3 @@ func WriteJSON(logger zerolog.Logger, w http.ResponseWriter, status int, payload
 		logger.Error().Err(err).Msg("failed to write response")
 	}
 }
-
-// WriteError writes a JSON error payload with the given status code.
-func WriteError(logger zerolog.Logger, w http.ResponseWriter, status int, message string) {
-	WriteJSON(logger, w, status, map[string]string{"error": message})
-}

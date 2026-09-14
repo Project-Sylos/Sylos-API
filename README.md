@@ -69,7 +69,7 @@ Sylos-UI / browser ──▶ Sylos API (this repo) ──▶ Migration Engine �
   - instantiates Sylos-FS adapters, seeds roots, and drives domain phase methods (`StartTraversal`, copy, delete, retry),
   - keeps in-memory state for live migrations and background tasks.
 - `internal/routes` contains one package per route group (`auth`, `users`, `services`, `providers`, `migrations`, `health`, …) plus the top-level `routes` package that composes them and applies middleware.
-- `internal/auth` holds JWT helpers, roles, and the users store (DuckDB-backed via `sylos.duckdb`).
+- `internal/auth` holds JWT helpers, roles, and the users store (Badger-backed via `sylos.api/`).
 - `pkg/logger` and `internal/server` provide structured logging and `http.Server` wrappers.
 
 ---
@@ -114,7 +114,7 @@ services:
 
 Important notes:
 
-- **JWT secret**: if omitted, the server generates a random secret on first startup and stores it in the encrypted `sylos.duckdb` `install_config` table. Set `SYLOS_JWT_SECRET` or `jwt.secret` in config to override.
+- **JWT secret**: if omitted, the server generates a random secret on first startup and stores it in `sylos.api/` install config. Set `SYLOS_JWT_SECRET` or `jwt.secret` in config to override.
 - **Local services**: users can only browse within the configured `root_path` (the service enforces prefix checks).
 - **Spectra services**: each entry identifies a config file and world; the API spawns a temporary Spectra SDK client per request.
 - **Runtime data**: migration databases and log buffers are written under `${runtime.data_dir}/${migrationID}/`. The directory is created automatically.
@@ -138,7 +138,6 @@ Important notes:
 |--------|------|-------------|
 | GET | `/api/health` | Authenticated health check |
 | GET | `/api/services` | List configured service connectors (local + Spectra) |
-| GET | `/api/source/list` | Legacy alias for `GET /api/services` |
 | GET | `/api/services/{serviceID}/children?identifier=` | List folders/files under a given service node |
 | POST | `/api/migrations/roots` | Seed database with selected source/destination roots and receive a migration id |
 | POST | `/api/migrations` | Start a migration; body matches `corebridge.StartMigrationRequest` |

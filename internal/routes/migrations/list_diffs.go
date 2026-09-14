@@ -66,6 +66,7 @@ func (h handler) listDiffs(ctx *middleware.Context) {
 		ctx.Error(http.StatusInternalServerError, "failed to get migration", err)
 		return
 	}
+	h.applyReviewQueryPrefs(ctx, mig)
 	diffs, err := migrationops.ListChildrenDiffs(mig, corebridge.ListChildrenDiffsRequest{
 		MigrationID:            migrationID,
 		Path:                   path,
@@ -117,6 +118,7 @@ func (h handler) diffsStats(ctx *middleware.Context) {
 		ctx.Error(http.StatusInternalServerError, "failed to get migration", err)
 		return
 	}
+	h.applyReviewQueryPrefs(ctx, mig)
 	stats, err := migrationops.GetChildrenDiffsStats(mig, path, foldersOnly, includeDestinationOnly)
 	if err != nil {
 		ctx.Error(http.StatusInternalServerError, "failed to get diffs stats", err)

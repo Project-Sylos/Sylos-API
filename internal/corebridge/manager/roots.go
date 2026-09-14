@@ -36,18 +36,7 @@ func (m *Manager) SetRoot(ctx context.Context, req corebridge.SetRootRequest) (c
 		ExcludedIDs: req.ExcludedIds,
 	}
 	if len(req.Children) > 0 {
-		rootsReq.Children = make([]roots.RootChildPlan, len(req.Children))
-		for i, c := range req.Children {
-			rootsReq.Children[i] = roots.RootChildPlan{
-				ID:       c.ID,
-				Name:     c.Name,
-				Type:     c.Type,
-				Size:     c.Size,
-				MTime:    c.MTime,
-				Excluded: c.Excluded,
-				DstOnly:  c.DstOnly,
-			}
-		}
+		rootsReq.Children = mapRootChildPlans(req.Children)
 	}
 	if err := m.rootsMgr.ValidateMigrationRoot(req.ServiceID, rootsReq.Root); err != nil {
 		return corebridge.SetRootResponse{}, err
@@ -148,4 +137,46 @@ func (m *Manager) SetRoot(ctx context.Context, req corebridge.SetRootRequest) (c
 		SourceRootPrepared:      resp.SourceRootPrepared,
 		DestinationRootPrepared: resp.DestinationRootPrepared,
 	}, nil
+}
+
+func mapRootChildPlans(in []corebridge.RootChildPlan) []roots.RootChildPlan {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]roots.RootChildPlan, len(in))
+	for i, c := range in {
+		out[i] = roots.RootChildPlan{
+			ID:          c.ID,
+			Name:        c.Name,
+			Type:        c.Type,
+			Size:        c.Size,
+			MTime:       c.MTime,
+			Excluded:    c.Excluded,
+			DstOnly:     c.DstOnly,
+			IncludeOnly: append([]string(nil), c.IncludeOnly...),
+			Children:    mapRootChildPlans(c.Children),
+		}
+	}
+	return out
+}
+
+func mapRootChildPlansToCore(in []roots.RootChildPlan) []corebridge.RootChildPlan {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]corebridge.RootChildPlan, len(in))
+	for i, c := range in {
+		out[i] = corebridge.RootChildPlan{
+			ID:          c.ID,
+			Name:        c.Name,
+			Type:        c.Type,
+			Size:        c.Size,
+			MTime:       c.MTime,
+			Excluded:    c.Excluded,
+			DstOnly:     c.DstOnly,
+			IncludeOnly: append([]string(nil), c.IncludeOnly...),
+			Children:    mapRootChildPlansToCore(c.Children),
+		}
+	}
+	return out
 }

@@ -1,6 +1,8 @@
 package migrationops
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -8,9 +10,19 @@ import (
 	"time"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/convert"
+	"codeberg.org/Sylos/Migration-Engine/pkg/db/stats"
 	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
+	"github.com/google/uuid"
 )
+
+// ApplyDisableQueryTimeout toggles the 2m review query deadline on the migration DB handle.
+func ApplyDisableQueryTimeout(mig *migration.Migration, disable bool) {
+	if mig == nil || mig.DB == nil {
+		return
+	}
+	mig.DB.SetDisableQueryTimeout(disable)
+}
 
 // ErrSearchRequiresFilter is returned when search/count is called with no narrowing predicates.
 var ErrSearchRequiresFilter = errors.New("search requires at least one filter")
@@ -19,6 +31,12 @@ var ErrSearchRequiresFilter = errors.New("search requires at least one filter")
 // Mirrors Migration-Engine ReviewFilterHasSearchPredicate after condition mapping:
 // statusSearchType / sort alone do not count; IncludeDestinationOnly=false does.
 func SearchRequestHasFilter(req corebridge.SearchRequest) bool {
+	if under := strings.TrimSpace(req.UnderPath); under != "" && under != "/" {
+		return true
+	}
+	if req.Ruleset != nil && len(req.Ruleset.RootGroup.Children) > 0 {
+		return true
+	}
 	for _, c := range req.Conditions {
 		field := strings.ToLower(strings.TrimSpace(c.Field))
 		switch field {
@@ -125,13 +143,16 @@ func resolveSort(sort *corebridge.SortOption) (sortBy, sortDirection string) {
 	return sortBy, sortDirection
 }
 
-// diffListResponse builds the paginated API response from engine diff items (counted tree path).
-func diffListResponse(items []migration.DiffItem, offset, limit, total int) corebridge.ListChildrenDiffsResponse {
+// diffListResponse builds the paginated API response from engine diff items.
+func diffListResponse(items []migration.DiffItem, offset, limit int, total *int, hasMore bool) corebridge.ListChildrenDiffsResponse {
 	out := make(map[string]corebridge.PathNodes, len(items))
 	order := make([]string, 0, len(items))
 	for _, item := range items {
 		out[item.Path] = diffItemToPathNodes(item)
 		order = append(order, item.Path)
+	}
+	if total != nil {
+		hasMore = offset+limit < *total
 	}
 	return corebridge.ListChildrenDiffsResponse{
 		Items:     out,
@@ -139,8 +160,8 @@ func diffListResponse(items []migration.DiffItem, offset, limit, total int) core
 		Pagination: corebridge.PaginationInfo{
 			Offset:  offset,
 			Limit:   limit,
-			Total:   &total,
-			HasMore: offset+limit < total,
+			Total:   total,
+			HasMore: hasMore,
 		},
 	}
 }
@@ -169,12 +190,22 @@ func diffItemToPathNodes(item migration.DiffItem) corebridge.PathNodes {
 	pathNodes := corebridge.PathNodes{
 		ResolvedDstName: strings.TrimSpace(item.ResolvedDstName),
 	}
+	displayPath := strings.TrimSpace(item.DisplayPath)
+	dstDisplay := strings.TrimSpace(item.DstDisplayPath)
+	if dstDisplay == "" {
+		dstDisplay = displayPath
+		if pathNodes.ResolvedDstName != "" && displayPath != "" {
+			// Fallback: swap leaf to resolved DST basename when DST compose is unavailable.
+			dstDisplay = joinParentPath(displayPath, pathNodes.ResolvedDstName)
+		}
+	}
 	if !item.MissingOnSource {
 		pathNodes.Src = &corebridge.PathNodeItem{
 			Queue:           "SRC",
 			Id:              item.SrcNodeID,
 			Name:            item.Name,
 			LocationPath:    item.Path,
+			DisplayPath:     displayPath,
 			DepthLevel:      item.Depth,
 			Type:            item.Type,
 			Size:            item.Size,
@@ -187,25 +218,31 @@ func diffItemToPathNodes(item migration.DiffItem) corebridge.PathNodes {
 	}
 	if !item.MissingOnDest {
 		dstName := item.Name
-		dstPath := item.Path
 		if pathNodes.ResolvedDstName != "" {
 			dstName = pathNodes.ResolvedDstName
-			dstPath = joinParentPath(item.Path, pathNodes.ResolvedDstName)
 		}
 		pathNodes.Dst = &corebridge.PathNodeItem{
 			Queue:           "DST",
 			Id:              item.DstNodeID,
 			Name:            dstName,
-			LocationPath:    dstPath,
+			LocationPath:    item.Path, // id_path for parent_path nav (same chain as SRC when mapped)
+			DisplayPath:     dstDisplay,
 			DepthLevel:      item.Depth,
 			Type:            item.Type,
-			Size:            item.Size,
+			Size:            dstReviewSize(item),
 			TraversalStatus: item.DstTraversalStatus,
 			FailureLogID:    item.DstFailureLogID,
 			FailureMessage:  item.DstFailureMessage,
 		}
 	}
 	return pathNodes
+}
+
+func dstReviewSize(item migration.DiffItem) int64 {
+	if item.HasDstSize {
+		return item.DstSize
+	}
+	return item.Size
 }
 
 // joinParentPath replaces the basename of srcPath with newBase.
@@ -242,11 +279,16 @@ func ListChildrenDiffs(mig *migration.Migration, req corebridge.ListChildrenDiff
 		SortDirection:          sortDirection,
 		FoldersOnly:            req.FoldersOnly,
 		IncludeDestinationOnly: req.IncludeDestinationOnly,
+		AfterPath:              req.AfterPath,
 	})
 	if err != nil {
 		return corebridge.ListChildrenDiffsResponse{}, fmt.Errorf("failed to list children diffs: %w", err)
 	}
-	return diffListResponse(result.Items, result.Offset, result.Limit, result.Total), nil
+	resp := diffListResponse(result.Items, result.Offset, result.Limit, result.Total, result.HasMore)
+	if enrichErr := EnrichPathNodesWithRuleExclusions(mig, &resp); enrichErr != nil {
+		return corebridge.ListChildrenDiffsResponse{}, fmt.Errorf("failed to enrich rule exclusions: %w", enrichErr)
+	}
+	return resp, nil
 }
 
 // GetChildrenDiffsStats calls the engine and converts to API response.
@@ -290,6 +332,7 @@ func engineSearchRequest(req corebridge.SearchRequest, offset, limit int) migrat
 	sortBy, sortDirection := resolveSort(req.Sort)
 	return migration.SearchRequest{
 		Path:                   "",
+		UnderPath:              strings.TrimSpace(req.UnderPath),
 		Limit:                  limit,
 		Offset:                 offset,
 		SortBy:                 sortBy,
@@ -297,38 +340,45 @@ func engineSearchRequest(req corebridge.SearchRequest, offset, limit int) migrat
 		Conditions:             enginePathReviewConditions(req),
 		StatusSearchType:       req.StatusSearchType,
 		IncludeDestinationOnly: req.IncludeDestinationOnly,
+		Ruleset:                req.Ruleset,
+		AfterPath:              strings.TrimSpace(req.AfterPath),
+		AfterID:                strings.TrimSpace(req.AfterID),
 	}
 }
 
 // SearchPathReviewItems calls the engine and converts to API response.
 // Caller should reject zero-filter requests via SearchRequestHasFilter before calling.
-func SearchPathReviewItems(mig *migration.Migration, req corebridge.SearchRequest, offset, limit int) (corebridge.ListChildrenDiffsResponse, error) {
+func SearchPathReviewItems(ctx context.Context, mig *migration.Migration, req corebridge.SearchRequest, offset, limit int) (corebridge.ListChildrenDiffsResponse, error) {
 	if mig == nil {
 		return corebridge.ListChildrenDiffsResponse{}, fmt.Errorf("migration is nil")
 	}
 	if !SearchRequestHasFilter(req) {
 		return corebridge.ListChildrenDiffsResponse{}, ErrSearchRequiresFilter
 	}
-	result, err := mig.SearchPathReviewItems(engineSearchRequest(req, offset, limit))
+	result, err := mig.SearchPathReviewItems(ctx, engineSearchRequest(req, offset, limit))
 	if err != nil {
 		if errors.Is(err, migration.ErrSearchRequiresFilter) {
 			return corebridge.ListChildrenDiffsResponse{}, ErrSearchRequiresFilter
 		}
 		return corebridge.ListChildrenDiffsResponse{}, fmt.Errorf("failed to search path review items: %w", err)
 	}
-	return searchListResponse(result), nil
+	resp := searchListResponse(result)
+	if enrichErr := EnrichPathNodesWithRuleExclusions(mig, &resp); enrichErr != nil {
+		return corebridge.ListChildrenDiffsResponse{}, fmt.Errorf("failed to enrich rule exclusions: %w", enrichErr)
+	}
+	return resp, nil
 }
 
-// GetSearchStats calls the engine and converts to API response (exact total/folder/file counts).
+// GetSearchStats calls the engine and converts to API response (total/folder/file counts; Truncated when deadline cut short).
 // Caller should reject zero-filter requests via SearchRequestHasFilter before calling.
-func GetSearchStats(mig *migration.Migration, req corebridge.SearchRequest) (corebridge.DiffsStatsResponse, error) {
+func GetSearchStats(ctx context.Context, mig *migration.Migration, req corebridge.SearchRequest) (corebridge.DiffsStatsResponse, error) {
 	if mig == nil {
 		return corebridge.DiffsStatsResponse{}, fmt.Errorf("migration is nil")
 	}
 	if !SearchRequestHasFilter(req) {
 		return corebridge.DiffsStatsResponse{}, ErrSearchRequiresFilter
 	}
-	stats, err := mig.GetSearchStats(engineSearchRequest(req, 0, 10000))
+	stats, err := mig.GetSearchStats(ctx, engineSearchRequest(req, 0, 10000))
 	if err != nil {
 		return corebridge.DiffsStatsResponse{}, fmt.Errorf("failed to get search stats: %w", err)
 	}
@@ -336,7 +386,18 @@ func GetSearchStats(mig *migration.Migration, req corebridge.SearchRequest) (cor
 		Total:        stats.Total,
 		TotalFolders: stats.Folders,
 		TotalFiles:   stats.Files,
+		Truncated:    stats.Truncated,
 	}, nil
+}
+
+// ReviewOpsStatus reports in-flight path-review writers for UI staleness banners.
+func ReviewOpsStatus(mig *migration.Migration) corebridge.ReviewOpsResponse {
+	if mig == nil {
+		return corebridge.ReviewOpsResponse{}
+	}
+	return corebridge.ReviewOpsResponse{
+		BulkMutationInProgress: mig.BulkMutationInProgress(),
+	}
 }
 
 // commonQueueState fills the state fields shared by traversal and copy queues.
@@ -361,11 +422,17 @@ func commonQueueState(m *corebridge.ExternalQueueMetrics, name string, q map[str
 }
 
 func traversalQueueMetrics(name string, q map[string]any) *corebridge.ExternalQueueMetrics {
+	itemsPerSec := convert.ToNumber[float64](q["items_per_second"])
+	if itemsPerSec == 0 {
+		itemsPerSec = convert.ToNumber[float64](q["discovery_rate_items_per_sec"])
+	}
 	m := &corebridge.ExternalQueueMetrics{
 		FilesDiscoveredTotal:     convert.ToNumber[int64](q["files_discovered_total"]),
 		FoldersDiscoveredTotal:   convert.ToNumber[int64](q["folders_discovered_total"]),
 		DiscoveryRateItemsPerSec: convert.ToNumber[float64](q["discovery_rate_items_per_sec"]),
 		TotalDiscovered:          convert.ToNumber[int64](q["total_discovered"]),
+		ItemsPerSecond:           itemsPerSec,
+		BytesPerSecond:           convert.ToNumber[float64](q["bytes_per_second"]),
 	}
 	commonQueueState(m, name, q)
 	return m
@@ -373,24 +440,33 @@ func traversalQueueMetrics(name string, q map[string]any) *corebridge.ExternalQu
 
 func phaseQueueMetrics(name string, q map[string]any) *corebridge.ExternalQueueMetrics {
 	m := &corebridge.ExternalQueueMetrics{
-		Folders:              convert.ToNumber[int64](q["folders"]),
-		Files:                convert.ToNumber[int64](q["files"]),
-		Total:                convert.ToNumber[int64](q["total"]),
-		Bytes:                convert.ToNumber[int64](q["bytes"]),
-		ItemsPerSecond:       convert.ToNumber[float64](q["items_per_second"]),
-		BytesPerSecond:       convert.ToNumber[float64](q["bytes_per_second"]),
-		FoldersExpected:      convert.ToNumber[int64](q["folders_expected"]),
-		FilesExpected:        convert.ToNumber[int64](q["files_expected"]),
-		TotalExpected:        convert.ToNumber[int64](q["total_expected"]),
-		ItemsCompleted:       convert.ToNumber[int64](q["items_completed"]),
-		ItemsTotal:           convert.ToNumber[int64](q["items_total"]),
-		ItemsProgressPercent: convert.ToNumber[float64](q["items_progress_percent"]),
-		ItemsFailedPercent:   convert.ToNumber[float64](q["items_failed_percent"]),
-		BytesTotal:           convert.ToNumber[int64](q["bytes_total"]),
-		BytesFailed:          convert.ToNumber[int64](q["bytes_failed"]),
-		BytesProgressPercent: convert.ToNumber[float64](q["bytes_progress_percent"]),
-		BytesFailedPercent:   convert.ToNumber[float64](q["bytes_failed_percent"]),
-		ProgressPercent:      convert.ToNumber[float64](q["progress_percent"]),
+		Folders:                   convert.ToNumber[int64](q["folders"]),
+		Files:                     convert.ToNumber[int64](q["files"]),
+		Total:                     convert.ToNumber[int64](q["total"]),
+		Bytes:                     convert.ToNumber[int64](q["bytes"]),
+		ItemsPerSecond:            convert.ToNumber[float64](q["items_per_second"]),
+		BytesPerSecond:            convert.ToNumber[float64](q["bytes_per_second"]),
+		FoldersAlreadyExists:      convert.ToNumber[int64](q["folders_already_exists"]),
+		FilesAlreadyExists:        convert.ToNumber[int64](q["files_already_exists"]),
+		BytesAlreadyExists:        convert.ToNumber[int64](q["bytes_already_exists"]),
+		FoldersFailed:             convert.ToNumber[int64](q["folders_failed"]),
+		FilesFailed:               convert.ToNumber[int64](q["files_failed"]),
+		FoldersExpected:           convert.ToNumber[int64](q["folders_expected"]),
+		FilesExpected:             convert.ToNumber[int64](q["files_expected"]),
+		TotalExpected:             convert.ToNumber[int64](q["total_expected"]),
+		ItemsCompleted:            convert.ToNumber[int64](q["items_completed"]),
+		ItemsTotal:                convert.ToNumber[int64](q["items_total"]),
+		ItemsProgressPercent:      convert.ToNumber[float64](q["items_progress_percent"]),
+		ItemsOkPercent:            convert.ToNumber[float64](q["items_ok_percent"]),
+		ItemsAlreadyExistsPercent: convert.ToNumber[float64](q["items_already_exists_percent"]),
+		ItemsFailedPercent:        convert.ToNumber[float64](q["items_failed_percent"]),
+		BytesTotal:                convert.ToNumber[int64](q["bytes_total"]),
+		BytesFailed:               convert.ToNumber[int64](q["bytes_failed"]),
+		BytesProgressPercent:      convert.ToNumber[float64](q["bytes_progress_percent"]),
+		BytesOkPercent:            convert.ToNumber[float64](q["bytes_ok_percent"]),
+		BytesAlreadyExistsPercent: convert.ToNumber[float64](q["bytes_already_exists_percent"]),
+		BytesFailedPercent:        convert.ToNumber[float64](q["bytes_failed_percent"]),
+		ProgressPercent:           convert.ToNumber[float64](q["progress_percent"]),
 	}
 	commonQueueState(m, name, q)
 	m.EtaBasis = convert.ToString(q["eta_basis"])
@@ -422,11 +498,40 @@ func QueueMetricsFromMigration(mig *migration.Migration) (*corebridge.QueueMetri
 	}
 	if q, ok := metrics.Queues["delete"]; ok {
 		resp.Delete = phaseQueueMetrics("delete", q)
-	} else if q, ok := metrics.Queues["delete-traversal"]; ok {
-		// Legacy key from before delete queue used its own stats key.
-		resp.Delete = phaseQueueMetrics("delete", q)
+	}
+	if fold := sizeFoldMetrics(mig); fold != nil {
+		resp.SizeFold = fold
 	}
 	return resp, nil
+}
+
+func sizeFoldMetrics(mig *migration.Migration) *corebridge.ExternalQueueMetrics {
+	if mig == nil || mig.DB == nil {
+		return nil
+	}
+	phase := ""
+	switch mig.Phase() {
+	case migration.PhaseTraversalFinalizing, migration.PhaseTraversalFinalizeFailed:
+		phase = "trav"
+	case migration.PhaseCopyFinalizing, migration.PhaseCopyFinalizeFailed:
+		phase = "copy"
+	default:
+		return nil
+	}
+	raw, err := stats.GetLatestQueueStats(mig.DB, "size-fold", phase)
+	if err != nil || len(raw) == 0 {
+		return nil
+	}
+	var q map[string]any
+	if err := json.Unmarshal(raw, &q); err != nil {
+		return nil
+	}
+	m := phaseQueueMetrics("size-fold", q)
+	m.ItemsPerSecond = convert.ToNumber[float64](q["folders_per_sec"])
+	if m.ItemsPerSecond == 0 {
+		m.ItemsPerSecond = convert.ToNumber[float64](q["items_per_second"])
+	}
+	return m
 }
 
 // GetLogsFromMigration calls the engine and converts to API response.
@@ -485,11 +590,11 @@ func mergePathReviewResults(a, b migration.PathReviewActionResult) migration.Pat
 	return out
 }
 
-// isCopyPhaseFamily is true when exclusion must be blocked (copy or delete phase families).
-func isCopyPhaseFamily(phase string) bool {
+// excludeOperationsLocked is true while copy/delete workers are running; review-phase exclude is allowed.
+func excludeOperationsLocked(phase string) bool {
 	switch phase {
-	case migration.PhaseCopying, migration.PhaseCopySuspended, migration.PhaseCopyReview,
-		migration.PhaseDeleting, migration.PhaseDeleteSuspended, migration.PhaseDeleteReview:
+	case migration.PhaseCopying, migration.PhaseCopySuspended,
+		migration.PhaseDeleting, migration.PhaseDeleteSuspended:
 		return true
 	default:
 		return false
@@ -503,11 +608,11 @@ func SetNodesExcluded(mig *migration.Migration, req corebridge.ExclusionRequest,
 	if mig == nil {
 		return exclusionFromOutcome(nilMigrationOutcome()), nil
 	}
-	if isCopyPhaseFamily(mig.Phase()) {
+	if excludeOperationsLocked(mig.Phase()) {
 		resp, err := exclusionFromOutcome(pathReviewOutcome{
-			errMsg: "exclusion operations are not available in copy phase (exclusion only applies to traversal)",
+			errMsg: "exclusion operations are not available while copy or delete is in progress",
 			deltas: emptyDeltas(),
-		}), fmt.Errorf("exclusion operations are locked in copy phase")
+		}), fmt.Errorf("exclusion operations are locked during active copy or delete")
 		return resp, err
 	}
 	if req.All {
@@ -527,15 +632,64 @@ func SetNodesExcluded(mig *migration.Migration, req corebridge.ExclusionRequest,
 		resp := exclusionFromOutcome(outcomeFromSingle(res, err))
 		return resp, err
 	}
-	merged, err := runPathReviewBatch(req.NodeIDs, func(nodeID string) (migration.PathReviewActionResult, error) {
+	merged, items, err := runPathReviewBatch(req.NodeIDs, func(nodeID string) (migration.PathReviewActionResult, error) {
 		// Exclude/unexclude is SRC-only; a second DST call would re-mutate the same SRC id.
 		return mig.SetNodeExcludedWithPropagation("SRC", nodeID, excluded)
-	})
-	resp := exclusionFromOutcome(outcomeFromBatch(merged, err, true))
-	return resp, err
+	}, excludeNoopReason(excluded))
+	if err != nil {
+		return exclusionFromOutcome(outcomeFromSingle(migration.PathReviewActionResult{}, err)), err
+	}
+	resp := exclusionFromOutcome(outcomeFromItems(merged, items))
+	return resp, nil
+}
+
+func excludeNoopReason(excluded bool) string {
+	if excluded {
+		return "already excluded or not pending"
+	}
+	return "already included"
 }
 
 func ptrBool(v bool) *bool { return &v }
+
+// ExcludeBySearch applies path-review search criteria as a bulk exclusion over
+// discovered SRC nodes. Flat conditions and optional ruleset are ANDed the same
+// way as POST .../search.
+func ExcludeBySearch(mig *migration.Migration, req corebridge.SearchRequest, except []string) (*corebridge.ExclusionResponse, error) {
+	if mig == nil {
+		return exclusionFromOutcome(nilMigrationOutcome()), nil
+	}
+	if excludeOperationsLocked(mig.Phase()) {
+		resp, err := exclusionFromOutcome(pathReviewOutcome{
+			errMsg: "exclusion operations are not available while copy or delete is in progress",
+			deltas: emptyDeltas(),
+		}), fmt.Errorf("exclusion operations are locked during active copy or delete")
+		return resp, err
+	}
+	appID := uuid.New().String()
+	engineReq := engineSearchRequest(req, 0, 0)
+	res, err := mig.ApplySearchExclusion(engineReq, except, appID)
+	resp := exclusionFromOutcome(outcomeFromSingle(res, err))
+	return resp, err
+}
+
+// UnexcludeBySearch restores pending for excluded SRC nodes matching search criteria.
+func UnexcludeBySearch(mig *migration.Migration, req corebridge.SearchRequest, except []string) (*corebridge.ExclusionResponse, error) {
+	if mig == nil {
+		return exclusionFromOutcome(nilMigrationOutcome()), nil
+	}
+	if excludeOperationsLocked(mig.Phase()) {
+		resp, err := exclusionFromOutcome(pathReviewOutcome{
+			errMsg: "exclusion operations are not available while copy or delete is in progress",
+			deltas: emptyDeltas(),
+		}), fmt.Errorf("exclusion operations are locked during active copy or delete")
+		return resp, err
+	}
+	engineReq := engineSearchRequest(req, 0, 0)
+	res, err := mig.ApplySearchUnexclusion(engineReq, except)
+	resp := exclusionFromOutcome(outcomeFromSingle(res, err))
+	return resp, err
+}
 
 // MarkNodesForRetry calls the engine for discovery or copy retry marking.
 // Caller should call MarkPathReviewChanges after success.
@@ -543,11 +697,32 @@ func MarkNodesForRetry(mig *migration.Migration, kind RetryKind, req corebridge.
 	if mig == nil {
 		return markRetryFromOutcome(nilMigrationOutcome()), nil
 	}
-	merged, err := runPathReviewBatch(req.NodeIDs, func(nodeID string) (migration.PathReviewActionResult, error) {
+	if req.MarkAsFailed {
+		return UnmarkNodesForRetry(mig, kind, req)
+	}
+	merged, items, err := runPathReviewBatch(req.NodeIDs, func(nodeID string) (migration.PathReviewActionResult, error) {
 		return retryNode(mig, kind, nodeID, true)
-	})
-	resp := markRetryFromOutcome(outcomeFromBatch(merged, err, true))
-	return resp, err
+	}, "not eligible for retry")
+	if err != nil {
+		return markRetryFromOutcome(outcomeFromSingle(migration.PathReviewActionResult{}, err)), err
+	}
+	resp := markRetryFromOutcome(outcomeFromItems(merged, items))
+	return resp, nil
+}
+
+// UnmarkNodesForRetry clears retry (marks failed) for many nodes.
+func UnmarkNodesForRetry(mig *migration.Migration, kind RetryKind, req corebridge.MarkRetryRequest) (*corebridge.MarkRetryResponse, error) {
+	if mig == nil {
+		return markRetryFromOutcome(nilMigrationOutcome()), nil
+	}
+	merged, items, err := runPathReviewBatch(req.NodeIDs, func(nodeID string) (migration.PathReviewActionResult, error) {
+		return retryNode(mig, kind, nodeID, false)
+	}, "not eligible to mark failed")
+	if err != nil {
+		return markRetryFromOutcome(outcomeFromSingle(migration.PathReviewActionResult{}, err)), err
+	}
+	resp := markRetryFromOutcome(outcomeFromItems(merged, items))
+	return resp, nil
 }
 
 // UnmarkNodeForRetry calls the engine for discovery or copy retry unmarking.

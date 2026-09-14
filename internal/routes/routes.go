@@ -18,8 +18,10 @@ import (
 	middlewarepkg "codeberg.org/Sylos/Sylos-API/internal/routes/middleware"
 	migrationroutes "codeberg.org/Sylos/Sylos-API/internal/routes/migrations"
 	oauthappsroutes "codeberg.org/Sylos/Sylos-API/internal/routes/oauthapps"
+	performanceroutes "codeberg.org/Sylos/Sylos-API/internal/routes/performance"
 	preferencesroutes "codeberg.org/Sylos/Sylos-API/internal/routes/preferences"
 	providerroutes "codeberg.org/Sylos/Sylos-API/internal/routes/providers"
+	rulesetsroutes "codeberg.org/Sylos/Sylos-API/internal/routes/rulesets"
 	scalingroutes "codeberg.org/Sylos/Sylos-API/internal/routes/scaling"
 	serviceroutes "codeberg.org/Sylos/Sylos-API/internal/routes/services"
 	setuproutes "codeberg.org/Sylos/Sylos-API/internal/routes/setup"
@@ -69,8 +71,10 @@ func New(deps Dependencies) chi.Router {
 	providerroutes.Register(apiRouter, deps.Logger, deps.Manager, mw)
 	oauthappsroutes.Register(apiRouter, deps.Logger, deps.Manager, mw)
 	adminroutes.Register(apiRouter, deps.Logger, deps.Manager, mw)
-	migrationroutes.Register(apiRouter, deps.Logger, deps.Manager, mw)
+	migrationroutes.RegisterWithUsers(apiRouter, deps.Logger, deps.Manager, deps.UserStore, mw)
+	rulesetsroutes.Register(apiRouter, deps.Logger, deps.Manager, mw)
 	scalingroutes.Register(apiRouter, deps.Logger, deps.Manager, mw)
+	performanceroutes.Register(apiRouter, deps.Logger, deps.Manager, mw)
 	preferencesroutes.Register(apiRouter, deps.Logger, deps.UserStore, mw)
 
 	router.Mount("/api", apiRouter)

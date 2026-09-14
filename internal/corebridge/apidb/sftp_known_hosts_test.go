@@ -1,8 +1,6 @@
 package apidb
 
 import (
-	"os"
-	"path/filepath"
 	"testing"
 )
 
@@ -32,19 +30,6 @@ func TestSFTPKnownHostRoundTrip(t *testing.T) {
 		t.Fatalf("row=%+v", row)
 	}
 
-	legacy := filepath.Join(dir, "sftp-known-hosts.json")
-	if err := os.WriteFile(legacy, []byte(`{"hosts":{"other.com:22":{"hostKey":"xyz","fingerprint":"SHA256:o"}}}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.ImportLegacySFTPKnownHostsFile(dir); err != nil {
-		t.Fatal(err)
-	}
-	if _, ok, err := db.LookupSFTPKnownHost("other.com", 22); err != nil || !ok {
-		t.Fatalf("legacy import ok=%v err=%v", ok, err)
-	}
-	if _, err := os.Stat(legacy); !os.IsNotExist(err) {
-		t.Fatalf("legacy file should be removed, err=%v", err)
-	}
 	if err := db.DeleteAllSFTPKnownHosts(); err != nil {
 		t.Fatal(err)
 	}

@@ -59,6 +59,14 @@ func (m *Manager) ListDrives(ctx context.Context, serviceID string) ([]corebridg
 	return m.serviceMgr.FS.ListDrives(ctx, serviceID)
 }
 
+func (m *Manager) GetHomeFolder(ctx context.Context, serviceID string) (corebridge.FolderDescriptor, error) {
+	folder, err := m.serviceMgr.FS.GetHomeFolder(ctx, serviceID)
+	if err != nil {
+		return corebridge.FolderDescriptor{}, err
+	}
+	return folderDescriptorFromFS(folder), nil
+}
+
 func (m *Manager) GetStorageInfo(ctx context.Context, req corebridge.GetStorageInfoRequest) (corebridge.StorageInfo, error) {
 	return m.serviceMgr.GetStorageInfo(ctx, req)
 }
