@@ -38,6 +38,8 @@ func RegisterWithUsers(router chi.Router, logger zerolog.Logger, mgr *manager.Ma
 	router.Post("/migrations/{migrationID}/retry-finalize", middleware.JSON(mw, h.retryFinalize))
 	router.Post("/migrations/log-terminal", middleware.JSON(mw, h.toggleLogTerminal))
 	router.Post("/migrations/{migrationID}/upload", middleware.MultipartForm(mw, h.uploadUnified))
+	router.Post("/migrations/db/upload", middleware.MultipartForm(mw, h.uploadDB))
+	router.Get("/migrations/{migrationID}/export", middleware.NoBody(mw, h.exportOps))
 	router.Get("/migrations/db/list", middleware.NoBody(mw, h.listDBs))
 	router.Get("/migrations", middleware.NoBody(mw, h.list))
 	router.Post("/migrations/{migrationID}/load", middleware.NoBody(mw, h.load))

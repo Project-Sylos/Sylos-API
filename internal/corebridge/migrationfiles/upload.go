@@ -18,6 +18,7 @@ const (
 	UploadTypeZip  = "zip"
 	UploadTypeDB   = "db"
 	UploadTypeYAML = "yaml"
+	UploadTypeOps  = "ops"
 )
 
 // UploadMigrationDBResponse represents the response from uploading migration data
@@ -35,7 +36,7 @@ type MigrationDBInfo struct {
 	ModifiedAt time.Time `json:"modifiedAt"`
 }
 
-// UploadByType uploads migration data based on the given type (zip, db, or yaml)
+// UploadByType uploads migration data based on the given type (zip, db, yaml, or ops).
 func UploadByType(ctx context.Context, logger zerolog.Logger, dataDir, migrationID, uploadType string, data []byte, overwrite bool) (UploadMigrationDBResponse, error) {
 	switch uploadType {
 	case UploadTypeZip:
@@ -44,10 +45,12 @@ func UploadByType(ctx context.Context, logger zerolog.Logger, dataDir, migration
 		return UploadMigrationDB(ctx, logger, dataDir, migrationID, data, overwrite)
 	case UploadTypeYAML:
 		return UploadMigrationYAML(ctx, logger, dataDir, migrationID, data, overwrite)
+	case UploadTypeOps:
+		return UploadMigrationOps(ctx, logger, dataDir, migrationID, data, overwrite)
 	default:
 		return UploadMigrationDBResponse{
 			Success: false,
-			Error:   fmt.Sprintf("invalid upload type %q: must be zip, db, or yaml", uploadType),
+			Error:   fmt.Sprintf("invalid upload type %q: must be zip, db, yaml, or ops", uploadType),
 		}, nil
 	}
 }

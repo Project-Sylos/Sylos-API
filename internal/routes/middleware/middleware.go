@@ -108,6 +108,17 @@ func (c *Context) Request() *http.Request {
 	return c.r
 }
 
+// Writer returns the underlying response writer. Call MarkWritten after sending a non-JSON body.
+func (c *Context) Writer() http.ResponseWriter {
+	return c.w
+}
+
+// MarkWritten records that the handler already wrote the HTTP response.
+func (c *Context) MarkWritten(status int) {
+	c.status = status
+	c.wrote = true
+}
+
 // Response writes a JSON response with the provided status code and payload.
 func (c *Context) Response(status int, payload any) {
 	if c.wrote {

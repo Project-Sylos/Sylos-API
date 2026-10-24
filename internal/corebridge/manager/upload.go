@@ -13,8 +13,13 @@ func (m *Manager) UploadByType(ctx context.Context, migrationID, uploadType stri
 	if err != nil {
 		return corebridge.UploadMigrationDBResponse{}, err
 	}
-	if resp.Success && uploadType == migrationfiles.UploadTypeDB && resp.Path != "" {
-		m.persistUploadedDBMetadata(migrationID, resp.Path)
+	if resp.Success && resp.Path != "" &&
+		(uploadType == migrationfiles.UploadTypeDB || uploadType == migrationfiles.UploadTypeOps) {
+		id := migrationID
+		if uploadType == migrationfiles.UploadTypeOps {
+			id = migrationfiles.NormalizeMigrationID(migrationID)
+		}
+		m.persistUploadedDBMetadata(id, resp.Path)
 	}
 	return corebridge.UploadMigrationDBResponse{
 		Success: resp.Success,
