@@ -103,6 +103,36 @@ func (h handler) handleBulkRetry(ctx *middleware.Context, payload corebridge.Mar
 	ctx.Response(http.StatusOK, result)
 }
 
+func (h handler) handleForceReplaceCopy(ctx *middleware.Context, mark bool) {
+	migrationID, unescapedNodeID, ok := h.loadMigrationNode(ctx)
+	if !ok {
+		return
+	}
+
+	mig, err := h.mgr.GetMigration(ctx.Request().Context(), migrationID)
+	if err != nil {
+		h.writeMigrationLoadError(ctx, err)
+		return
+	}
+
+	result, err := migrationops.ForceReplaceCopy(mig, unescapedNodeID, mark)
+	if err != nil {
+		if writeReviewOpBusy(ctx, err) {
+			return
+		}
+		label := "Failed to undo force-replace"
+		if mark {
+			label = "Failed to force-replace with source"
+		}
+		ctx.Error(http.StatusInternalServerError, label, err)
+		return
+	}
+	if result != nil && result.Success {
+		_ = h.mgr.MarkPathReviewChanges(ctx.Request().Context(), migrationID, true)
+	}
+	ctx.Response(http.StatusOK, result)
+}
+
 func (h handler) handleMarkNodeForRetry(ctx *middleware.Context, kind migrationops.RetryKind) {
 	migrationID, unescapedNodeID, ok := h.loadMigrationNode(ctx)
 	if !ok {

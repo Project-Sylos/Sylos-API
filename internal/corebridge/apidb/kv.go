@@ -3,7 +3,6 @@ package apidb
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
 
 	badger "github.com/dgraph-io/badger/v4"
 )
@@ -128,10 +127,6 @@ func getBytes(txn *badger.Txn, key []byte) ([]byte, error) {
 	return item.ValueCopy(nil)
 }
 
-func putBytes(txn *badger.Txn, key []byte, val []byte) error {
-	return txn.Set(key, val)
-}
-
 func lookupID(txn *badger.Txn, indexKey []byte) (string, error) {
 	idBytes, err := getBytes(txn, indexKey)
 	if err != nil {
@@ -165,14 +160,4 @@ func initSchema(txn *badger.Txn) error {
 		return err
 	}
 	return txn.Set([]byte(keyMetaSchemaVer), raw)
-}
-
-func scanErrWrap(op string, err error) error {
-	if err == nil {
-		return nil
-	}
-	if errors.Is(err, ErrNotFound) {
-		return err
-	}
-	return fmt.Errorf("%s: %w", op, err)
 }

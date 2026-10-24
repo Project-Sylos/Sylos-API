@@ -78,6 +78,12 @@ func RegisterWithUsers(router chi.Router, logger zerolog.Logger, mgr *manager.Ma
 	router.Post("/migrations/{migrationID}/node/{nodeID}/unmark-retry-delete", middleware.NoBody(mw, func(ctx *middleware.Context) {
 		h.handleUnmarkNodeForRetry(ctx, migrationops.RetryKindDelete)
 	}))
+	router.Post("/migrations/{migrationID}/node/{nodeID}/force-replace-copy", middleware.NoBody(mw, func(ctx *middleware.Context) {
+		h.handleForceReplaceCopy(ctx, true)
+	}))
+	router.Post("/migrations/{migrationID}/node/{nodeID}/unforce-replace-copy", middleware.NoBody(mw, func(ctx *middleware.Context) {
+		h.handleForceReplaceCopy(ctx, false)
+	}))
 	router.Post("/migrations/{migrationID}/prepare-source-cleanup", middleware.JSON(mw, h.prepareSourceCleanup))
 	router.Post("/migrations/{migrationID}/node/{nodeID}/skip-delete", middleware.NoBody(mw, h.handleSkipNodeDelete))
 	router.Post("/migrations/{migrationID}/node/{nodeID}/unskip-delete", middleware.NoBody(mw, h.handleUnskipNodeDelete))

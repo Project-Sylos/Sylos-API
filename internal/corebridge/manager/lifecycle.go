@@ -448,6 +448,9 @@ func (m *Manager) GetMigrationStatus(ctx context.Context, id string) (corebridge
 		StopProgress:            mapStopProgress(mig.GetStopProgress()),
 		DbActivity:              dbActivity,
 	}
+	// A full status read already paid for opening this migration; remember
+	// phase + roots so list views never have to open the ops DB themselves.
+	m.persistMigrationListHints(id, st.Status, sourceRoot, destinationRoot)
 	return st, nil
 }
 

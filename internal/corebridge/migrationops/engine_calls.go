@@ -201,19 +201,22 @@ func diffItemToPathNodes(item migration.DiffItem) corebridge.PathNodes {
 	}
 	if !item.MissingOnSource {
 		pathNodes.Src = &corebridge.PathNodeItem{
-			Queue:           "SRC",
-			Id:              item.SrcNodeID,
-			Name:            item.Name,
-			LocationPath:    item.Path,
-			DisplayPath:     displayPath,
-			DepthLevel:      item.Depth,
-			Type:            item.Type,
-			Size:            item.Size,
-			TraversalStatus: item.SrcTraversalStatus,
-			CopyStatus:      item.CopyStatus,
-			DeleteStatus:    item.DeleteStatus,
-			FailureLogID:    item.SrcFailureLogID,
-			FailureMessage:  item.SrcFailureMessage,
+			Queue:                  "SRC",
+			Id:                     item.SrcNodeID,
+			Name:                   item.Name,
+			LocationPath:           item.Path,
+			DisplayPath:            displayPath,
+			DepthLevel:             item.Depth,
+			Type:                   item.Type,
+			Size:                   item.Size,
+			TraversalStatus:        item.SrcTraversalStatus,
+			CopyStatus:             item.CopyStatus,
+			DeleteStatus:           item.DeleteStatus,
+			CopyRetryMarked:        item.CopyRetryMarked,
+			CopyExcludedFromFailed: item.CopyExcludedFromFailed,
+			CopyForceReplaceMarked: item.CopyForceReplaceMarked,
+			FailureLogID:           item.SrcFailureLogID,
+			FailureMessage:         item.SrcFailureMessage,
 		}
 	}
 	if !item.MissingOnDest {
@@ -746,6 +749,16 @@ func retryNode(mig *migration.Migration, kind RetryKind, nodeID string, mark boo
 		engineKind = migration.RetryMutationDelete
 	}
 	return mig.SetNodeRetryMark(engineKind, nodeID, mark)
+}
+
+// ForceReplaceCopy prefers source for exists-on-both (already_existed → pending).
+func ForceReplaceCopy(mig *migration.Migration, nodeID string, mark bool) (*corebridge.MarkRetryResponse, error) {
+	if mig == nil {
+		return markRetryFromOutcome(nilMigrationOutcome()), nil
+	}
+	res, err := mig.SetNodeCopyForceReplace(nodeID, mark)
+	resp := markRetryFromOutcome(outcomeFromSingle(res, err))
+	return resp, err
 }
 
 // PrepareSourceCleanup aligns delete_status with selected SRC nodes before source removal.

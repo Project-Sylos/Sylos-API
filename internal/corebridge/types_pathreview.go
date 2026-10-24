@@ -37,17 +37,25 @@ type PathNodeItem struct {
 	Name         string `json:"name"`
 	LocationPath string `json:"locationPath"`
 	// DisplayPath is the friendly name path for UI; LocationPath remains id_path for tree nav.
-	DisplayPath     string         `json:"displayPath,omitempty"`
-	LastUpdated     string         `json:"lastUpdated,omitempty"`
-	DepthLevel      int            `json:"depthLevel"`
-	Type            string         `json:"type"`
-	Size            int64          `json:"size,omitempty"` // file bytes, or folder identity child size
-	TraversalStatus string         `json:"traversalStatus"`
-	CopyStatus      string         `json:"copyStatus,omitempty"`
-	DeleteStatus    string         `json:"deleteStatus,omitempty"` // pending_explicit, pending_inherited, skipped, deleted, failed
-	FailureLogID    string         `json:"failureLogId,omitempty"`
-	FailureMessage  string         `json:"failureMessage,omitempty"`
-	RuleExclusion   *RuleExclusion `json:"ruleExclusion,omitempty"`
+	DisplayPath     string `json:"displayPath,omitempty"`
+	LastUpdated     string `json:"lastUpdated,omitempty"`
+	DepthLevel      int    `json:"depthLevel"`
+	Type            string `json:"type"`
+	Size            int64  `json:"size,omitempty"` // file bytes, or folder identity child size
+	TraversalStatus string `json:"traversalStatus"`
+	CopyStatus      string `json:"copyStatus,omitempty"`
+	DeleteStatus    string `json:"deleteStatus,omitempty"` // pending_explicit, pending_inherited, skipped, deleted, failed
+	// CopyRetryMarked reports a copy-pending node queued for retry from a
+	// previous copy failure (provenance only; renders as plain pending).
+	CopyRetryMarked bool `json:"copyRetryMarked,omitempty"`
+	// CopyExcludedFromFailed reports a copy-excluded node whose exclusion
+	// started from a retry-marked failure; unexcluding restores failed.
+	CopyExcludedFromFailed bool `json:"copyExcludedFromFailed,omitempty"`
+	// CopyForceReplaceMarked reports pending prefer-source overwrite from already_existed.
+	CopyForceReplaceMarked bool           `json:"copyForceReplaceMarked,omitempty"`
+	FailureLogID           string         `json:"failureLogId,omitempty"`
+	FailureMessage         string         `json:"failureMessage,omitempty"`
+	RuleExclusion          *RuleExclusion `json:"ruleExclusion,omitempty"`
 }
 
 // PathNodes represents the src and dst nodes for a given path
@@ -95,9 +103,9 @@ type ListChildrenDiffsResponse struct {
 
 // DiffsStatsResponse is returned by the separate diffs stats endpoint (total and folder/file counts for a path).
 type DiffsStatsResponse struct {
-	Total        int  `json:"total"`
-	TotalFolders int  `json:"totalFolders"`
-	TotalFiles   int  `json:"totalFiles"`
+	Total        int `json:"total"`
+	TotalFolders int `json:"totalFolders"`
+	TotalFiles   int `json:"totalFiles"`
 	// Truncated means Total is a lower bound (count stopped early, e.g. query deadline).
 	Truncated bool `json:"truncated,omitempty"`
 }

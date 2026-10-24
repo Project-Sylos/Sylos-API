@@ -65,7 +65,7 @@ func keySftpSavedEp(host string, port int, username string) []byte {
 	if port <= 0 {
 		port = 22
 	}
-	return []byte(fmt.Sprintf("%s%s:%d:%s", prefixSftpSavedEp, host, port, username))
+	return fmt.Appendf(nil, "%s%s:%d:%s", prefixSftpSavedEp, host, port, username)
 }
 
 func keyScale(scope, scopeKey, mode string) []byte {

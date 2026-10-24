@@ -87,6 +87,20 @@ func (d *DB) SetInstallConfig(key, value string) error {
 	})
 }
 
+// MigrationRootSnapshot is a slim root copy for list/sidebar glyphs without
+// opening the per-migration ops DB after restart.
+type MigrationRootSnapshot struct {
+	ServiceID    string `json:"serviceId,omitempty"`
+	ServiceName  string `json:"serviceName,omitempty"`
+	ServiceType  string `json:"serviceType,omitempty"`
+	ConnectionID string `json:"connectionId,omitempty"`
+	Name         string `json:"name,omitempty"`
+	LocationPath string `json:"locationPath,omitempty"`
+	NativePath   string `json:"nativePath,omitempty"`
+	Type         string `json:"type,omitempty"`
+	ParentID     string `json:"parentId,omitempty"`
+}
+
 // MigrationRecord mirrors metadata.MigrationMetadata for API DB storage.
 type MigrationRecord struct {
 	ID                   string    `json:"id"`
@@ -95,6 +109,12 @@ type MigrationRecord struct {
 	CreatedAt            time.Time `json:"createdAt"`
 	IsNewMigration       bool      `json:"isNewMigration"`
 	HasPathReviewChanges bool      `json:"hasPathReviewChanges"`
+	// Phase is the last lifecycle phase observed via a full status read.
+	// It lets migration lists render without opening the per-migration ops DB.
+	Phase string `json:"phase,omitempty"`
+	// SourceRoot / DestinationRoot feed sidebar route glyphs and labels for cold lists.
+	SourceRoot      *MigrationRootSnapshot `json:"sourceRoot,omitempty"`
+	DestinationRoot *MigrationRootSnapshot `json:"destinationRoot,omitempty"`
 }
 
 func (d *DB) UpsertMigration(rec MigrationRecord) error {

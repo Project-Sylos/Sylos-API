@@ -8,7 +8,6 @@ import (
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
-	"codeberg.org/Sylos/Sylos-API/internal/corebridge/apidb"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/roots"
 )
 
@@ -116,11 +115,18 @@ func (m *Manager) SetRoot(ctx context.Context, req corebridge.SetRootRequest) (c
 	} else if existingMeta.ID != "" && existingMeta.Name != "" {
 		recName = existingMeta.Name
 	}
-	rec := apidb.MigrationRecord{
-		ID:             resp.MigrationID,
-		Name:           recName,
-		DatabasePath:   resp.DatabasePath,
-		IsNewMigration: isNewMigration,
+	rec := existingMeta
+	rec.ID = resp.MigrationID
+	rec.Name = recName
+	rec.DatabasePath = resp.DatabasePath
+	rec.IsNewMigration = isNewMigration
+	if source, destination, ok := m.cachedMigrationRoots(resp.MigrationID); ok {
+		if source != nil {
+			rec.SourceRoot = rootSnapshot(source)
+		}
+		if destination != nil {
+			rec.DestinationRoot = rootSnapshot(destination)
+		}
 	}
 	if err := m.upsertMigrationRecord(rec); err != nil {
 		m.logger.Warn().Err(err).Str("migration_id", resp.MigrationID).Msg("failed to update migration metadata when setting root")
