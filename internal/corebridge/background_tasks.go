@@ -271,3 +271,14 @@ func (m *BackgroundTaskManager) CleanupCompletedTasks(olderThan time.Duration) {
 		}
 	}
 }
+
+// ClearMigration drops all background task records for one migration.
+func (m *BackgroundTaskManager) ClearMigration(migrationID string) {
+	if m == nil || migrationID == "" {
+		return
+	}
+	m.mu.Lock()
+	delete(m.tasks, migrationID)
+	m.mu.Unlock()
+}
+

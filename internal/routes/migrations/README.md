@@ -198,6 +198,22 @@ Poll `GET /migrations/{migrationID}` until `live` is false and phase is a `*-sus
 
 ---
 
+### Delete Migration
+
+Permanently delete one migration: force-stops if running, clears in-memory state, removes the registry row and encryption key, and deletes `dataDir/{migrationID}/`.
+
+**Endpoint:** `DELETE /migrations/{migrationID}`
+
+**Response (200 OK):**
+```json
+{
+  "id": "migration-…",
+  "message": "Migration deleted."
+}
+```
+
+---
+
 ### Force-Stop Migration
 
 Hard-kill a stuck soft stop (or any live traversal/copy/delete). Cancels the run context, abandons in-flight queue work, and sets phase to `aborted` (not resumable). Prefer soft stop unless the drain is stuck.

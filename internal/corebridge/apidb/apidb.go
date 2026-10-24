@@ -121,10 +121,16 @@ func (d *DB) UpsertMigration(rec MigrationRecord) error {
 	if rec.Name == "" {
 		rec.Name = rec.ID
 	}
-	if rec.CreatedAt.IsZero() {
-		rec.CreatedAt = time.Now().UTC()
-	}
 	return d.update(func(txn *badger.Txn) error {
+		var existing MigrationRecord
+		if err := getJSON(txn, keyMig(rec.ID), &existing); err == nil {
+			if rec.CreatedAt.IsZero() {
+				rec.CreatedAt = existing.CreatedAt
+			}
+		}
+		if rec.CreatedAt.IsZero() {
+			rec.CreatedAt = time.Now().UTC()
+		}
 		return putJSON(txn, keyMig(rec.ID), rec)
 	})
 }
@@ -162,6 +168,22 @@ func sortMigrationsByCreatedAtDesc(recs []MigrationRecord) {
 			}
 		}
 	}
+}
+
+// DeleteMigration removes one migration registry row and its encryption key.
+func (d *DB) DeleteMigration(id string) error {
+	if id == "" {
+		return fmt.Errorf("migration id required")
+	}
+	return d.update(func(txn *badger.Txn) error {
+		if err := txn.Delete(keyMig(id)); err != nil && err != badger.ErrKeyNotFound {
+			return fmt.Errorf("delete migration record: %w", err)
+		}
+		if err := txn.Delete(keyMigKey(id)); err != nil && err != badger.ErrKeyNotFound {
+			return fmt.Errorf("delete migration key: %w", err)
+		}
+		return nil
+	})
 }
 
 // DeleteAllMigrationRegistry removes migration registry rows and per-migration encryption keys.

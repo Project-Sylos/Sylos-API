@@ -554,6 +554,14 @@ func (m *Manager) ClearAdapters(migrationID string) {
 	}
 }
 
+// ClearPlan releases adapters and removes one in-memory root plan.
+func (m *Manager) ClearPlan(migrationID string) {
+	m.ClearAdapters(migrationID)
+	m.mu.Lock()
+	delete(m.plans, migrationID)
+	m.mu.Unlock()
+}
+
 // ClearAllPlans releases adapters and removes all in-memory root plans.
 func (m *Manager) ClearAllPlans() {
 	m.mu.Lock()

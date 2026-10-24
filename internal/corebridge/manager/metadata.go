@@ -89,6 +89,10 @@ func (m *Manager) ListAllMigrations(ctx context.Context, req corebridge.ListMigr
 
 		// Prefer a human-friendly registry name when status has none / only the ID.
 		status.Name = preferMigrationDisplayName(status.Name, rec.Name, rec.ID)
+		// Resume list "Created" uses StartedAt; keep registry creation time, not last-run start.
+		if !rec.CreatedAt.IsZero() {
+			status.StartedAt = rec.CreatedAt
+		}
 
 		statuses = append(statuses, status)
 	}

@@ -161,3 +161,42 @@ func TestListAllMigrationsColdRecordsIncludeRootSnapshots(t *testing.T) {
 		t.Fatalf("sourceID=%q destinationID=%q", got.SourceID, got.DestinationID)
 	}
 }
+
+func TestUpsertMigrationPreservesCreatedAt(t *testing.T) {
+	t.Parallel()
+
+	db, err := apidb.Open(t.TempDir(), testAPIKey(t))
+	if err != nil {
+		t.Fatalf("open api db: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	created := time.Date(2025, 6, 1, 12, 0, 0, 0, time.UTC)
+	if err := db.UpsertMigration(apidb.MigrationRecord{
+		ID:        "mig-ts",
+		Name:      "Stamp",
+		CreatedAt: created,
+		Phase:     "roots-set",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.UpsertMigration(apidb.MigrationRecord{
+		ID:    "mig-ts",
+		Name:  "Stamp",
+		Phase: "awaiting-copy-review",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	rec, err := db.GetMigration("mig-ts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rec.CreatedAt.Equal(created) {
+		t.Fatalf("CreatedAt=%v want preserved %v", rec.CreatedAt, created)
+	}
+	if rec.Phase != "awaiting-copy-review" {
+		t.Fatalf("phase=%q", rec.Phase)
+	}
+}
