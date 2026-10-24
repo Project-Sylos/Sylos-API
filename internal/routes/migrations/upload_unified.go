@@ -22,14 +22,16 @@ func (h handler) uploadUnified(ctx *middleware.Context) {
 	if uploadType == "" {
 		uploadType = migrationfiles.UploadTypeZip
 	}
-	if uploadType != migrationfiles.UploadTypeZip && uploadType != migrationfiles.UploadTypeDB && uploadType != migrationfiles.UploadTypeYAML {
-		ctx.Error(http.StatusBadRequest, "type must be zip, db, or yaml", nil)
+	switch uploadType {
+	case migrationfiles.UploadTypeZip, migrationfiles.UploadTypeDB, migrationfiles.UploadTypeYAML, migrationfiles.UploadTypeOps:
+	default:
+		ctx.Error(http.StatusBadRequest, "type must be zip, db, yaml, or ops", nil)
 		return
 	}
 
 	maxSize := int64(100 << 20) // 100MB for db/yaml
-	if uploadType == migrationfiles.UploadTypeZip {
-		maxSize = 500 << 20 // 500MB for zip
+	if uploadType == migrationfiles.UploadTypeZip || uploadType == migrationfiles.UploadTypeOps {
+		maxSize = 500 << 20 // 500MB for zip / ops
 	}
 	if err := ctx.Request().ParseMultipartForm(maxSize); err != nil {
 		ctx.Error(http.StatusBadRequest, "failed to parse multipart form", err)

@@ -397,17 +397,28 @@ eventSource.addEventListener('progress', (e) => {
 
 ## Database Management
 
+### Upload / import ops (Resume)
+
+**Endpoint:** `POST /migrations/db/upload`
+
+Import a Badger ops store from a zip (Sylos export or zipped folder). Copies into `dataDir/{id}/{id}.ops/` (never uses the source path in place). Validates schema version on open.
+
+**Form:** `file` (zip), `filename` (folder or `{id}.ops.zip`), optional `overwrite=true` (500MB).
+
+**Export:** `GET /migrations/{migrationID}/export` streams `{id}.ops.zip` (ops contents + `sylos-export.json`).
+
 ### Upload Migration Data
 
-Upload migration data (ZIP, DB, or YAML) to the server.
+Upload migration data (ZIP, DB, YAML, or ops) to the server.
 
-**Endpoint:** `POST /migrations/{migrationID}/upload?type=zip|db|yaml`
+**Endpoint:** `POST /migrations/{migrationID}/upload?type=zip|db|yaml|ops`
 
 **Query Parameters:**
 - `type` (optional, default: `zip`): Upload type:
   - `zip`: ZIP archive containing YAML + DB (and related files); extracts to `dataDir/{migrationID}/`
   - `db`: Raw `.db` file only
   - `yaml`: Raw `.yaml` config file only
+  - `ops`: Badger ops zip into `dataDir/{migrationID}/{migrationID}.ops/` (paths preserved)
 
 **Request:** Multipart form data
 - `file` (file, required): The file to upload
@@ -438,6 +449,10 @@ curl -X POST -F "file=@migration.db" -F "overwrite=false" \
 # Upload YAML only
 curl -X POST -F "file=@migration.yaml" -F "overwrite=false" \
   "http://localhost:8080/api/migrations/{migrationID}/upload?type=yaml"
+
+# Import ops zip (Resume path; filename derives id)
+curl -X POST -F "file=@abc.ops.zip" -F "filename=abc.ops.zip" \
+  "http://localhost:8080/api/migrations/db/upload"
 ```
 
 ---

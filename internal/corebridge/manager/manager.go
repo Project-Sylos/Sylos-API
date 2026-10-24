@@ -169,6 +169,14 @@ func (m *Manager) oauthProviderCredentials(providerID string) (oauthcreds.Provid
 	}
 }
 
+// DataDir returns the configured runtime data directory.
+func (m *Manager) DataDir() string {
+	if m == nil {
+		return ""
+	}
+	return m.cfg.Runtime.DataDir
+}
+
 // migrationDirFor returns the absolute path to the folder for the given migration (e.g. dataDir/{id}).
 func (m *Manager) migrationDirFor(migrationID string) (string, error) {
 	dir := filepath.Join(m.cfg.Runtime.DataDir, migrationID)
