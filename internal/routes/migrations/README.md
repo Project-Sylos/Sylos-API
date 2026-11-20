@@ -70,13 +70,54 @@ Set the source or destination root folder for a migration.
 - Returns `201 Created` when `ready: true` (both roots set)
 - Returns `200 OK` when only one root is set
 - Setting the source root creates a new migration if it doesn't exist
-- Optional `children` / `excludedIds` come from the root-pick review UI. They are held in memory (and `root_preparation.json` under the migration data dir) until **Start discovery**; DuckDB is not written at SetRoot time.
+- Optional `children` / `excludedIds` come from the root-pick review UI. They are held in memory (and `root_preparation.json` under the migration data dir) until **Start discovery**; the DB is not written at SetRoot time.
 - Source with children requires at least one non-excluded child. Destination children cannot set excludes. Off-path `excludedIds` (not in `children`) are ignored.
 - When Start runs `AddRoots`, prepared sides seed the root as traversal-successful plus depth-1 children and start queues at round 1; unprepared sides keep classic round 0.
 
 ---
 
 ## Migration Lifecycle
+
+### Filesystem health check
+
+Live probe of bound source/destination roots (list + create/delete permission test). Used by the UI before Start/Resume and enforced again by those hot paths if the last successful check is older than 10 minutes.
+
+**Endpoint:** `POST /migrations/{migrationID}/fs-health?side=src|dst|both`
+
+**Query:**
+- `side` (optional): `src`, `dst`, or `both` (default `both`)
+
+**Response (200 OK):**
+```json
+{
+  "ok": true,
+  "checkedAt": "2026-11-17T03:00:00Z",
+  "side": "both",
+  "source": {
+    "ok": true,
+    "serviceId": "local",
+    "serviceType": "local",
+    "rootId": "/data/src",
+    "classification": "ok",
+    "steps": {
+      "rehydrate": { "ok": true },
+      "listRoot": { "ok": true },
+      "createFolder": { "ok": true },
+      "createFile": { "ok": true },
+      "delete": { "ok": true }
+    }
+  },
+  "destination": { "ok": true }
+}
+```
+
+**Notes:**
+- Expected probe failures still return HTTP 200 with `ok: false` and per-step errors / classifications (`auth_failed`, `permission_denied`, `transient`, `access_failed`).
+- Successful checks stamp registry freshness (`lastFsHealthAt`, `lastFsHealthSides`). Failed checks do not refresh the stamp.
+- `POST /migrations`, `POST /migrations/{id}/resume`, phase-change, and retry-sweep call the same probe when freshness is missing/stale; resume/retry responses may include `fsHealth` when blocked.
+- Auth classification may set migration `needsAttention` (`credentials_invalid`) until quiet reauth.
+
+---
 
 ### List All Migrations
 
@@ -190,7 +231,7 @@ Request a soft stop for a live traversal, copy, or delete run. The API returns i
 - `stopProgress`: checklist (`steps`, `step`, `label`, `inProgress`, `mode`) for the UI popover
 - `live`: may still be true while draining
 
-Poll `GET /migrations/{migrationID}` until `live` is false and phase is a `*-suspended` (or `aborted` if the user force-stopped). Soft stop has no automatic timeout kill; use force-stop only when stuck.
+Poll `GET /migrations/{migrationID}` until `live` is false and phase is a `*-suspended`. Soft stop has no automatic timeout kill; use force-stop only when stuck (still Resume-eligible via recovery).
 
 **Error Responses:**
 - `404 Not Found`: Migration not found
@@ -216,13 +257,15 @@ Permanently delete one migration: force-stops if running, clears in-memory state
 
 ### Force-Stop Migration
 
-Hard-kill a stuck soft stop (or any live traversal/copy/delete). Cancels the run context, abandons in-flight queue work, and sets phase to `aborted` (not resumable). Prefer soft stop unless the drain is stuck.
+Hard-kill a stuck soft stop (or any live traversal/copy/delete). Cancels the run context and abandons in-flight queue work **without** a soft-stop checkpoint. **Not recommended** unless soft stop is stuck.
+
+The migration is left in the matching `*-suspended` phase with an unclean-interrupt flag so **Resume remains available**. Resume runs a recovery sweep (may re-check or redo some work; copy may HashVerify name-matched files). Prefer soft stop for a clean cursor resume.
 
 **Endpoint:** `POST /migrations/{migrationID}/force-stop`
 
 **Request:** No body required
 
-**Response (200 OK):** Status with `status` / phase `aborted` and `stopProgress` reflecting the force path.
+**Response (200 OK):** Status with suspended phase (or legacy `aborted` healed on resume/startup) and `stopProgress` reflecting the force path.
 
 **Error Responses:**
 - `404 Not Found`: Migration not found
@@ -499,7 +542,7 @@ List all available migration database files.
 
 ### Get Migration Logs
 
-Retrieve the latest logs from a migration. Logs are read from a separate log database file derived from the migration DB path (e.g. `migration.db` → `migration_logs.db`); the main migration DB no longer stores logs.
+Retrieve the latest logs from a migration. Logs live in the per-migration Badger sidecar `{id}.logs/` (not the ops store).
 
 **Endpoint:** `POST /migrations/{migrationID}/logs`
 

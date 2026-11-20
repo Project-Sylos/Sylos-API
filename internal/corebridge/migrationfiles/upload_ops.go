@@ -55,7 +55,7 @@ func UploadMigrationOps(ctx context.Context, logger zerolog.Logger, dataDir, mig
 		}, nil
 	}
 
-	migrationDir := filepath.Join(dataDir, migrationID)
+	migrationDir := MigrationDir(dataDir, migrationID)
 	opsDir := filepath.Join(migrationDir, migrationID+".ops")
 	dbPath := filepath.Join(migrationDir, migrationID+".db")
 

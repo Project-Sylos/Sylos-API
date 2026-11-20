@@ -12,6 +12,7 @@ import (
 	"codeberg.org/Sylos/Migration-Engine/pkg/convert"
 	"codeberg.org/Sylos/Migration-Engine/pkg/db/stats"
 	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
+	"codeberg.org/Sylos/Migration-Engine/pkg/opsdb"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
 	"github.com/google/uuid"
 )
@@ -24,12 +25,14 @@ func ApplyDisableQueryTimeout(mig *migration.Migration, disable bool) {
 	mig.DB.SetDisableQueryTimeout(disable)
 }
 
-// ErrSearchRequiresFilter is returned when search/count is called with no narrowing predicates.
+// ErrSearchRequiresFilter is retained for API compatibility with older clients.
+// List search allows empty filters; bulk exclude/unexclude still require a predicate.
 var ErrSearchRequiresFilter = errors.New("search requires at least one filter")
 
 // SearchRequestHasFilter reports whether req carries any narrowing search predicate.
 // Mirrors Migration-Engine ReviewFilterHasSearchPredicate after condition mapping:
 // statusSearchType / sort alone do not count; IncludeDestinationOnly=false does.
+// Bulk exclude/unexclude always require a real predicate via this check.
 func SearchRequestHasFilter(req corebridge.SearchRequest) bool {
 	if under := strings.TrimSpace(req.UnderPath); under != "" && under != "/" {
 		return true
@@ -189,6 +192,7 @@ func searchListResponse(result migration.SearchResult) corebridge.ListChildrenDi
 func diffItemToPathNodes(item migration.DiffItem) corebridge.PathNodes {
 	pathNodes := corebridge.PathNodes{
 		ResolvedDstName: strings.TrimSpace(item.ResolvedDstName),
+		PathDstAction:   strings.TrimSpace(item.PathDstAction),
 	}
 	displayPath := strings.TrimSpace(item.DisplayPath)
 	dstDisplay := strings.TrimSpace(item.DstDisplayPath)
@@ -200,11 +204,15 @@ func diffItemToPathNodes(item migration.DiffItem) corebridge.PathNodes {
 		}
 	}
 	if !item.MissingOnSource {
+		srcLoc := item.Path
+		if sp := strings.TrimSpace(item.SrcPath); sp != "" {
+			srcLoc = sp
+		}
 		pathNodes.Src = &corebridge.PathNodeItem{
 			Queue:                  "SRC",
 			Id:                     item.SrcNodeID,
 			Name:                   item.Name,
-			LocationPath:           item.Path,
+			LocationPath:           srcLoc,
 			DisplayPath:            displayPath,
 			DepthLevel:             item.Depth,
 			Type:                   item.Type,
@@ -215,6 +223,7 @@ func diffItemToPathNodes(item migration.DiffItem) corebridge.PathNodes {
 			CopyRetryMarked:        item.CopyRetryMarked,
 			CopyExcludedFromFailed: item.CopyExcludedFromFailed,
 			CopyForceReplaceMarked: item.CopyForceReplaceMarked,
+			TraversalAckFromFailed: item.TraversalAckFromFailed,
 			FailureLogID:           item.SrcFailureLogID,
 			FailureMessage:         item.SrcFailureMessage,
 		}
@@ -224,11 +233,15 @@ func diffItemToPathNodes(item migration.DiffItem) corebridge.PathNodes {
 		if pathNodes.ResolvedDstName != "" {
 			dstName = pathNodes.ResolvedDstName
 		}
+		dstLoc := item.Path
+		if dp := strings.TrimSpace(item.DstPath); dp != "" {
+			dstLoc = dp
+		}
 		pathNodes.Dst = &corebridge.PathNodeItem{
 			Queue:           "DST",
 			Id:              item.DstNodeID,
 			Name:            dstName,
-			LocationPath:    item.Path, // id_path for parent_path nav (same chain as SRC when mapped)
+			LocationPath:    dstLoc,
 			DisplayPath:     dstDisplay,
 			DepthLevel:      item.Depth,
 			Type:            item.Type,
@@ -283,6 +296,7 @@ func ListChildrenDiffs(mig *migration.Migration, req corebridge.ListChildrenDiff
 		FoldersOnly:            req.FoldersOnly,
 		IncludeDestinationOnly: req.IncludeDestinationOnly,
 		AfterPath:              req.AfterPath,
+		Side:                   req.Side,
 	})
 	if err != nil {
 		return corebridge.ListChildrenDiffsResponse{}, fmt.Errorf("failed to list children diffs: %w", err)
@@ -343,6 +357,7 @@ func engineSearchRequest(req corebridge.SearchRequest, offset, limit int) migrat
 		Conditions:             enginePathReviewConditions(req),
 		StatusSearchType:       req.StatusSearchType,
 		IncludeDestinationOnly: req.IncludeDestinationOnly,
+		Side:                   strings.TrimSpace(req.Side),
 		Ruleset:                req.Ruleset,
 		AfterPath:              strings.TrimSpace(req.AfterPath),
 		AfterID:                strings.TrimSpace(req.AfterID),
@@ -350,13 +365,9 @@ func engineSearchRequest(req corebridge.SearchRequest, offset, limit int) migrat
 }
 
 // SearchPathReviewItems calls the engine and converts to API response.
-// Caller should reject zero-filter requests via SearchRequestHasFilter before calling.
 func SearchPathReviewItems(ctx context.Context, mig *migration.Migration, req corebridge.SearchRequest, offset, limit int) (corebridge.ListChildrenDiffsResponse, error) {
 	if mig == nil {
 		return corebridge.ListChildrenDiffsResponse{}, fmt.Errorf("migration is nil")
-	}
-	if !SearchRequestHasFilter(req) {
-		return corebridge.ListChildrenDiffsResponse{}, ErrSearchRequiresFilter
 	}
 	result, err := mig.SearchPathReviewItems(ctx, engineSearchRequest(req, offset, limit))
 	if err != nil {
@@ -373,16 +384,15 @@ func SearchPathReviewItems(ctx context.Context, mig *migration.Migration, req co
 }
 
 // GetSearchStats calls the engine and converts to API response (total/folder/file counts; Truncated when deadline cut short).
-// Caller should reject zero-filter requests via SearchRequestHasFilter before calling.
 func GetSearchStats(ctx context.Context, mig *migration.Migration, req corebridge.SearchRequest) (corebridge.DiffsStatsResponse, error) {
 	if mig == nil {
 		return corebridge.DiffsStatsResponse{}, fmt.Errorf("migration is nil")
 	}
-	if !SearchRequestHasFilter(req) {
-		return corebridge.DiffsStatsResponse{}, ErrSearchRequiresFilter
-	}
 	stats, err := mig.GetSearchStats(ctx, engineSearchRequest(req, 0, 10000))
 	if err != nil {
+		if errors.Is(err, migration.ErrSearchRequiresFilter) {
+			return corebridge.DiffsStatsResponse{}, ErrSearchRequiresFilter
+		}
 		return corebridge.DiffsStatsResponse{}, fmt.Errorf("failed to get search stats: %w", err)
 	}
 	return corebridge.DiffsStatsResponse{
@@ -422,6 +432,23 @@ func commonQueueState(m *corebridge.ExternalQueueMetrics, name string, q map[str
 	m.RateLimitedRemainingMsSrc = convert.ToNumber[int64](q["rate_limited_remaining_ms_src"])
 	m.RateLimitedRemainingMsDst = convert.ToNumber[int64](q["rate_limited_remaining_ms_dst"])
 	m.InterOpDelayMs = convert.ToNumber[int64](q["inter_op_delay_ms"])
+	m.ActiveTasks = activeTasksFromQueueMap(q)
+}
+
+func activeTasksFromQueueMap(q map[string]any) []corebridge.InFlightTask {
+	raw, ok := q["activeTasks"]
+	if !ok || raw == nil {
+		return nil
+	}
+	b, err := json.Marshal(raw)
+	if err != nil || len(b) == 0 || string(b) == "null" {
+		return nil
+	}
+	var out []corebridge.InFlightTask
+	if err := json.Unmarshal(b, &out); err != nil {
+		return nil
+	}
+	return out
 }
 
 func traversalQueueMetrics(name string, q map[string]any) *corebridge.ExternalQueueMetrics {
@@ -534,13 +561,30 @@ func sizeFoldMetrics(mig *migration.Migration) *corebridge.ExternalQueueMetrics 
 	if m.ItemsPerSecond == 0 {
 		m.ItemsPerSecond = convert.ToNumber[float64](q["items_per_second"])
 	}
+	// Prefer JSON round (fold depth); fall back to current_depth for older payloads.
+	if m.Round == 0 {
+		if d, ok := q["current_depth"].(float64); ok {
+			m.Round = int(d)
+		}
+	}
+	if v, ok := q["round"].(float64); ok {
+		m.Round = int(v)
+	}
 	return m
 }
 
 // GetLogsFromMigration calls the engine and converts to API response.
-func GetLogsFromMigration(mig *migration.Migration, _ corebridge.GetLogsRequest) (*corebridge.GetLogsResponse, error) {
+func GetLogsFromMigration(mig *migration.Migration, req corebridge.GetLogsRequest) (*corebridge.GetLogsResponse, error) {
 	if mig == nil {
 		return nil, fmt.Errorf("migration is nil")
+	}
+	if req.TextExact != "" || req.Action != "" || req.NodeID != "" || req.From != "" || req.To != "" {
+		q := opsdbLogSearch(req)
+		entries, err := mig.SearchLogs(q)
+		if err != nil {
+			return nil, fmt.Errorf("failed to search logs: %w", err)
+		}
+		return &corebridge.GetLogsResponse{Success: true, Logs: groupLogEntries(entries)}, nil
 	}
 	logs, err := mig.GetLogs(1000, true)
 	if err != nil {
@@ -549,22 +593,65 @@ func GetLogsFromMigration(mig *migration.Migration, _ corebridge.GetLogsRequest)
 	out := make(map[string][]corebridge.LogEntry)
 	for level, entries := range logs.ByLevel {
 		for _, entry := range entries {
-			id := entry.ID
-			if id == "" {
-				// Stable fallback so UI polling can dedupe across snapshots.
-				id = fmt.Sprintf("%s|%s|%s", level, entry.Timestamp.Format(time.RFC3339Nano), entry.Message)
-			}
-			out[level] = append(out[level], corebridge.LogEntry{
-				ID:    id,
-				Level: level,
-				Data: map[string]any{
-					"message":   entry.Message,
-					"timestamp": entry.Timestamp.Format(time.RFC3339Nano),
-				},
-			})
+			out[level] = append(out[level], toAPILogEntry(entry, level))
 		}
 	}
 	return &corebridge.GetLogsResponse{Success: true, Logs: out}, nil
+}
+
+func opsdbLogSearch(req corebridge.GetLogsRequest) opsdb.LogSearchQuery {
+	limit := req.Limit
+	if limit <= 0 {
+		limit = 200
+	}
+	q := opsdb.LogSearchQuery{TextExact: req.TextExact, Action: req.Action, NodeID: req.NodeID, Limit: limit}
+	if req.From != "" {
+		if t, err := time.Parse(time.RFC3339Nano, req.From); err == nil {
+			q.From = t
+		} else if t, err := time.Parse(time.RFC3339, req.From); err == nil {
+			q.From = t
+		}
+	}
+	if req.To != "" {
+		if t, err := time.Parse(time.RFC3339Nano, req.To); err == nil {
+			q.To = t
+		} else if t, err := time.Parse(time.RFC3339, req.To); err == nil {
+			q.To = t
+		}
+	}
+	return q
+}
+
+func groupLogEntries(entries []migration.LogEntry) map[string][]corebridge.LogEntry {
+	out := make(map[string][]corebridge.LogEntry)
+	for _, entry := range entries {
+		level := entry.Level
+		if level == "" {
+			level = "info"
+		}
+		out[level] = append(out[level], toAPILogEntry(entry, level))
+	}
+	return out
+}
+
+func toAPILogEntry(entry migration.LogEntry, level string) corebridge.LogEntry {
+	id := entry.ID
+	if id == "" {
+		id = fmt.Sprintf("%s|%s|%s", level, entry.Timestamp.Format(time.RFC3339Nano), entry.Message)
+	}
+	return corebridge.LogEntry{
+		ID:    id,
+		Level: level,
+		Data: map[string]any{
+			"message":   entry.Message,
+			"timestamp": entry.Timestamp.Format(time.RFC3339Nano),
+			"entity":    entry.Entity,
+			"entityId":  entry.EntityID,
+			"queue":     entry.Queue,
+			"action":    entry.Action,
+			"nodeId":    entry.NodeID,
+		},
+	}
 }
 
 // pathReviewResultToResponse copies engine PathReviewActionResult into API response fields. Returns empty map for nil Deltas.
@@ -611,13 +698,17 @@ func SetNodesExcluded(mig *migration.Migration, req corebridge.ExclusionRequest,
 	if mig == nil {
 		return exclusionFromOutcome(nilMigrationOutcome()), nil
 	}
-	if excludeOperationsLocked(mig.Phase()) {
+	phase := mig.Phase()
+	if excludeOperationsLocked(phase) {
 		resp, err := exclusionFromOutcome(pathReviewOutcome{
 			errMsg: "exclusion operations are not available while copy or delete is in progress",
 			deltas: emptyDeltas(),
 		}), fmt.Errorf("exclusion operations are locked during active copy or delete")
 		return resp, err
 	}
+	// Phase-aware: traversal-review failed → traversal ack; copy-review → copy
+	// exclusion (pending or failed); delete-review failed → delete skipped.
+	// SetNodeExcludedWithPropagation owns the branch.
 	if req.All {
 		filter := migration.NodeQueryFilter{
 			Queue:  "SRC",
@@ -671,7 +762,7 @@ func ExcludeBySearch(mig *migration.Migration, req corebridge.SearchRequest, exc
 	}
 	appID := uuid.New().String()
 	engineReq := engineSearchRequest(req, 0, 0)
-	res, err := mig.ApplySearchExclusion(engineReq, except, appID)
+	res, err := mig.ApplySearchExclusion(engineReq, true, except, appID)
 	resp := exclusionFromOutcome(outcomeFromSingle(res, err))
 	return resp, err
 }
@@ -689,7 +780,7 @@ func UnexcludeBySearch(mig *migration.Migration, req corebridge.SearchRequest, e
 		return resp, err
 	}
 	engineReq := engineSearchRequest(req, 0, 0)
-	res, err := mig.ApplySearchUnexclusion(engineReq, except)
+	res, err := mig.ApplySearchExclusion(engineReq, false, except, "")
 	resp := exclusionFromOutcome(outcomeFromSingle(res, err))
 	return resp, err
 }
@@ -756,7 +847,7 @@ func ForceReplaceCopy(mig *migration.Migration, nodeID string, mark bool) (*core
 	if mig == nil {
 		return markRetryFromOutcome(nilMigrationOutcome()), nil
 	}
-	res, err := mig.SetNodeCopyForceReplace(nodeID, mark)
+	res, err := mig.SetNodeRetryMark(migration.RetryMutationForceReplace, nodeID, mark)
 	resp := markRetryFromOutcome(outcomeFromSingle(res, err))
 	return resp, err
 }
@@ -776,7 +867,7 @@ func SkipNodeDelete(mig *migration.Migration, nodeID string) (*corebridge.MarkRe
 	if mig == nil {
 		return markRetryFromOutcome(nilMigrationOutcome()), nil
 	}
-	res, err := mig.SkipNodeDelete(nodeID)
+	res, err := mig.SetNodeDeleteSkipped(nodeID, true)
 	resp := markRetryFromOutcome(outcomeFromSingle(res, err))
 	return resp, err
 }
@@ -786,7 +877,7 @@ func UnskipNodeDelete(mig *migration.Migration, nodeID string) (*corebridge.Mark
 	if mig == nil {
 		return markRetryFromOutcome(nilMigrationOutcome()), nil
 	}
-	res, err := mig.UnskipNodeDelete(nodeID)
+	res, err := mig.SetNodeDeleteSkipped(nodeID, false)
 	resp := markRetryFromOutcome(outcomeFromSingle(res, err))
 	return resp, err
 }

@@ -26,7 +26,7 @@ type Config struct {
 	UseEnvKeys    bool
 }
 
-// Resolve returns the per-install 32-byte AES master key for DuckDB file encryption.
+// Resolve returns the per-install 32-byte AES master key used to wrap per-migration keys and API-side secrets.
 func Resolve(cfg Config) ([]byte, error) {
 	if cfg.UseEnvKeys {
 		return resolveFromEnv(cfg)

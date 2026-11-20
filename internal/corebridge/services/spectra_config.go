@@ -29,6 +29,7 @@ type SpectraConfig struct {
 		FileBackoffFactor      float64 `json:"file_backoff_factor,omitempty"`
 		FileDepthDecayFactor   float64 `json:"file_depth_decay_factor,omitempty"`
 		DivergingTreeMode      bool    `json:"diverging_tree_mode,omitempty"`
+		UniqueIDNames          bool    `json:"unique_id_names,omitempty"`
 	} `json:"seed"`
 	API struct {
 		Host string `json:"host"`

@@ -208,6 +208,72 @@ func (h handler) resetPathRemap(ctx *middleware.Context) {
 	ctx.Response(http.StatusOK, resp)
 }
 
+func (h handler) acceptUniquePathName(ctx *middleware.Context, payload corebridge.AcceptPathRequest) {
+	migrationID := chi.URLParam(ctx.Request(), "migrationID")
+	nodeID := chi.URLParam(ctx.Request(), "nodeID")
+	if migrationID == "" || nodeID == "" {
+		ctx.Error(http.StatusBadRequest, "migration id and node id are required", nil)
+		return
+	}
+	mig, err := h.mgr.PathMigration(ctx.Request().Context(), migrationID)
+	if err != nil {
+		if errors.Is(err, corebridge.ErrMigrationNotFound) {
+			ctx.Error(http.StatusNotFound, "migration not found", err)
+			return
+		}
+		ctx.Error(http.StatusInternalServerError, "failed to assign unique destination name", err)
+		return
+	}
+	resp, err := migrationops.AcceptUniquePathName(mig, nodeID, payload.ProposedPath)
+	if err != nil {
+		ctx.Error(http.StatusInternalServerError, "failed to assign unique destination name", err)
+		return
+	}
+	if !resp.Success {
+		ctx.Response(http.StatusBadRequest, map[string]any{
+			"success":   false,
+			"errorCode": corebridge.ErrCodePathValidation,
+			"error":     resp.Message,
+			"message":   resp.Message,
+		})
+		return
+	}
+	ctx.Response(http.StatusOK, resp)
+}
+
+func (h handler) previewPathResolutionCascade(ctx *middleware.Context, payload corebridge.PreviewPathCascadeRequest) {
+	migrationID := chi.URLParam(ctx.Request(), "migrationID")
+	nodeID := chi.URLParam(ctx.Request(), "nodeID")
+	if migrationID == "" || nodeID == "" {
+		ctx.Error(http.StatusBadRequest, "migration id and node id are required", nil)
+		return
+	}
+	action := strings.TrimSpace(payload.Action)
+	if action != "unique" && action != "remap" {
+		ctx.Error(http.StatusBadRequest, "action must be unique or remap", nil)
+		return
+	}
+	mig, err := h.mgr.PathMigration(ctx.Request().Context(), migrationID)
+	if err != nil {
+		if errors.Is(err, corebridge.ErrMigrationNotFound) {
+			ctx.Error(http.StatusNotFound, "migration not found", err)
+			return
+		}
+		ctx.Error(http.StatusInternalServerError, "failed to preview path resolution", err)
+		return
+	}
+	resp, err := migrationops.PreviewPathResolutionCascade(mig, nodeID, action, payload.ProposedName)
+	if err != nil {
+		ctx.Error(http.StatusInternalServerError, "failed to preview path resolution", err)
+		return
+	}
+	if !resp.Success {
+		ctx.Response(http.StatusBadRequest, resp)
+		return
+	}
+	ctx.Response(http.StatusOK, resp)
+}
+
 func (h handler) ignorePathIssueSubtree(ctx *middleware.Context) {
 	migrationID := chi.URLParam(ctx.Request(), "migrationID")
 	nodeID := chi.URLParam(ctx.Request(), "nodeID")
@@ -227,6 +293,12 @@ func (h handler) ignorePathIssueSubtree(ctx *middleware.Context) {
 	resp, err := migrationops.IgnorePathIssueSubtree(mig, nodeID)
 	if err != nil {
 		ctx.Error(http.StatusInternalServerError, "failed to dismiss destination name warning", err)
+		return
+	}
+	if !resp.Success {
+		ctx.Response(http.StatusBadRequest, map[string]any{
+			"success": false, "error": resp.Message, "message": resp.Message,
+		})
 		return
 	}
 	ctx.Response(http.StatusOK, resp)
@@ -254,4 +326,71 @@ func (h handler) unignorePathIssueSubtree(ctx *middleware.Context) {
 		return
 	}
 	ctx.Response(http.StatusOK, resp)
+}
+
+func (h handler) pathRenameProgress(ctx *middleware.Context) {
+	migrationID := chi.URLParam(ctx.Request(), "migrationID")
+	if migrationID == "" {
+		ctx.Error(http.StatusBadRequest, "migration id is required", nil)
+		return
+	}
+	mig, err := h.mgr.PathMigration(ctx.Request().Context(), migrationID)
+	if err != nil {
+		if errors.Is(err, corebridge.ErrMigrationNotFound) {
+			ctx.Error(http.StatusNotFound, "migration not found", err)
+			return
+		}
+		ctx.Error(http.StatusInternalServerError, "failed to read path rename progress", err)
+		return
+	}
+	resp, err := migrationops.PathRenameProgress(mig)
+	if err != nil {
+		ctx.Error(http.StatusInternalServerError, "failed to read path rename progress", err)
+		return
+	}
+	ctx.Response(http.StatusOK, resp)
+}
+
+func (h handler) pathRenameSoftStop(ctx *middleware.Context) {
+	migrationID := chi.URLParam(ctx.Request(), "migrationID")
+	if migrationID == "" {
+		ctx.Error(http.StatusBadRequest, "migration id is required", nil)
+		return
+	}
+	mig, err := h.mgr.PathMigration(ctx.Request().Context(), migrationID)
+	if err != nil {
+		if errors.Is(err, corebridge.ErrMigrationNotFound) {
+			ctx.Error(http.StatusNotFound, "migration not found", err)
+			return
+		}
+		ctx.Error(http.StatusInternalServerError, "failed to soft-stop path rename", err)
+		return
+	}
+	if err := migrationops.RequestPathRenameSoftStop(mig); err != nil {
+		ctx.Error(http.StatusConflict, err.Error(), err)
+		return
+	}
+	ctx.Response(http.StatusOK, map[string]any{"success": true})
+}
+
+func (h handler) pathRenameHardStop(ctx *middleware.Context) {
+	migrationID := chi.URLParam(ctx.Request(), "migrationID")
+	if migrationID == "" {
+		ctx.Error(http.StatusBadRequest, "migration id is required", nil)
+		return
+	}
+	mig, err := h.mgr.PathMigration(ctx.Request().Context(), migrationID)
+	if err != nil {
+		if errors.Is(err, corebridge.ErrMigrationNotFound) {
+			ctx.Error(http.StatusNotFound, "migration not found", err)
+			return
+		}
+		ctx.Error(http.StatusInternalServerError, "failed to hard-stop path rename", err)
+		return
+	}
+	if err := migrationops.RequestPathRenameHardStop(mig); err != nil {
+		ctx.Error(http.StatusConflict, err.Error(), err)
+		return
+	}
+	ctx.Response(http.StatusOK, map[string]any{"success": true})
 }

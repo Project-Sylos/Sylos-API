@@ -2,6 +2,7 @@ package manager
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -27,6 +28,19 @@ type phaseResumeSetup struct {
 func (m *Manager) ResumeMigration(ctx context.Context, migrationID string, config corebridge.SweepConfigRequest) (corebridge.SweepResponse, error) {
 	mig, err := m.GetMigration(context.TODO(), migrationID)
 	if err != nil {
+		return corebridge.SweepResponse{Success: false, Error: err.Error()}, err
+	}
+	if err := m.rejectIfNeedsAttention(migrationID); err != nil {
+		return corebridge.SweepResponse{Success: false, Error: err.Error()}, err
+	}
+	if health, err := m.EnsureFSHealthFresh(ctx, migrationID); err != nil {
+		var failed *FSHealthFailedError
+		if errors.As(err, &failed) {
+			return sweepResponseFromFSHealth(failed.Report), err
+		}
+		if health != nil && !health.OK {
+			return sweepResponseFromFSHealth(*health), err
+		}
 		return corebridge.SweepResponse{Success: false, Error: err.Error()}, err
 	}
 
@@ -284,9 +298,9 @@ func (m *Manager) triggerCopyRetryResume(migrationID string, config corebridge.S
 	}, nil
 }
 
-func (m *Manager) buildCopyPhaseOptions(config corebridge.SweepConfigRequest) migration.CopyPhaseOptions {
+func (m *Manager) buildCopyPhaseOptions(config corebridge.SweepConfigRequest) migration.RunOverrides {
 	workerCount, maxRetries, logAddress, logLevel, skipListener := m.sweepConfigFields(config)
-	return migration.CopyPhaseOptions{
+	return migration.RunOverrides{
 		WorkerCount:  workerCount,
 		MaxRetries:   maxRetries,
 		LogAddress:   logAddress,

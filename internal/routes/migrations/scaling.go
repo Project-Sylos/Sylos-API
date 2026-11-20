@@ -37,3 +37,31 @@ func (h handler) putScaling(ctx *middleware.Context, req manager.SetMigrationSca
 	}
 	ctx.Response(http.StatusOK, view)
 }
+
+func (h handler) getAutoscaler(ctx *middleware.Context) {
+	migrationID := chi.URLParam(ctx.Request(), "migrationID")
+	view, err := h.mgr.GetMigrationAutoscaler(ctx.Request().Context(), migrationID)
+	if err == corebridge.ErrMigrationNotFound {
+		ctx.Error(http.StatusNotFound, "migration not found", err)
+		return
+	}
+	if err != nil {
+		ctx.Error(http.StatusInternalServerError, "failed to get autoscaler snapshot", err)
+		return
+	}
+	ctx.Response(http.StatusOK, view)
+}
+
+func (h handler) putAutoscaler(ctx *middleware.Context, req manager.SetMigrationAutoscalerRequest) {
+	migrationID := chi.URLParam(ctx.Request(), "migrationID")
+	view, err := h.mgr.SetMigrationAutoscaler(ctx.Request().Context(), migrationID, req)
+	if err == corebridge.ErrMigrationNotFound {
+		ctx.Error(http.StatusNotFound, "migration not found", err)
+		return
+	}
+	if err != nil {
+		ctx.Error(http.StatusBadRequest, "failed to apply autoscaler overrides", err)
+		return
+	}
+	ctx.Response(http.StatusOK, view)
+}

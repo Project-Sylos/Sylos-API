@@ -24,6 +24,7 @@ func (h handler) getStorageInfo(ctx *middleware.Context) {
 		RootType:     q.Get("rootType"),
 		DriveID:      q.Get("driveId"),
 		Role:         q.Get("role"),
+		MigrationID:  q.Get("migrationId"),
 	})
 	if err != nil {
 		if errors.Is(err, corebridge.ErrServiceNotFound) {

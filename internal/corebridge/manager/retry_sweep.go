@@ -2,6 +2,7 @@ package manager
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -34,6 +35,16 @@ func (m *Manager) TriggerRetrySweep(ctx context.Context, migrationID string, con
 		}, err
 	}
 
+	if health, err := m.EnsureFSHealthFresh(ctx, migrationID); err != nil {
+		var failed *FSHealthFailedError
+		if errors.As(err, &failed) {
+			return sweepResponseFromFSHealth(failed.Report), err
+		}
+		if health != nil && !health.OK {
+			return sweepResponseFromFSHealth(*health), err
+		}
+		return corebridge.SweepResponse{Success: false, Error: err.Error()}, err
+	}
 	// Root plans are in-memory only; rebuild adapters/roots from the migration DB after API restart.
 	if err := m.ensureFSAdaptersRehydrated(migrationID); err != nil {
 		return corebridge.SweepResponse{
@@ -106,9 +117,9 @@ func (m *Manager) TriggerRetrySweep(ctx context.Context, migrationID string, con
 	}, nil
 }
 
-func (m *Manager) buildRetrySweepOptions(config corebridge.SweepConfigRequest) migration.RetrySweepOptions {
+func (m *Manager) buildRetrySweepOptions(config corebridge.SweepConfigRequest) migration.RunOverrides {
 	workerCount, maxRetries, logAddress, logLevel, skipListener := m.sweepConfigFields(config)
-	return migration.RetrySweepOptions{
+	return migration.RunOverrides{
 		WorkerCount:   workerCount,
 		MaxRetries:    maxRetries,
 		LogAddress:    logAddress,

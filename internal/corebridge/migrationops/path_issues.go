@@ -11,6 +11,8 @@ import (
 
 // ListPathIssues loads the naming-compatibility queue, including ignored warnings.
 // Count is the number of active (non-ignored) issues that still block copy.
+// Rematches pending proposals that collide with existing DST siblings so Merge
+// appears even when DST compare missed the collision mark.
 func ListPathIssues(mig *migration.Migration, limit int) (corebridge.PathIssuesListResponse, error) {
 	if mig == nil {
 		return corebridge.PathIssuesListResponse{}, fmt.Errorf("migration is nil")
@@ -18,6 +20,9 @@ func ListPathIssues(mig *migration.Migration, limit int) (corebridge.PathIssuesL
 	enabled := mig.PathChecksEnabled()
 	if !enabled {
 		return corebridge.PathIssuesListResponse{PathChecksEnabled: false}, nil
+	}
+	if _, err := mig.RematchPendingGPLCollisions(); err != nil {
+		return corebridge.PathIssuesListResponse{}, err
 	}
 	rows, err := mig.ListPathIssues(limit)
 	if err != nil {
@@ -66,6 +71,7 @@ func AcceptPathChange(mig *migration.Migration, nodeID, proposedPath string, for
 		if proposedPath == "" {
 			return corebridge.PathIssuesMutationResponse{Success: false, Message: "A name is required.", PathChecksEnabled: true}, nil
 		}
+		defer mig.EndPathRenameProgress()
 		if err := mig.AcceptPathChange(nodeID, proposedPath, true); err != nil {
 			return pathValidationOrErr(err)
 		}
@@ -86,13 +92,15 @@ func AcceptPathChange(mig *migration.Migration, nodeID, proposedPath string, for
 	if proposedPath == "" {
 		return corebridge.PathIssuesMutationResponse{Success: false, Message: "No suggested name is available for this item.", PathChecksEnabled: true}, nil
 	}
+	defer mig.EndPathRenameProgress()
 	if err := mig.AcceptPathChange(nodeID, proposedPath, false); err != nil {
 		return pathValidationOrErr(err)
 	}
-	if err := mig.RunGPLSweep(); err != nil {
+	if err := mig.RunGPLSweepForNode(nodeID); err != nil {
 		return corebridge.PathIssuesMutationResponse{}, err
 	}
 	_ = mig.RunDSTRenameSweep()
+	mig.PathRenameBeginPhase(migration.PathRenamePhaseRefresh, "Refreshing review…", 0)
 	return refreshPathIssuesResponse(mig, 1, 0)
 }
 
@@ -104,24 +112,29 @@ func AcceptAllPathProposals(mig *migration.Migration) (corebridge.PathIssuesMuta
 	if !mig.PathChecksEnabled() {
 		return corebridge.PathIssuesMutationResponse{Success: true, PathChecksEnabled: false}, nil
 	}
+	defer mig.EndPathRenameProgress()
 	n, err := mig.AcceptAllPathProposals()
 	if err != nil {
 		return pathValidationOrErr(err)
 	}
-	if err := mig.RunGPLSweep(); err != nil {
+	if err := mig.RunGPLSweep("/"); err != nil {
 		return corebridge.PathIssuesMutationResponse{}, err
 	}
 	_ = mig.RunDSTRenameSweep()
+	mig.PathRenameBeginPhase(migration.PathRenamePhaseRefresh, "Refreshing review…", 0)
 	return refreshPathIssuesResponse(mig, n, 0)
 }
 
 // IgnorePathIssueSubtree dismisses warnings for one node and its contents.
+// Manual-review (blocking) issues are refused.
 func IgnorePathIssueSubtree(mig *migration.Migration, nodeID string) (corebridge.PathIssuesMutationResponse, error) {
 	if mig == nil {
 		return corebridge.PathIssuesMutationResponse{}, fmt.Errorf("migration is nil")
 	}
 	if err := mig.SetGPLSubtreeIgnored(nodeID, true); err != nil {
-		return corebridge.PathIssuesMutationResponse{}, err
+		return corebridge.PathIssuesMutationResponse{
+			Success: false, Message: err.Error(), PathChecksEnabled: mig.PathChecksEnabled(),
+		}, nil
 	}
 	return refreshPathIssuesResponse(mig, 0, 1)
 }
@@ -171,7 +184,7 @@ func EnsurePathIssuesClearForCopy(mig *migration.Migration) error {
 	if !mig.PathChecksEnabled() {
 		return nil
 	}
-	if err := mig.RunGPLSweep(); err != nil {
+	if err := mig.RunGPLSweep("/"); err != nil {
 		return err
 	}
 	rows, err := mig.ListPathIssues(0)
@@ -215,6 +228,18 @@ func pathValidationOrErr(err error) (corebridge.PathIssuesMutationResponse, erro
 			Message: msg,
 		}, nil
 	}
+	if errors.Is(err, migration.ErrPathRenameSoftStopped) {
+		return corebridge.PathIssuesMutationResponse{
+			Success: false,
+			Message: "Rename cancelled and reverted.",
+		}, nil
+	}
+	if errors.Is(err, migration.ErrPathRenameHardStopped) {
+		return corebridge.PathIssuesMutationResponse{
+			Success: false,
+			Message: "Rename hard-stopped; some related paths may be inconsistent.",
+		}, nil
+	}
 	return corebridge.PathIssuesMutationResponse{}, err
 }
 
@@ -238,19 +263,99 @@ func pathIssueRowsToAPI(rows []migration.PathIssueRow) []corebridge.PathIssue {
 			})
 		}
 		out = append(out, corebridge.PathIssue{
-			NodeID:       row.NodeID,
-			Path:         row.Path,
-			Name:         row.Name,
-			ProposedPath: row.ProposedPath,
-			Status:       row.Status,
-			Category:     row.Category,
-			Summary:      summary,
-			EventTime:    row.EventTime,
-			Messages:     msgs,
-			Ignored:      row.Ignored,
+			NodeID:           row.NodeID,
+			Path:             row.Path,
+			Name:             row.Name,
+			ProposedPath:     row.ProposedPath,
+			Status:           row.Status,
+			Category:         row.Category,
+			Summary:          summary,
+			EventTime:        row.EventTime,
+			Messages:         msgs,
+			Ignored:          row.Ignored,
+			DstAction:        row.DstAction,
+			CollisionSibling:    row.CollisionSibling,
+			SuggestedUniqueName: row.SuggestedUniqueName,
 		})
 	}
 	return out
+}
+
+// PreviewPathResolutionCascade dry-runs nested collisions and file overwrite winners.
+func PreviewPathResolutionCascade(mig *migration.Migration, nodeID, action, proposedName string) (corebridge.PathResolutionCascadePreview, error) {
+	if mig == nil {
+		return corebridge.PathResolutionCascadePreview{}, fmt.Errorf("migration is nil")
+	}
+	if !mig.PathChecksEnabled() {
+		return corebridge.PathResolutionCascadePreview{
+			Success: false, Message: migration.PathChecksNotApplicableMessage, PathChecksEnabled: false,
+		}, nil
+	}
+	prev, err := mig.PreviewPathResolutionCascade(nodeID, action, proposedName)
+	if err != nil {
+		return corebridge.PathResolutionCascadePreview{
+			Success: false, Message: err.Error(), PathChecksEnabled: true, Action: action, SrcFolderID: nodeID,
+		}, nil
+	}
+	return toAPICascadePreview(prev), nil
+}
+
+func toAPICascadePreview(p migration.PathResolutionCascadePreview) corebridge.PathResolutionCascadePreview {
+	out := corebridge.PathResolutionCascadePreview{
+		Success:              true,
+		Action:               p.Action,
+		SrcFolderID:          p.SrcFolderID,
+		DstFolderID:          p.DstFolderID,
+		FolderCollisionCount: p.FolderCollisionCount,
+		FileOverwriteCount:   p.FileOverwriteCount,
+		DstSubtreeListed:     p.DstSubtreeListed,
+		PathChecksEnabled:    p.PathChecksEnabled,
+	}
+	if len(p.FolderCollisions) > 0 {
+		out.FolderCollisions = make([]corebridge.PathCascadeFolderCollision, len(p.FolderCollisions))
+		for i, c := range p.FolderCollisions {
+			out.FolderCollisions[i] = corebridge.PathCascadeFolderCollision{
+				SrcID: c.SrcID, SrcName: c.SrcName, SrcPath: c.SrcPath,
+				DstID: c.DstID, DstName: c.DstName, DstPath: c.DstPath,
+			}
+		}
+	}
+	if len(p.FileOverwrites) > 0 {
+		out.FileOverwrites = make([]corebridge.PathCascadeFileOverwrite, len(p.FileOverwrites))
+		for i, f := range p.FileOverwrites {
+			out.FileOverwrites[i] = corebridge.PathCascadeFileOverwrite{
+				SrcID: f.SrcID, SrcName: f.SrcName, SrcPath: f.SrcPath,
+				SrcSize: f.SrcSize, SrcMTime: f.SrcMTime,
+				DstID: f.DstID, DstName: f.DstName, DstPath: f.DstPath,
+				DstSize: f.DstSize, DstMTime: f.DstMTime,
+				DefaultWinner: f.DefaultWinner,
+			}
+		}
+	}
+	return out
+}
+
+// AcceptUniquePathName allocates a unique destination basename and accepts it.
+// proposedName, when set, is validated and used instead of auto-allocating.
+func AcceptUniquePathName(mig *migration.Migration, nodeID, proposedName string) (corebridge.PathIssuesMutationResponse, error) {
+	if mig == nil {
+		return corebridge.PathIssuesMutationResponse{}, fmt.Errorf("migration is nil")
+	}
+	if !mig.PathChecksEnabled() {
+		return corebridge.PathIssuesMutationResponse{
+			Success: false, Message: migration.PathChecksNotApplicableMessage, PathChecksEnabled: false,
+		}, nil
+	}
+	defer mig.EndPathRenameProgress()
+	if _, err := mig.AcceptUniquePathName(nodeID, proposedName); err != nil {
+		return pathValidationOrErr(err)
+	}
+	if err := mig.RunGPLSweepForNode(nodeID); err != nil {
+		return corebridge.PathIssuesMutationResponse{}, err
+	}
+	_ = mig.RunDSTRenameSweep()
+	mig.PathRenameBeginPhase(migration.PathRenamePhaseRefresh, "Refreshing review…", 0)
+	return refreshPathIssuesResponse(mig, 1, 0)
 }
 
 func stringsToMessages(msgs []string) []corebridge.PathIssueMessage {

@@ -2,6 +2,7 @@ package manager
 
 import (
 	"context"
+	"strings"
 
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/services"
@@ -68,6 +69,14 @@ func (m *Manager) GetHomeFolder(ctx context.Context, serviceID string) (corebrid
 }
 
 func (m *Manager) GetStorageInfo(ctx context.Context, req corebridge.GetStorageInfoRequest) (corebridge.StorageInfo, error) {
+	if id := strings.TrimSpace(req.MigrationID); id != "" {
+		// Cloud connections live only in the FS manager process map. After restart
+		// they are gone until rehydrate; storage must not skip that step the way
+		// DB-only status/review paths do.
+		if err := m.ensureFSAdaptersRehydrated(id); err != nil {
+			m.logger.Warn().Err(err).Str("migration_id", id).Msg("storage info: rehydrate before GetStorageInfo")
+		}
+	}
 	return m.serviceMgr.GetStorageInfo(ctx, req)
 }
 

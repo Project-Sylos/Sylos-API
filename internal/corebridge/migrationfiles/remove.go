@@ -7,7 +7,7 @@ import (
 	"strings"
 )
 
-// RemoveMigrationDir deletes dataDir/{migrationID}/ (ops store, configs, etc.).
+// RemoveMigrationDir deletes storageDir/{migrationID}/ (ops store, configs, etc.).
 func RemoveMigrationDir(dataDir, migrationID string) error {
 	raw := strings.TrimSpace(migrationID)
 	if raw == "" || strings.Contains(raw, "..") || strings.ContainsAny(raw, `/\`) {

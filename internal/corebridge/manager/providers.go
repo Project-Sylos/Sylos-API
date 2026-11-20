@@ -49,12 +49,16 @@ func (m *Manager) ListProviders(_ context.Context) ([]corebridge.ProviderDescrip
 	return out, nil
 }
 
-func (m *Manager) CreateProviderConnection(ctx context.Context, providerID, migrationID string) (corebridge.ConnectionResponse, error) {
+func (m *Manager) CreateProviderConnection(ctx context.Context, providerID, migrationID, connectionID string) (corebridge.ConnectionResponse, error) {
+	_ = ctx
 	cfg, ok := m.cfg.Providers[providerID]
 	if !ok || !cfg.Enabled {
 		return corebridge.ConnectionResponse{}, fmt.Errorf("provider %q not enabled", providerID)
 	}
-	connectionID := ulid.Make().String()
+	connectionID = strings.TrimSpace(connectionID)
+	if connectionID == "" {
+		connectionID = ulid.Make().String()
+	}
 	m.connMgr.Set(connectionID, connections.Record{
 		ProviderID:  providerID,
 		ServiceID:   cfg.ServiceID,
@@ -223,9 +227,40 @@ func (m *Manager) PostProviderTokens(ctx context.Context, providerID, connection
 	return m.connectionStatusFromRecord(providerID, connectionID, rec, true), nil
 }
 
+func (m *Manager) ensureProviderConnection(providerID, connectionID, migrationID string) error {
+	if connectionID == "" {
+		return fmt.Errorf("connection id is required")
+	}
+	if rec, ok := m.connMgr.Get(connectionID); ok {
+		if rec.ProviderID != providerID {
+			return fmt.Errorf("connection provider mismatch")
+		}
+		if migrationID != "" && rec.MigrationID == "" {
+			rec.MigrationID = migrationID
+			m.connMgr.Set(connectionID, rec)
+		}
+		return nil
+	}
+	cfg, ok := m.cfg.Providers[providerID]
+	if !ok || !cfg.Enabled {
+		return fmt.Errorf("provider %q not enabled", providerID)
+	}
+	// Exchange proves possession of a one-time auth code; recreate the shell if
+	// createConnection was dropped (reconnect race or API restart mid-OAuth).
+	m.connMgr.Set(connectionID, connections.Record{
+		ProviderID:  providerID,
+		ServiceID:   cfg.ServiceID,
+		MigrationID: migrationID,
+	})
+	return nil
+}
+
 func (m *Manager) ExchangeProviderOAuthCode(ctx context.Context, providerID, connectionID string, req corebridge.OAuthExchangeRequest) (corebridge.ConnectionStatus, error) {
 	if req.Code == "" || req.RedirectURI == "" {
 		return corebridge.ConnectionStatus{}, fmt.Errorf("code and redirect_uri are required")
+	}
+	if err := m.ensureProviderConnection(providerID, connectionID, req.MigrationID); err != nil {
+		return corebridge.ConnectionStatus{}, err
 	}
 
 	creds, err := m.oauthProviderCredentials(providerID)

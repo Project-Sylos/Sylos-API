@@ -20,6 +20,12 @@ func (m *Manager) StartMigration(ctx context.Context, req corebridge.StartMigrat
 	if err != nil {
 		return corebridge.Migration{}, err
 	}
+	if err := m.rejectIfNeedsAttention(mig.ID); err != nil {
+		return corebridge.Migration{}, err
+	}
+	if _, err := m.EnsureFSHealthFresh(ctx, mig.ID); err != nil {
+		return corebridge.Migration{}, err
+	}
 	if err := m.ensureFSAdaptersRehydrated(mig.ID); err != nil {
 		return corebridge.Migration{}, fmt.Errorf("restore filesystem credentials: %w", err)
 	}
@@ -117,6 +123,10 @@ func (m *Manager) buildTraversalConfig(opts corebridge.MigrationOptions, plan *r
 	if logLevel == "" {
 		logLevel = "info"
 	}
+	persistLogLevel := opts.PersistLogLevel
+	if persistLogLevel == "" {
+		persistLogLevel = "trace"
+	}
 	skipListener := true
 	if opts.SkipListener != nil {
 		skipListener = *opts.SkipListener
@@ -130,11 +140,14 @@ func (m *Manager) buildTraversalConfig(opts corebridge.MigrationOptions, plan *r
 		CoordinatorLead: coordinatorLead,
 		LogAddress:      logAddress,
 		LogLevel:        logLevel,
+		PersistLogLevel: persistLogLevel,
 		SkipListener:    skipListener,
 		StartupDelay:    time.Duration(opts.StartupDelaySec) * time.Second,
 		ProgressTick:    time.Duration(opts.ProgressTickMillis) * time.Millisecond,
 		PathCheckTarget: pathCheckTargetFromOpts(opts, plan),
 		WindowsCompat:   windowsCompatFromOpts(opts, plan),
+		OverwritePolicy: migration.NormalizeOverwritePolicy(opts.OverwritePolicy),
+		HashVerify:      opts.HashVerify,
 		Verification: migration.VerifyOptions{
 			AllowPending:  opts.Verification.AllowPending,
 			AllowNotOnSrc: opts.Verification.AllowNotOnSrc,
@@ -254,6 +267,9 @@ func (m *Manager) ChangePhase(ctx context.Context, migrationID string, phase str
 	if err != nil {
 		return corebridge.Migration{}, err
 	}
+	if _, err := m.EnsureFSHealthFresh(ctx, migrationID); err != nil {
+		return corebridge.Migration{}, err
+	}
 	if err := m.ensureFSAdaptersRehydrated(migrationID); err != nil {
 		return corebridge.Migration{}, fmt.Errorf("restore filesystem credentials: %w", err)
 	}
@@ -355,6 +371,11 @@ func (m *Manager) GetMigrationStatus(ctx context.Context, id string) (corebridge
 		return corebridge.Status{}, err
 	}
 
+	// Stuck *-finalizing with no live run (crash / kill mid-teardown) → finalize-failed for Resume.
+	if !mig.IsLive() && migration.IsFinalizingPhase(mig.Phase()) {
+		_ = m.normalizeDeadInProgressForResume(id, mig)
+	}
+
 	m.mu.RLock()
 	rec := m.runtimeByID[id]
 	m.mu.RUnlock()
@@ -447,10 +468,16 @@ func (m *Manager) GetMigrationStatus(ctx context.Context, id string) (corebridge
 		SourceRootChildren:      mapRootChildPlansToCore(prep.SourceChildren),
 		StopProgress:            mapStopProgress(mig.GetStopProgress()),
 		DbActivity:              dbActivity,
+		UncleanInterrupt:        mig.HasUncleanInterrupt(),
+		UncleanInterruptKind:    mig.UncleanInterruptKind(),
+	}
+	if recMeta, metaErr := m.getMigrationRecord(id); metaErr == nil && recMeta.ID != "" {
+		applyAttentionToStatus(&st, recMeta)
 	}
 	// A full status read already paid for opening this migration; remember
 	// phase + roots so list views never have to open the ops DB themselves.
-	m.persistMigrationListHints(id, st.Status, sourceRoot, destinationRoot)
+	unclean := st.UncleanInterrupt
+	m.persistMigrationListHints(id, st.Status, sourceRoot, destinationRoot, &unclean)
 	return st, nil
 }
 
@@ -493,6 +520,26 @@ func (m *Manager) StopMigration(ctx context.Context, migrationID string) (corebr
 	}
 
 	if !migrationStopAllowed(mig.Phase(), mig.IsLive()) {
+		// Dead *-finalizing (process died mid-teardown): land in finalize-failed so Resume works.
+		if !mig.IsLive() && migration.IsFinalizingPhase(mig.Phase()) {
+			if normErr := m.normalizeDeadInProgressForResume(migrationID, mig); normErr != nil {
+				return corebridge.Status{}, normErr
+			}
+			st, statusErr := m.GetMigrationStatus(ctx, migrationID)
+			if statusErr != nil {
+				return corebridge.Status{
+					Migration: corebridge.Migration{
+						ID:      migrationID,
+						Status:  mig.Phase(),
+						Success: true,
+					},
+					Live: false,
+				}, nil
+			}
+			st.Success = true
+			st.Live = false
+			return st, nil
+		}
 		st, statusErr := m.GetMigrationStatus(ctx, migrationID)
 		if statusErr != nil {
 			return corebridge.Status{
@@ -537,13 +584,33 @@ func (m *Manager) StopMigration(ctx context.Context, migrationID string) (corebr
 	return st, nil
 }
 
-// ForceStopMigration aborts a live run immediately and marks the migration aborted (not resumable).
+// ForceStopMigration hard-stops a live run without a soft-stop checkpoint.
+// Prefer soft Stop; hard stop is recoverable via Resume (unclean recovery sweep) but not recommended.
 func (m *Manager) ForceStopMigration(ctx context.Context, migrationID string) (corebridge.Status, error) {
 	mig, err := m.GetMigration(context.TODO(), migrationID)
 	if err != nil {
 		return corebridge.Status{}, err
 	}
 	if !mig.IsLive() && mig.Phase() != migration.PhaseTraversing && mig.Phase() != migration.PhaseCopying && mig.Phase() != migration.PhaseDeleting {
+		if migration.IsFinalizingPhase(mig.Phase()) {
+			if normErr := m.normalizeDeadInProgressForResume(migrationID, mig); normErr != nil {
+				return corebridge.Status{}, normErr
+			}
+			st, statusErr := m.GetMigrationStatus(ctx, migrationID)
+			if statusErr != nil {
+				return corebridge.Status{
+					Migration: corebridge.Migration{
+						ID:      migrationID,
+						Status:  mig.Phase(),
+						Success: true,
+					},
+					Live: false,
+				}, nil
+			}
+			st.Success = true
+			st.Live = false
+			return st, nil
+		}
 		st, statusErr := m.GetMigrationStatus(ctx, migrationID)
 		if statusErr != nil {
 			return corebridge.Status{
@@ -563,17 +630,20 @@ func (m *Manager) ForceStopMigration(ctx context.Context, migrationID string) (c
 	if _, err := mig.Abort(); err != nil {
 		return corebridge.Status{}, err
 	}
+	unclean := true
+	m.persistMigrationListHints(migrationID, mig.Phase(), nil, nil, &unclean)
 	st, statusErr := m.GetMigrationStatus(ctx, migrationID)
 	if statusErr != nil {
 		return corebridge.Status{
 			Migration: corebridge.Migration{
 				ID:      migrationID,
-				Status:  migration.PhaseAborted,
+				Status:  mig.Phase(),
 				Success: true,
 			},
-			Live:         mig.IsLive(),
-			Stopped:      true,
-			StopProgress: mapStopProgress(mig.GetStopProgress()),
+			Live:             mig.IsLive(),
+			Stopped:          true,
+			StopProgress:     mapStopProgress(mig.GetStopProgress()),
+			UncleanInterrupt: true,
 		}, nil
 	}
 	st.Live = mig.IsLive()
@@ -588,5 +658,11 @@ func migrationStopAllowed(phase string, live bool) bool {
 	if !live {
 		return false
 	}
-	return phase == migration.PhaseTraversing || phase == migration.PhaseCopying || phase == migration.PhaseDeleting
+	switch phase {
+	case migration.PhaseTraversing, migration.PhaseCopying, migration.PhaseDeleting,
+		migration.PhaseTraversalFinalizing, migration.PhaseCopyFinalizing, migration.PhaseDeleteFinalizing:
+		return true
+	default:
+		return false
+	}
 }

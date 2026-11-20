@@ -104,12 +104,27 @@ func TestExportThenImportRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := store.PutOAuthCred("conn-a", "enc:v1:deadbeef"); err != nil {
+		t.Fatal(err)
+	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dataDir, "src", "src.db"), nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
+
+	// Live store still has oauth before export.
+	live, err := opsdb.Open(opsdb.Options{Dir: srcOps})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids, err := live.ListOAuthConnectionIDs()
+	if err != nil || len(ids) != 1 {
+		live.Close()
+		t.Fatalf("live oauth ids=%v err=%v", ids, err)
+	}
+	_ = live.Close()
 
 	var buf bytes.Buffer
 	name, err := ExportMigrationOpsZip(dataDir, "src", &buf)
@@ -120,6 +135,17 @@ func TestExportThenImportRoundTrip(t *testing.T) {
 		t.Fatalf("filename %q", name)
 	}
 
+	// Live store must remain unchanged by export strip.
+	live, err = opsdb.Open(opsdb.Options{Dir: srcOps})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids, err = live.ListOAuthConnectionIDs()
+	_ = live.Close()
+	if err != nil || len(ids) != 1 {
+		t.Fatalf("live oauth after export ids=%v err=%v", ids, err)
+	}
+
 	resp, err := UploadMigrationOps(context.Background(), zerolog.Nop(), dataDir, "dst.ops.zip", buf.Bytes(), false)
 	if err != nil {
 		t.Fatal(err)
@@ -127,7 +153,20 @@ func TestExportThenImportRoundTrip(t *testing.T) {
 	if !resp.Success {
 		t.Fatalf("import: %s", resp.Error)
 	}
-	if !looksLikeBadgerDir(filepath.Join(dataDir, "dst", "dst.ops")) {
+	dstOps := filepath.Join(dataDir, "dst", "dst.ops")
+	if !looksLikeBadgerDir(dstOps) {
 		t.Fatal("dst ops missing")
+	}
+	imported, err := opsdb.Open(opsdb.Options{Dir: dstOps})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids, err = imported.ListOAuthConnectionIDs()
+	_ = imported.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != 0 {
+		t.Fatalf("exported zip still contained oauth ids=%v", ids)
 	}
 }

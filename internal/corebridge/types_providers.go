@@ -31,6 +31,9 @@ type OAuthExchangeRequest struct {
 	Code        string   `json:"code"`
 	RedirectURI string   `json:"redirect_uri"`
 	Scopes      []string `json:"scopes,omitempty"`
+	// MigrationID ties tokens to a migration when createConnection was lost
+	// (process restart or reconnect race) before exchange.
+	MigrationID string `json:"migrationId,omitempty"`
 	// MicrosoftAccountType is "personal" or "business" for OneDrive/SharePoint.
 	// personal → consumers; business → configured tenant_id or organizations.
 	MicrosoftAccountType string `json:"microsoft_account_type,omitempty"`
@@ -104,4 +107,7 @@ type ConnectionStatus struct {
 
 type CreateConnectionRequest struct {
 	MigrationID string `json:"migrationId,omitempty"`
+	// ConnectionID reuses an existing binding id on reconnect/reauth so Badger
+	// bindings, oauth keys, and UI state stay aligned. Empty mints a new ULID.
+	ConnectionID string `json:"connectionId,omitempty"`
 }

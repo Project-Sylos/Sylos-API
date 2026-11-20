@@ -9,9 +9,14 @@ import (
 )
 
 func (m *Manager) UploadByType(ctx context.Context, migrationID, uploadType string, data []byte, overwrite bool) (corebridge.UploadMigrationDBResponse, error) {
-	resp, err := migrationfiles.UploadByType(ctx, m.logger, m.cfg.Runtime.DataDir, migrationID, uploadType, data, overwrite)
+	resp, err := migrationfiles.UploadByType(ctx, m.logger, m.cfg.Runtime.MigrationDBStorageDir, migrationID, uploadType, data, overwrite)
 	if err != nil {
 		return corebridge.UploadMigrationDBResponse{}, err
+	}
+	out := corebridge.UploadMigrationDBResponse{
+		Success: resp.Success,
+		Error:   resp.Error,
+		Path:    resp.Path,
 	}
 	if resp.Success && resp.Path != "" &&
 		(uploadType == migrationfiles.UploadTypeDB || uploadType == migrationfiles.UploadTypeOps) {
@@ -20,16 +25,23 @@ func (m *Manager) UploadByType(ctx context.Context, migrationID, uploadType stri
 			id = migrationfiles.NormalizeMigrationID(migrationID)
 		}
 		m.persistUploadedDBMetadata(id, resp.Path)
+		if uploadType == migrationfiles.UploadTypeOps {
+			if _, keyErr := m.apiDB.EnsureMigrationKey(id); keyErr != nil {
+				m.logger.Warn().Err(keyErr).Str("migration_id", id).Msg("ensure migration key after ops import")
+			}
+			report, scanErr := m.scanImportedOps(id)
+			if scanErr != nil {
+				m.logger.Warn().Err(scanErr).Str("migration_id", id).Msg("ops import attention scan failed")
+			} else {
+				out.ImportReport = &report
+			}
+		}
 	}
-	return corebridge.UploadMigrationDBResponse{
-		Success: resp.Success,
-		Error:   resp.Error,
-		Path:    resp.Path,
-	}, nil
+	return out, nil
 }
 
 func (m *Manager) ListMigrationDBs(ctx context.Context) ([]corebridge.MigrationDBInfo, error) {
-	dbs, err := migrationfiles.ListMigrationDBs(ctx, m.logger, m.cfg.Runtime.DataDir)
+	dbs, err := migrationfiles.ListMigrationDBs(ctx, m.logger, m.cfg.Runtime.MigrationDBStorageDir)
 	if err != nil {
 		return nil, err
 	}

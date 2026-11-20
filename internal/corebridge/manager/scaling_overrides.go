@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"codeberg.org/Sylos/Migration-Engine/pkg/scaling/loop"
 	"codeberg.org/Sylos/Migration-Engine/pkg/scaling/profile"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/apidb"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/roots"
@@ -38,6 +39,20 @@ type SetMigrationScalingRequest struct {
 	Persist       bool           `json:"persist"`
 	PersistTarget string         `json:"persistTarget,omitempty"`
 	PersistKey    string         `json:"persistKey,omitempty"`
+}
+
+// MigrationAutoscalerView wraps the live autoscaler snapshot for one migration.
+type MigrationAutoscalerView struct {
+	MigrationID string            `json:"migrationId"`
+	Snapshot    loop.LiveSnapshot `json:"snapshot"`
+	// Warnings are operator-facing notes from the last Apply (e.g. seal buffer
+	// size clamped to the absolute max). Empty on GET.
+	Warnings []string `json:"warnings,omitempty"`
+}
+
+// SetMigrationAutoscalerRequest applies live knob min/max/value overlays.
+type SetMigrationAutoscalerRequest struct {
+	Knobs []loop.KnobOverride `json:"knobs"`
 }
 
 // SaveScalingOverridesRequest is the body for PUT /scaling/overrides/...
@@ -195,6 +210,35 @@ func fillCapsFromRows(caps map[profile.WorkerCapMode]int, rows []apidb.ScalingOv
 		}
 		caps[profile.WorkerCapMode(row.Mode)] = row.MaxWorkers
 	}
+}
+
+// GetMigrationAutoscaler returns the live autoscaler operator snapshot.
+func (m *Manager) GetMigrationAutoscaler(ctx context.Context, migrationID string) (MigrationAutoscalerView, error) {
+	mig, err := m.GetMigration(ctx, migrationID)
+	if err != nil {
+		return MigrationAutoscalerView{}, err
+	}
+	return MigrationAutoscalerView{
+		MigrationID: migrationID,
+		Snapshot:    mig.AutoscalerSnapshot(),
+	}, nil
+}
+
+// SetMigrationAutoscaler applies live knob overlays and returns the updated snapshot.
+func (m *Manager) SetMigrationAutoscaler(ctx context.Context, migrationID string, req SetMigrationAutoscalerRequest) (MigrationAutoscalerView, error) {
+	mig, err := m.GetMigration(ctx, migrationID)
+	if err != nil {
+		return MigrationAutoscalerView{}, err
+	}
+	warnings, err := mig.ApplyAutoscalerOverrides(req.Knobs)
+	if err != nil {
+		return MigrationAutoscalerView{}, err
+	}
+	return MigrationAutoscalerView{
+		MigrationID: migrationID,
+		Snapshot:    mig.AutoscalerSnapshot(),
+		Warnings:    warnings,
+	}, nil
 }
 
 // GetMigrationScaling returns the session MaxWorkers overlays for a migration.

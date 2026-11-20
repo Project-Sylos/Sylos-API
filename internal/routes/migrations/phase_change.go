@@ -9,6 +9,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge/manager"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/migrationops"
 	"codeberg.org/Sylos/Sylos-API/internal/routes/middleware"
 )
@@ -74,11 +75,30 @@ func (h handler) changePhase(ctx *middleware.Context, payload PhaseChangeRequest
 		}
 	}
 
+	if health, err := h.mgr.EnsureFSHealthFresh(ctx.Request().Context(), migrationID); err != nil {
+		var failed *manager.FSHealthFailedError
+		if errors.As(err, &failed) {
+			ctx.Response(http.StatusOK, failed.Report)
+			return
+		}
+		if health != nil && !health.OK {
+			ctx.Response(http.StatusOK, *health)
+			return
+		}
+		ctx.Error(http.StatusBadRequest, err.Error(), err)
+		return
+	}
+
 	// Validate synchronously before starting background operation
 	// This allows us to return immediate errors to the client
 	bgCtx := context.Background()
 	migration, err := h.mgr.ChangePhase(bgCtx, migrationID, payload.Phase, payload.StartMigrationRequest)
 	if err != nil {
+		var failed *manager.FSHealthFailedError
+		if errors.As(err, &failed) {
+			ctx.Response(http.StatusOK, failed.Report)
+			return
+		}
 		// Return error response with success: false
 		h.logger.Error().
 			Err(err).
@@ -91,7 +111,7 @@ func (h handler) changePhase(ctx *middleware.Context, payload PhaseChangeRequest
 		if strings.Contains(err.Error(), "invalid phase") ||
 			strings.Contains(err.Error(), "pending retries") ||
 			strings.Contains(err.Error(), "running background tasks") ||
-			strings.Contains(err.Error(), "DuckDB file not found") {
+			strings.Contains(err.Error(), "DB file not found") {
 			statusCode = http.StatusBadRequest
 		}
 

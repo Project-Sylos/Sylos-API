@@ -46,7 +46,7 @@ func (m *Manager) clearMigrationRuntimeAndDisk(ctx context.Context) error {
 		}
 	}
 
-	if err := migrationfiles.CleanMigrationData(m.cfg.Runtime.DataDir); err != nil {
+	if err := migrationfiles.CleanMigrationData(m.cfg.Runtime.MigrationDBStorageDir); err != nil {
 		return fmt.Errorf("clean migration data files: %w", err)
 	}
 
