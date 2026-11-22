@@ -169,7 +169,7 @@ func (m *Manager) oauthProviderCredentials(providerID string) (oauthcreds.Provid
 	}
 }
 
-// DataDir returns the configured runtime data directory (install DB, api-runtime.log).
+// DataDir returns the configured runtime data directory (install DB under sylos.api/).
 func (m *Manager) DataDir() string {
 	if m == nil {
 		return ""

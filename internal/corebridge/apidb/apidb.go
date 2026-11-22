@@ -17,6 +17,7 @@ type DB struct {
 	dir       string
 	masterKey []byte
 	db        *badger.DB
+	logBuf    *apiLogBuffer
 }
 
 // Open opens or creates the API Badger store (sylos.api/). masterKey must be the 32-byte install key from masterkey.Resolve.
@@ -51,6 +52,7 @@ func Open(dataDir string, masterKey []byte) (*DB, error) {
 		_ = raw.Close()
 		return nil, fmt.Errorf("seed builtin rulesets: %w", err)
 	}
+	d.logBuf = newAPILogBuffer(d, apiLogBatchSize, apiLogFlushEvery)
 	return d, nil
 }
 
@@ -59,6 +61,10 @@ func (d *DB) Path() string {
 }
 
 func (d *DB) Close() error {
+	if d.logBuf != nil {
+		d.logBuf.Stop()
+		d.logBuf = nil
+	}
 	if d.db != nil {
 		err := d.db.Close()
 		d.db = nil

@@ -53,7 +53,7 @@ func New(deps Dependencies) chi.Router {
 
 	mw := deps.Middleware
 	if mw == nil {
-		mw, _ = middlewarepkg.New(deps.Logger, "")
+		mw = middlewarepkg.New(deps.Logger, nil)
 	}
 
 	healthroutes.Register(router)

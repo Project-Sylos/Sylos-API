@@ -118,13 +118,7 @@ func Run(ctx context.Context, opts Options) error {
 		return fmt.Errorf("failed to initialize auth manager: %w", err)
 	}
 
-	apiMiddleware, err := middleware.New(log, filepath.Join(cfg.Runtime.DataDir, "api-runtime.log"))
-	if err != nil {
-		log.Warn().Err(err).Msg("failed to initialize API middleware logger; proceeding without runtime file log")
-	}
-	if apiMiddleware != nil {
-		defer apiMiddleware.Close()
-	}
+	apiMiddleware := middleware.New(log, apiDB)
 
 	router := routes.New(routes.Dependencies{
 		Logger:      log,

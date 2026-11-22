@@ -3,22 +3,23 @@ package middleware
 import (
 	"encoding/json"
 	"errors"
-	"io"
-	"log"
+	"fmt"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/rs/zerolog"
 )
 
+// APILogSink persists request/runtime lines into the install API database.
+type APILogSink interface {
+	AppendAPILog(level, message, component string) error
+}
+
 // Middleware provides helpers for request binding, structured responses, and runtime logging.
 type Middleware struct {
-	logger       zerolog.Logger
-	runtimeLog   *log.Logger
-	runtimeClose io.Closer
+	logger zerolog.Logger
+	sink   APILogSink
 }
 
 // Context carries request/response metadata for handlers wrapped by the middleware.
@@ -31,41 +32,12 @@ type Context struct {
 	err    error
 }
 
-// New constructs a middleware instance that logs to the provided runtime log path.
-// If the path is empty or cannot be opened, logging falls back to stdout.
-func New(logger zerolog.Logger, runtimeLogPath string) (*Middleware, error) {
-	var (
-		writer io.Writer = os.Stdout
-		closer io.Closer
-	)
-
-	if runtimeLogPath != "" {
-		if err := os.MkdirAll(filepath.Dir(runtimeLogPath), 0o755); err != nil {
-			return nil, err
-		}
-
-		file, err := os.OpenFile(runtimeLogPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-		if err != nil {
-			logger.Warn().Err(err).Msg("failed to open runtime log file; falling back to stdout")
-		} else {
-			writer = file
-			closer = file
-		}
-	}
-
+// New constructs a middleware instance. Request lines go to sink (sylos.api/) when non-nil.
+func New(logger zerolog.Logger, sink APILogSink) *Middleware {
 	return &Middleware{
-		logger:       logger,
-		runtimeLog:   log.New(writer, "", log.LstdFlags|log.LUTC),
-		runtimeClose: closer,
-	}, nil
-}
-
-// Close closes any file handles owned by the middleware.
-func (mw *Middleware) Close() error {
-	if mw.runtimeClose != nil {
-		return mw.runtimeClose.Close()
+		logger: logger,
+		sink:   sink,
 	}
-	return nil
 }
 
 // JSON wraps a handler expecting a JSON payload of type T.
@@ -228,18 +200,25 @@ func writeJSON(w http.ResponseWriter, status int, payload any) error {
 }
 
 func (mw *Middleware) logRequest(ctx *Context, duration time.Duration) {
-	if mw.runtimeLog == nil {
+	if mw.sink == nil {
 		return
 	}
 	errMsg := ""
 	if ctx.err != nil {
 		errMsg = ctx.err.Error()
 	}
-	mw.runtimeLog.Printf("%s %s %d %s error=%s",
+	level := "info"
+	if ctx.status >= http.StatusInternalServerError {
+		level = "error"
+	} else if ctx.status >= http.StatusBadRequest {
+		level = "warn"
+	}
+	msg := fmt.Sprintf("%s %s %d %s error=%s",
 		ctx.r.Method,
 		ctx.r.URL.Path,
 		ctx.status,
 		duration.Truncate(time.Millisecond),
 		errMsg,
 	)
+	_ = mw.sink.AppendAPILog(level, msg, "http")
 }

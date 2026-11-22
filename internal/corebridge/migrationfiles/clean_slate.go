@@ -8,8 +8,7 @@ import (
 
 // preservedDataDirEntries are never deleted during a clean slate.
 var preservedDataDirEntries = map[string]bool{
-	"api-runtime.log": true,
-	"sylos.api":       true,
+	"sylos.api": true,
 }
 
 // CleanMigrationData removes on-disk migration folders under the migration DB storage dir.
