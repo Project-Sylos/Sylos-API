@@ -10,7 +10,7 @@ Public REST layer for Sylos that sits between the browser UI (Sylos-UI / embedde
 
 - **Thin but explicit router**: Chi-based route tree with domain packages (`auth`, `users`, `services`, `providers`, `migrations`, `health`, …) so each concern lives in a focused module.
 - **Core bridge manager**: `internal/corebridge` translates REST requests into Migration Engine calls, handles adapter lifecycle (local, Spectra, cloud), and tracks run state.
-- **Config-driven services**: `config.yaml` (or `SYLOS_*` env vars) define available connectors and queue/log tuning; the API validates and normalizes everything at startup.
+- **Baked-in defaults**: `pkg/config` hardcodes production defaults (port, OS app-data dirs, provider catalog, local FS). No YAML config file.
 - **Structured logging + graceful shutdown**: Zerolog for consistent logging, plus proper signal handling so queue workers have time to drain.
 - **Local-first ergonomics**: Go toolchain matching `go.mod`, `make run/test/tidy`, and local `replace` directives for developing alongside Migration Engine, Sylos-FS, and Spectra.
 
@@ -28,17 +28,12 @@ Public REST layer for Sylos that sits between the browser UI (Sylos-UI / embedde
      └─ Sylos-API/
    ```
    The `replace` directives in `go.mod` point at those siblings for local development.
-3. Create `config.yaml` (defaults work for local use) and optionally set a JWT secret:
-   ```bash
-   export SYLOS_JWT_SECRET="super-secret-key"
-   ```
-4. Adjust `config.yaml` (see [Configuration](#configuration)) to declare the local/Spectra services you want to expose.
-5. Boot the server:
+3. Boot the server (no config file):
    ```bash
    make run
    ```
-   By default it listens on `http://localhost:8086`.
-6. Run the usual sanity checks:
+   By default it listens on `http://localhost:8086` and stores data under the OS app-data directory. A working OS keyring is required.
+4. Run the usual sanity checks:
    ```bash
    make test
    ```
@@ -60,7 +55,7 @@ Sylos-UI / browser ──▶ Sylos API (this repo) ──▶ Migration Engine �
 ```
 
 - `main.go` / `pkg/app` wires configuration, logging, the core bridge manager, and the Chi router, then starts an HTTP server with graceful shutdown semantics.
-- `pkg/config` loads YAML + environment overrides, normalizes absolute data directories, and builds the allow-listed service catalog (local filesystem roots, Spectra worlds, etc.).
+- `pkg/config` returns baked-in defaults, creates OS app-data and migration-dbs directories, and builds the service/provider catalog.
 - `internal/corebridge` is the translation layer:
   - **`Bridge`** interface and request/response types (`bridge.go`, `types_*.go`),
   - **`manager`** implements the bridge (roots, lifecycle, progress, uploads, providers),
@@ -76,50 +71,15 @@ Sylos-UI / browser ──▶ Sylos API (this repo) ──▶ Migration Engine �
 
 ## Configuration
 
-Configuration flows through [`pkg/config`](pkg/config). Sources:
+There is no `config.yaml`. [`pkg/config.Load`](pkg/config) returns baked-in production defaults:
 
-- Environment variables (`SYLOS_*`, e.g. `SYLOS_HTTP_PORT=9090`).
-- `config.yaml` in the project root (create from defaults or copy from a known-good install).
-- Optional `SYLOS_CONFIG_PATH` pointing to a different file.
+- HTTP port `8086` (Sylos launcher can override with `--port`)
+- Data under the OS app-data directory (`org.sylos.app`), with `migration-dbs/` underneath
+- Full cloud provider catalog enabled; local filesystem with empty root (unrestricted browse)
+- No Spectra connectors in the shipped catalog
+- Install master key from the OS keyring only (see [`docs/ENCRYPTION.md`](docs/ENCRYPTION.md))
 
-Key sections:
-
-```yaml
-environment: development
-http:
-  port: 8086
-jwt:
-  secret: "change-me"            # optional; random secret generated if omitted
-  access_token_ttl: "15m"
-runtime:
-  data_dir: "./data"             # outputs DBs, logs here (normalized to absolute path)
-  log_address: "127.0.0.1:8081"  # optional UDP listener for live logs
-  log_level: "info"
-  enable_logging_terminal: false
-  default_worker_count: 10
-  default_max_retries: 3
-  default_coordinator_lead: 4
-services:
-  local:
-    - id: "local"
-      name: "Local Filesystem"
-      root_path: "/path/to/allowlisted/root"   # server-side absolute path
-  spectra:
-    - id: "spectra-primary"
-      name: "Spectra Primary"
-      config_path: "../Migration-Engine/pkg/configs/spectra.json"
-      world: "primary"
-      root_id: "root"
-```
-
-Important notes:
-
-- **JWT secret**: if omitted, the server generates a random secret on first startup and stores it in `sylos.api/` install config. Set `SYLOS_JWT_SECRET` or `jwt.secret` in config to override.
-- **Local services**: users can only browse within the configured `root_path` (the service enforces prefix checks).
-- **Spectra services**: each entry identifies a config file and world; the API spawns a temporary Spectra SDK client per request.
-- **Runtime data**: migration databases and log buffers are written under `${runtime.data_dir}/${migrationID}/`. The directory is created automatically.
-- **Logging terminal**: set `runtime.enable_logging_terminal=true` and `runtime.log_address` to automatically spawn a log terminal process when starting migrations. The terminal displays live UDP logs from the migration engine. You can also toggle it mid-run via `POST /api/migrations/log-terminal`.
-- **Encryption**: see [`docs/ENCRYPTION.md`](docs/ENCRYPTION.md) for install master key and per-migration DB encryption.
+JWT secret is generated on first startup and stored in `sylos.api/` install config. Non-Google OAuth apps may be seeded from build-time ldflags (`internal/oauthbuiltin`), filled from the Sylos launcher’s `oauth.env` + `oauth.key` (see the Sylos README).
 
 ---
 

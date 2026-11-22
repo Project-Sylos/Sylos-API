@@ -38,7 +38,7 @@ func (m *Manager) DeleteMigration(ctx context.Context, migrationID string) (Dele
 		m.rootsMgr.ClearPlan(id)
 	}
 
-	dir, err := m.migrationDirFor(id)
+	dir, err := m.storedMigrationDir(id)
 	if err != nil {
 		return DeleteMigrationResult{}, err
 	}
@@ -63,7 +63,7 @@ func (m *Manager) DeleteMigration(ctx context.Context, migrationID string) (Dele
 		}
 	}
 
-	if err := migrationfiles.RemoveMigrationDir(m.cfg.Runtime.MigrationDBStorageDir, id); err != nil {
+	if err := migrationfiles.RemoveMigrationFolder(dir, id); err != nil {
 		return DeleteMigrationResult{}, err
 	}
 

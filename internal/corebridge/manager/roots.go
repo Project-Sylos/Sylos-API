@@ -61,9 +61,10 @@ func (m *Manager) SetRoot(ctx context.Context, req corebridge.SetRootRequest) (c
 		if _, err := m.apiDB.EnsureMigrationKey(migrationID); err != nil {
 			return corebridge.SetRootResponse{}, err
 		}
-		// Per-migration flow: create folder and materialize the migration (DB + row) so Start and polling never race on pending→persist.
 		migrationDir := migrationfiles.MigrationDir(m.cfg.Runtime.MigrationDBStorageDir, migrationID)
-		_ = os.MkdirAll(migrationDir, 0755)
+		if err := os.MkdirAll(migrationDir, 0755); err != nil {
+			return corebridge.SetRootResponse{}, err
+		}
 		if _, err := m.GetMigration(ctx, migrationID); err != nil {
 			return corebridge.SetRootResponse{}, err
 		}
@@ -166,8 +167,12 @@ func (m *Manager) SetRoot(ctx context.Context, req corebridge.SetRootRequest) (c
 	rec := existingMeta
 	rec.ID = resp.MigrationID
 	rec.Name = recName
-	if !quiet || strings.TrimSpace(resp.DatabasePath) != "" {
-		rec.DatabasePath = resp.DatabasePath
+	if path := strings.TrimSpace(resp.DatabasePath); path != "" {
+		rec.DatabasePath = path
+	} else if rec.DatabasePath == "" {
+		if p, err := m.logicalDatabasePath(resp.MigrationID); err == nil {
+			rec.DatabasePath = p
+		}
 	}
 	rec.IsNewMigration = isNewMigration
 	if source, destination, ok := m.cachedMigrationRoots(resp.MigrationID); ok {

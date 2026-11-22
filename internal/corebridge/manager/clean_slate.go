@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge/apidb"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/migrationfiles"
 	"codeberg.org/Sylos/Sylos-API/pkg/oauthcreds"
 )
@@ -40,14 +41,30 @@ func (m *Manager) clearMigrationRuntimeAndDisk(ctx context.Context) error {
 
 	m.connMgr.ClearAll()
 
+	var recs []apidb.MigrationRecord
+	if m.apiDB != nil {
+		listed, err := m.apiDB.ListMigrations()
+		if err != nil {
+			return fmt.Errorf("list migration registry: %w", err)
+		}
+		recs = listed
+	}
+
+	for _, rec := range recs {
+		dir, err := migrationfiles.FolderFromDatabasePath(rec.DatabasePath, rec.ID)
+		if err != nil {
+			m.logger.Warn().Err(err).Str("migration_id", rec.ID).Msg("clear migrations: stored database path")
+			continue
+		}
+		if err := migrationfiles.RemoveMigrationFolder(dir, rec.ID); err != nil {
+			m.logger.Warn().Err(err).Str("migration_id", rec.ID).Str("path", dir).Msg("clear migrations: remove folder")
+		}
+	}
+
 	if m.apiDB != nil {
 		if err := m.apiDB.DeleteAllMigrationRegistry(); err != nil {
 			return fmt.Errorf("clear migration registry: %w", err)
 		}
-	}
-
-	if err := migrationfiles.CleanMigrationData(m.cfg.Runtime.MigrationDBStorageDir); err != nil {
-		return fmt.Errorf("clean migration data files: %w", err)
 	}
 
 	return nil

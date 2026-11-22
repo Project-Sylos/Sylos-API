@@ -6,14 +6,10 @@ Sylos uses a two-tier key model. Ops Badger directories are **not** encrypted as
 
 | Key | Storage | Protects |
 |-----|---------|----------|
-| **Install master key** (32 bytes) | OS keyring (`Sylos` / `install-master-key`) by default, or `creds/.env` with `--use-env-keys` | Per-migration keys and SFTP saved-host secrets inside `sylos.api/` |
+| **Install master key** (32 bytes) | OS keyring only (`Sylos` / `install-master-key`) | Per-migration keys and SFTP saved-host secrets inside `sylos.api/` |
 | **Per-migration key** (32 bytes) | Encrypted row `migkey:{id}` in `sylos.api/` (wrapped by install master key) | OAuth / SFTP session credential payloads in `{id}.ops/` (`oauth:{connectionID}` as `enc:v1:…`) |
 
-Default mode requires a working OS keyring; startup fails if the key cannot be read or stored there.
-
-With `--use-env-keys`, `SYLOS_MASTER_KEY` overrides `creds/.env`. Setting `SYLOS_MASTER_KEY` or `SYLOS_KEY_FILE` without `--use-env-keys` is rejected at startup.
-
-There is no plaintext fallback file for the install master key in default mode.
+Startup requires a working OS keyring. If the key cannot be read or stored there, the process exits with a clear error. There is no file or env fallback for the install master key.
 
 ## What is encrypted
 
@@ -26,7 +22,7 @@ There is no plaintext fallback file for the install master key in default mode.
 - Entire `sylos.api/` and `{id}.ops/` Badger files (filesystem permissions apply)
 - Catalog / frontier / status / indexes inside ops stores
 - Provider OAuth **app** credentials (`client_id` / `client_secret`) in `sylos.api/`
-- JWT signing secret (`install_config` in `sylos.api/`, or `SYLOS_JWT_SECRET` / `jwt.secret` in config)
+- JWT signing secret (`install_config` in `sylos.api/`)
 - In-memory OAuth access tokens
 
 ## Export / import
@@ -41,18 +37,14 @@ Do not ship or re-wrap the install master key or `migkey:` blobs as part of a po
 
 ## Backup and recovery
 
-**Losing the install master key means loss of wrapped per-migration keys and API-side SFTP secrets.** Back up one of:
-
-- OS keyring export for service `Sylos` / user `install-master-key`
-- `creds/.env` / `SYLOS_MASTER_KEY` when using `--use-env-keys`
+**Losing the install master key means loss of wrapped per-migration keys and API-side SFTP secrets.** Back up the OS keyring entry for service `Sylos` / user `install-master-key`.
 
 Exported ops zips intentionally omit usable tokens; resume on another install requires re-login to cloud/SFTP providers.
 
-## Operator flags
+## Operator usage
 
 ```bash
-./bin/sylos                  # default: keyring
-./bin/sylos --use-env-keys   # read/write SYLOS_MASTER_KEY in creds/.env
+./bin/sylos   # requires OS keyring
 ```
 
 ## Validation checklist
@@ -67,5 +59,5 @@ Before relying on encryption in production:
 
 ## Threat model notes
 
-- Provider OAuth app credentials (`client_id` / `client_secret`) live in the API store; configure in the UI when choosing a cloud service or under Settings → Cloud providers.
+- Provider OAuth app credentials (`client_id` / `client_secret`) live in the API store. Shipped builds may seed Sylos-owned apps for Dropbox, Box, OneDrive, and SharePoint from Sylos `oauth.env` (`enc:…` values + `oauth.key`, revealed at link time). The committed key is not a secrecy boundary. Google Drive remains bring-your-own-app. Admins can still override under Settings → Cloud providers.
 - No legacy import from `users.duckdb`, `.enc` files, or `migrations.yaml`.

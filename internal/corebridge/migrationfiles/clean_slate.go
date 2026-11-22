@@ -12,7 +12,7 @@ var preservedDataDirEntries = map[string]bool{
 	"sylos.api":       true,
 }
 
-// CleanMigrationData removes on-disk migration folders.
+// CleanMigrationData removes on-disk migration folders under the migration DB storage dir.
 // User accounts, provider OAuth apps, and the encrypted API database file are preserved.
 func CleanMigrationData(dataDir string) error {
 	absDataDir, err := filepath.Abs(dataDir)

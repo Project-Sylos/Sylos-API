@@ -12,8 +12,8 @@ import (
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/apidb"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/connections"
-	"codeberg.org/Sylos/Sylos-API/internal/corebridge/migrationfiles"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/migrationaccess"
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge/migrationfiles"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/roots"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/services"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/terminal"
@@ -24,16 +24,16 @@ import (
 
 // Manager implements corebridge.Bridge.
 type Manager struct {
-	logger      zerolog.Logger
-	cfg         config.Config
-	serviceMgr  *services.ServiceManager
-	connMgr     *connections.Manager
-	rootsMgr    *roots.Manager
-	engineMgr   *migration.MigrationManager
+	logger     zerolog.Logger
+	cfg        config.Config
+	serviceMgr *services.ServiceManager
+	connMgr    *connections.Manager
+	rootsMgr   *roots.Manager
+	engineMgr  *migration.MigrationManager
 	*terminal.Manager
-	bgTaskMgr   *corebridge.BackgroundTaskManager
-	apiDB       *apidb.DB
-	migAccess   *migrationaccess.Opener
+	bgTaskMgr *corebridge.BackgroundTaskManager
+	apiDB     *apidb.DB
+	migAccess *migrationaccess.Opener
 
 	mu              sync.RWMutex
 	runtimeByID     map[string]*runtimeMigration
@@ -192,8 +192,27 @@ func (m *Manager) migrationDirFor(migrationID string) (string, error) {
 	return filepath.Abs(dir)
 }
 
+func (m *Manager) logicalDatabasePath(migrationID string) (string, error) {
+	dir, err := m.migrationDirFor(migrationID)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, migrationID+".db"), nil
+}
+
+func (m *Manager) storedMigrationDir(migrationID string) (string, error) {
+	rec, err := m.getMigrationRecord(migrationID)
+	if err != nil {
+		return "", err
+	}
+	if rec.DatabasePath == "" {
+		return "", fmt.Errorf("migration %q has no stored database path", migrationID)
+	}
+	return migrationfiles.FolderFromDatabasePath(rec.DatabasePath, migrationID)
+}
+
 // GetMigration returns the engine *Migration for the given ID, or ErrMigrationNotFound.
-// When using per-migration DBs, the engine expects the migration folder path (e.g. data/{id}) so it can open or create the DB there.
+// When using per-migration DBs, the engine expects the migration folder path (e.g. migration-dbs/{id}) so it can open or create the DB there.
 // FS adapters are not rehydrated here; call ensureFSAdaptersRehydrated before traversal, copy, or live FS browse.
 func (m *Manager) GetMigration(_ context.Context, migrationID string) (*migration.Migration, error) {
 	// Live/recent runtime migrations are already open and carry their decrypted key.

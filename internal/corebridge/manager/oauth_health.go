@@ -17,11 +17,11 @@ import (
 const installConfigOAuthHealthScanMinutes = "oauth_health_scan_interval_minutes"
 
 const (
-	OAuthHealthHealthy        = "healthy"
-	OAuthHealthUnhealthy      = "unhealthy"
-	OAuthHealthSkipped        = "skipped"
-	OAuthHealthNotConfigured  = "not_configured"
-	OAuthHealthUnknown        = "unknown"
+	OAuthHealthHealthy       = "healthy"
+	OAuthHealthUnhealthy     = "unhealthy"
+	OAuthHealthSkipped       = "skipped"
+	OAuthHealthNotConfigured = "not_configured"
+	OAuthHealthUnknown       = "unknown"
 )
 
 // OAuthHealthSummary is returned to the UI for settings badges.
@@ -188,6 +188,7 @@ func (m *Manager) checkOAuthProviderHealth(providerID string, skipBecauseLive bo
 		return summary, nil
 	}
 	summary.Configured = app.ClientID != "" && app.ClientSecret != ""
+	summary.IsDefault = app.IsDefault
 	summary.ClientID = app.ClientID
 	if app.DisplayName != "" {
 		summary.DisplayName = app.DisplayName
@@ -272,6 +273,7 @@ func oauthSummaryFromApp(app apidb.ProviderOAuthApp, fallbackName string) OAuthA
 		ProviderID:  app.ProviderID,
 		DisplayName: fallbackName,
 		Configured:  app.ClientID != "" && app.ClientSecret != "",
+		IsDefault:   app.IsDefault,
 		ClientID:    app.ClientID,
 		TenantID:    app.TenantID,
 	}

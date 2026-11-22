@@ -12,8 +12,9 @@ import (
 	"codeberg.org/Sylos/Sylos-API/internal/auth/jwtsecret"
 	"codeberg.org/Sylos/Sylos-API/internal/auth/users"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/apidb"
-	"codeberg.org/Sylos/Sylos-API/internal/corebridge/masterkey"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/manager"
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge/masterkey"
+	"codeberg.org/Sylos/Sylos-API/internal/oauthbuiltin"
 	"codeberg.org/Sylos/Sylos-API/internal/routes"
 	"codeberg.org/Sylos/Sylos-API/internal/routes/middleware"
 	"codeberg.org/Sylos/Sylos-API/internal/server"
@@ -25,7 +26,6 @@ import (
 type Options struct {
 	Config        config.Config
 	StaticHandler http.Handler
-	UseEnvKeys    bool
 	// Ready is closed once the HTTP listener is accepting connections (optional).
 	Ready chan<- struct{}
 }
@@ -36,11 +36,7 @@ func Run(ctx context.Context, opts Options) error {
 	log := logger.New(cfg.Environment)
 	log.Info().Msg("starting Sylos API server")
 
-	masterKey, err := masterkey.Resolve(masterkey.Config{
-		DataDir:       cfg.Runtime.DataDir,
-		OAuthCredsDir: cfg.Runtime.OAuthCredsDir,
-		UseEnvKeys:    opts.UseEnvKeys,
-	})
+	masterKey, err := masterkey.Resolve()
 	if err != nil {
 		return fmt.Errorf("failed to resolve install master key: %w", err)
 	}
@@ -56,6 +52,17 @@ func Run(ctx context.Context, opts Options) error {
 	}
 	defer apiDB.Close()
 	log = logger.WithAPIPersist(log, apiDB)
+
+	// When ldflags did not bake credentials, fill empty slots from oauth.env + oauth.key in cwd.
+	if err := oauthbuiltin.ApplyObscuredEnvFile("oauth.env", "oauth.key"); err != nil {
+		log.Warn().Err(err).Msg("failed to load oauth.env")
+	}
+
+	if n, seedErr := oauthbuiltin.SeedMissingApps(apiDB); seedErr != nil {
+		log.Warn().Err(seedErr).Msg("failed to seed builtin oauth apps")
+	} else if n > 0 {
+		log.Info().Int("count", n).Msg("seeded builtin oauth apps")
+	}
 
 	userStore, err := users.Open(apiDB, cfg.Auth.BcryptCost)
 	if err != nil {

@@ -380,6 +380,11 @@ func (m *Manager) SetRoot(ctx context.Context, req SetRootRequest) (SetRootRespo
 		plan.Seeded = false
 		plan.Seeding = false
 		plan.DatabasePath = ""
+		if m.resolveDBPath != nil {
+			if p, err := m.resolveDBPath("", migrationID); err == nil {
+				plan.DatabasePath = p
+			}
+		}
 		plan.RootSummary = migration.RootSeedSummary{}
 		_ = m.savePreparationLocked(migrationID, plan)
 	}

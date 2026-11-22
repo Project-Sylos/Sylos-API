@@ -8,25 +8,37 @@ import (
 )
 
 // RemoveMigrationDir deletes storageDir/{migrationID}/ (ops store, configs, etc.).
-func RemoveMigrationDir(dataDir, migrationID string) error {
-	raw := strings.TrimSpace(migrationID)
-	if raw == "" || strings.Contains(raw, "..") || strings.ContainsAny(raw, `/\`) {
-		return fmt.Errorf("invalid migration id")
-	}
-	id := NormalizeMigrationID(raw)
-	if id == "" || id == "." || strings.Contains(id, "..") || strings.ContainsAny(id, `/\`) {
-		return fmt.Errorf("invalid migration id")
-	}
-	absDataDir, err := filepath.Abs(dataDir)
+func RemoveMigrationDir(storageDir, migrationID string) error {
+	id, err := canonicalMigrationID(migrationID)
 	if err != nil {
-		return fmt.Errorf("resolve data dir: %w", err)
+		return err
 	}
-	dir := filepath.Join(absDataDir, id)
-	rel, err := filepath.Rel(absDataDir, dir)
+	absStorage, err := filepath.Abs(storageDir)
+	if err != nil {
+		return fmt.Errorf("resolve storage dir: %w", err)
+	}
+	dir := filepath.Join(absStorage, id)
+	rel, err := filepath.Rel(absStorage, dir)
 	if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
-		return fmt.Errorf("refusing to remove path outside data dir")
+		return fmt.Errorf("refusing to remove path outside storage dir")
 	}
-	if err := os.RemoveAll(dir); err != nil {
+	return RemoveMigrationFolder(dir, id)
+}
+
+// RemoveMigrationFolder deletes one migration folder. The last path component must be the id.
+func RemoveMigrationFolder(dir, migrationID string) error {
+	id, err := canonicalMigrationID(migrationID)
+	if err != nil {
+		return err
+	}
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return fmt.Errorf("resolve migration dir: %w", err)
+	}
+	if filepath.Base(abs) != id {
+		return fmt.Errorf("refusing to remove path that does not match migration id")
+	}
+	if err := os.RemoveAll(abs); err != nil {
 		return fmt.Errorf("remove migration dir %q: %w", id, err)
 	}
 	return nil

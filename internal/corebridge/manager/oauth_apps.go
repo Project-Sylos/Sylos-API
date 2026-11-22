@@ -16,6 +16,7 @@ type OAuthAppSummary struct {
 	ProviderID           string     `json:"providerId"`
 	DisplayName          string     `json:"displayName"`
 	Configured           bool       `json:"configured"`
+	IsDefault            bool       `json:"isDefault,omitempty"`
 	ClientID             string     `json:"clientId,omitempty"`
 	TenantID             string     `json:"tenantId,omitempty"`
 	HealthStatus         string     `json:"healthStatus"`

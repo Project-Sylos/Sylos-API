@@ -35,17 +35,21 @@ func TestDeleteMigrationRemovesRegistryAndDir(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := db.UpsertMigration(apidb.MigrationRecord{
-		ID:        id,
-		Name:      "Delete Me",
-		CreatedAt: time.Now().UTC(),
-		Phase:     "awaiting-copy-review",
+		ID:           id,
+		Name:         "Delete Me",
+		DatabasePath: filepath.Join(migDir, id+".db"),
+		CreatedAt:    time.Now().UTC(),
+		Phase:        "awaiting-copy-review",
 	}); err != nil {
 		t.Fatal(err)
 	}
 
 	mgr := &Manager{
-		logger:       zerolog.Nop(),
-		cfg:          config.Config{Runtime: config.RuntimeConfig{DataDir: dataDir}},
+		logger: zerolog.Nop(),
+		cfg: config.Config{Runtime: config.RuntimeConfig{
+			DataDir:               dataDir,
+			MigrationDBStorageDir: dataDir,
+		}},
 		apiDB:        db,
 		engineMgr:    migration.NewMigrationManager(),
 		rootsMgr:     roots.NewManager(zerolog.Nop(), dataDir, nil, nil),
@@ -66,5 +70,100 @@ func TestDeleteMigrationRemovesRegistryAndDir(t *testing.T) {
 	}
 	if _, err := os.Stat(migDir); !os.IsNotExist(err) {
 		t.Fatalf("migration dir still present, err=%v", err)
+	}
+}
+
+func TestDeleteMigrationUsesStoredDatabasePath(t *testing.T) {
+	t.Parallel()
+
+	dataDir := t.TempDir()
+	storageDir := filepath.Join(t.TempDir(), "migration-dbs")
+	db, err := apidb.Open(dataDir, testAPIKey(t))
+	if err != nil {
+		t.Fatalf("open api db: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	id := "mig-stored-path"
+	actualDir := filepath.Join(t.TempDir(), "elsewhere", id)
+	if err := os.MkdirAll(filepath.Join(actualDir, id+".ops"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(actualDir, id+".db")
+	if err := os.WriteFile(dbPath, []byte{}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wrongDir := filepath.Join(storageDir, id)
+	if err := os.MkdirAll(wrongDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.UpsertMigration(apidb.MigrationRecord{
+		ID:           id,
+		Name:         "Stored Path",
+		DatabasePath: dbPath,
+		CreatedAt:    time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	mgr := &Manager{
+		logger: zerolog.Nop(),
+		cfg: config.Config{Runtime: config.RuntimeConfig{
+			DataDir:               dataDir,
+			MigrationDBStorageDir: storageDir,
+		}},
+		apiDB:        db,
+		engineMgr:    migration.NewMigrationManager(),
+		rootsMgr:     roots.NewManager(zerolog.Nop(), storageDir, nil, nil),
+		runtimeByID:  map[string]*runtimeMigration{},
+		progressByID: map[string]map[string]chan corebridge.ProgressEvent{},
+	}
+
+	if _, err := mgr.DeleteMigration(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(actualDir); !os.IsNotExist(err) {
+		t.Fatalf("stored folder still present, err=%v", err)
+	}
+	if _, err := os.Stat(wrongDir); err != nil {
+		t.Fatalf("configured storage folder should be left alone: %v", err)
+	}
+}
+
+func TestDeleteMigrationRequiresStoredDatabasePath(t *testing.T) {
+	t.Parallel()
+
+	dataDir := t.TempDir()
+	db, err := apidb.Open(dataDir, testAPIKey(t))
+	if err != nil {
+		t.Fatalf("open api db: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	id := "mig-no-path"
+	if err := db.UpsertMigration(apidb.MigrationRecord{
+		ID:        id,
+		Name:      "No Path",
+		CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	mgr := &Manager{
+		logger: zerolog.Nop(),
+		cfg: config.Config{Runtime: config.RuntimeConfig{
+			DataDir:               dataDir,
+			MigrationDBStorageDir: dataDir,
+		}},
+		apiDB:        db,
+		engineMgr:    migration.NewMigrationManager(),
+		rootsMgr:     roots.NewManager(zerolog.Nop(), dataDir, nil, nil),
+		runtimeByID:  map[string]*runtimeMigration{},
+		progressByID: map[string]map[string]chan corebridge.ProgressEvent{},
+	}
+
+	if _, err := mgr.DeleteMigration(context.Background(), id); err == nil {
+		t.Fatal("expected error when databasePath is missing")
 	}
 }

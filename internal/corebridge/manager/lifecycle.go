@@ -236,6 +236,16 @@ func (m *Manager) ensureMigration(_ context.Context, requestedID string) (*migra
 	if err != nil {
 		return nil, err
 	}
+	if rec, recErr := m.getMigrationRecord(created.ID); recErr == nil && rec.DatabasePath == "" {
+		if p, pathErr := m.logicalDatabasePath(created.ID); pathErr == nil {
+			rec.ID = created.ID
+			if rec.Name == "" {
+				rec.Name = created.ID
+			}
+			rec.DatabasePath = p
+			_ = m.upsertMigrationRecord(rec)
+		}
+	}
 	return loaded, nil
 }
 
@@ -245,6 +255,9 @@ func (m *Manager) updateMetadataForMigrationID(migrationID string) error {
 	dbPath := ""
 	if plan != nil {
 		dbPath = plan.DatabasePath
+	}
+	if dbPath == "" {
+		dbPath, _ = m.logicalDatabasePath(migrationID)
 	}
 	if err != nil || rec.ID == "" {
 		rec = apidb.MigrationRecord{
