@@ -52,6 +52,7 @@ func (h handler) listDiffs(ctx *middleware.Context) {
 	}
 
 	includeDestinationOnly := parseOptionalBoolQuery(ctx.Request().URL.Query().Get("includeDestinationOnly"))
+	side := ctx.Request().URL.Query().Get("side")
 
 	mig, err := h.mgr.GetMigration(ctx.Request().Context(), migrationID)
 	if err != nil {
@@ -75,6 +76,7 @@ func (h handler) listDiffs(ctx *middleware.Context) {
 		AfterPath:              afterPath,
 		FoldersOnly:            foldersOnly,
 		IncludeDestinationOnly: includeDestinationOnly,
+		Side:                   side,
 	})
 	if err != nil {
 		ctx.Error(http.StatusInternalServerError, "failed to list children diffs", err)

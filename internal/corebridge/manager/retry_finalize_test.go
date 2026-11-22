@@ -17,8 +17,7 @@ func TestRetryFinalizeRejectsWrongPhase(t *testing.T) {
 		},
 	}
 	resp, err := m.RetryFinalize(context.Background(), "m1", corebridge.SweepConfigRequest{
-		MemoryLimitGB: 4,
-		Threads:       2,
+		Refold: true,
 	})
 	if err == nil {
 		t.Fatal("expected error for wrong phase")

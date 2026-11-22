@@ -48,7 +48,7 @@ func (m *Manager) migrationRoots(mig *migration.Migration) (source, destination 
 }
 
 // cachedMigrationRoots returns roots from the in-memory root plan. Root bindings
-// are immutable during a live phase, so status polling must not re-read DuckDB.
+// are immutable during a live phase, so status polling must not re-read DB.
 func (m *Manager) cachedMigrationRoots(migrationID string) (source, destination *corebridge.RootInfo, ok bool) {
 	if m.rootsMgr == nil {
 		return nil, nil, false
@@ -59,28 +59,28 @@ func (m *Manager) cachedMigrationRoots(migrationID string) (source, destination 
 	}
 	if plan.HasSource {
 		source = &corebridge.RootInfo{
-			ServiceID:     plan.SourceDefinition.ID,
-			ConnectionID:  plan.SourceConnectionID,
-			ServiceName:   plan.SourceDefinition.Name,
-			ServiceType:   string(plan.SourceDefinition.Type),
-			Name:          plan.SourceRoot.DisplayName,
-			LocationPath:  plan.SourceRoot.LocationPath,
-			NativePath:    plan.SourceRoot.ServiceID,
-			Type:          plan.SourceRoot.Type,
-			ParentID:      plan.SourceRoot.ParentId,
+			ServiceID:    plan.SourceDefinition.ID,
+			ConnectionID: plan.SourceConnectionID,
+			ServiceName:  plan.SourceDefinition.Name,
+			ServiceType:  string(plan.SourceDefinition.Type),
+			Name:         plan.SourceRoot.DisplayName,
+			LocationPath: plan.SourceRoot.LocationPath,
+			NativePath:   plan.SourceRoot.ServiceID,
+			Type:         plan.SourceRoot.Type,
+			ParentID:     plan.SourceRoot.ParentId,
 		}
 	}
 	if plan.HasDestination {
 		destination = &corebridge.RootInfo{
-			ServiceID:     plan.DestinationDefinition.ID,
-			ConnectionID:  plan.DestinationConnectionID,
-			ServiceName:   plan.DestinationDefinition.Name,
-			ServiceType:   string(plan.DestinationDefinition.Type),
-			Name:          plan.DestinationRoot.DisplayName,
-			LocationPath:  plan.DestinationRoot.LocationPath,
-			NativePath:    plan.DestinationRoot.ServiceID,
-			Type:          plan.DestinationRoot.Type,
-			ParentID:      plan.DestinationRoot.ParentId,
+			ServiceID:    plan.DestinationDefinition.ID,
+			ConnectionID: plan.DestinationConnectionID,
+			ServiceName:  plan.DestinationDefinition.Name,
+			ServiceType:  string(plan.DestinationDefinition.Type),
+			Name:         plan.DestinationRoot.DisplayName,
+			LocationPath: plan.DestinationRoot.LocationPath,
+			NativePath:   plan.DestinationRoot.ServiceID,
+			Type:         plan.DestinationRoot.Type,
+			ParentID:     plan.DestinationRoot.ParentId,
 		}
 	}
 	return source, destination, source != nil || destination != nil

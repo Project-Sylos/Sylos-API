@@ -108,6 +108,10 @@ type GetStorageInfoRequest struct {
 	RootType     string
 	DriveID      string
 	Role         string
+	// MigrationID, when set, rehydrates that migration's cloud connection into
+	// the FS manager before querying. Required after API restart so Path Review
+	// free-space matches the live session that existed at root-pick time.
+	MigrationID string
 }
 
 type MountDriveRequest struct {

@@ -1,11 +1,13 @@
 package migrations
 
 import (
+	"errors"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
 
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge/manager"
 	"codeberg.org/Sylos/Sylos-API/internal/routes/middleware"
 )
 
@@ -21,6 +23,11 @@ func (h handler) retrySweep(ctx *middleware.Context, payload corebridge.SweepCon
 	// Trigger retry sweep
 	response, err := h.mgr.TriggerRetrySweep(ctx.Request().Context(), migrationID, payload)
 	if err != nil {
+		var failed *manager.FSHealthFailedError
+		if errors.As(err, &failed) || response.FsHealth != nil {
+			ctx.Response(http.StatusOK, response)
+			return
+		}
 		// Determine appropriate HTTP status code
 		statusCode := http.StatusInternalServerError
 		if !response.Success {

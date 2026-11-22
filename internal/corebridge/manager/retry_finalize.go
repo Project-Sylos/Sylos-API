@@ -9,7 +9,7 @@ import (
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
 )
 
-// RetryFinalize retries seal stop / secondary indexes / checkpoint after *-finalize-failed.
+// RetryFinalize retries seal flush / folder-size fold / checkpoint after *-finalize-failed.
 func (m *Manager) RetryFinalize(ctx context.Context, migrationID string, config corebridge.SweepConfigRequest) (corebridge.SweepResponse, error) {
 	mig, err := m.GetMigration(ctx, migrationID)
 	if err != nil {
@@ -23,10 +23,7 @@ func (m *Manager) RetryFinalize(ctx context.Context, migrationID string, config 
 		return resp, nil
 	}
 
-	opts := migration.FinalizeOverrides{
-		Threads:       config.Threads,
-		MemoryLimitGB: config.MemoryLimitGB,
-	}
+	opts := migration.FinalizeOptions{Refold: config.Refold}
 
 	m.mu.Lock()
 	now := time.Now().UTC()

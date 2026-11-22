@@ -40,7 +40,7 @@ func (m *Manager) persistFSCredentialBinding(migrationID, role string) error {
 		}
 		binding.RootFolderJSON = string(raw)
 		if plan.SourceDefinition.Type == services.ServiceTypeSpectra {
-			if _, ok, _ := services.LoadSpectraConfigOverride(m.cfg.Runtime.DataDir, migrationID); ok {
+			if _, ok, _ := services.LoadSpectraConfigOverride(m.cfg.Runtime.MigrationDBStorageDir, migrationID); ok {
 				binding.CredsConfRelPath = "spectra-config.json"
 			}
 		}
@@ -53,7 +53,7 @@ func (m *Manager) persistFSCredentialBinding(migrationID, role string) error {
 		}
 		binding.RootFolderJSON = string(raw)
 		if plan.DestinationDefinition.Type == services.ServiceTypeSpectra {
-			if _, ok, _ := services.LoadSpectraConfigOverride(m.cfg.Runtime.DataDir, migrationID); ok {
+			if _, ok, _ := services.LoadSpectraConfigOverride(m.cfg.Runtime.MigrationDBStorageDir, migrationID); ok {
 				binding.CredsConfRelPath = "spectra-config.json"
 			}
 		}
@@ -77,6 +77,7 @@ func (m *Manager) persistFSCredentialBinding(migrationID, role string) error {
 			m.connMgr.Set(binding.ConnectionID, rec)
 		}
 	}
+	m.reevaluateImportAttention(migrationID)
 	return nil
 }
 
@@ -97,7 +98,12 @@ func (m *Manager) persistLiveCloudCredentials(mig *migration.Migration, connecti
 }
 
 // ensureFSAdaptersRehydrated rebuilds in-memory FS adapters when a real filesystem operation is needed.
+// Blocked while import attention is set (missing/undecryptable provider credentials). DB-only
+// paths (review, exclude, status) do not call this; SetRoot / Connect re-auth remains allowed.
 func (m *Manager) ensureFSAdaptersRehydrated(migrationID string) error {
+	if err := m.rejectIfNeedsAttention(migrationID); err != nil {
+		return err
+	}
 	mig, err := m.GetMigration(context.Background(), migrationID)
 	if err != nil {
 		return err
@@ -143,7 +149,7 @@ func (m *Manager) rehydrateFSAdaptersIfNeeded(migrationID string, mig *migration
 			}
 			if def.Type == services.ServiceTypeSpectra {
 				if !spectraRegistered[b.ConnectionID] {
-					path, ok, loadErr := services.LoadSpectraConfigOverride(m.cfg.Runtime.DataDir, migrationID)
+					path, ok, loadErr := services.LoadSpectraConfigOverride(m.cfg.Runtime.MigrationDBStorageDir, migrationID)
 					if loadErr != nil {
 						m.logger.Warn().Err(loadErr).Str("migration_id", migrationID).Msg("rehydrate: load spectra config override")
 						continue
@@ -193,9 +199,13 @@ func (m *Manager) persistOAuthCredentials(mig *migration.Migration, connectionID
 	if mig == nil || connectionID == "" || len(credsJSON) == 0 {
 		return nil
 	}
-	return mig.RunStore(func(s *migration.Store) error {
+	if err := mig.RunStore(func(s *migration.Store) error {
 		return s.UpsertOAuthCredentials(connectionID, credsJSON)
-	})
+	}); err != nil {
+		return err
+	}
+	m.reevaluateImportAttention(mig.ID)
+	return nil
 }
 
 func (m *Manager) cloudCredentialsPersistHook(mig *migration.Migration, connectionID string) func(cloud.StoredCredentials) error {

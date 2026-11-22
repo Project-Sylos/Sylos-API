@@ -2,18 +2,23 @@ package manager
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
+	"codeberg.org/Sylos/Sylos-API/internal/corebridge/migrationfiles"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/roots"
 )
 
 func (m *Manager) SetRoot(ctx context.Context, req corebridge.SetRootRequest) (corebridge.SetRootResponse, error) {
-	if err := m.checkPhaseLock(req.MigrationID, "setRoot"); err != nil {
-		return corebridge.SetRootResponse{}, err
+	quiet := req.Reauth || m.migrationNeedsAttention(req.MigrationID)
+	if !quiet {
+		if err := m.checkPhaseLock(req.MigrationID, "setRoot"); err != nil {
+			return corebridge.SetRootResponse{}, err
+		}
 	}
 
 	rootsReq := roots.SetRootRequest{
@@ -33,8 +38,10 @@ func (m *Manager) SetRoot(ctx context.Context, req corebridge.SetRootRequest) (c
 		},
 		Config:      req.Config,
 		ExcludedIDs: req.ExcludedIds,
+		Quiet:       quiet,
 	}
-	if len(req.Children) > 0 {
+	// Quiet re-auth must not rewrite include trees; ignore children/excludes.
+	if !quiet && len(req.Children) > 0 {
 		rootsReq.Children = mapRootChildPlans(req.Children)
 	}
 	if err := m.rootsMgr.ValidateMigrationRoot(req.ServiceID, rootsReq.Root); err != nil {
@@ -43,6 +50,9 @@ func (m *Manager) SetRoot(ctx context.Context, req corebridge.SetRootRequest) (c
 
 	migrationID := req.MigrationID
 	if migrationID == "" {
+		if quiet {
+			return corebridge.SetRootResponse{}, fmt.Errorf("reauth requires an existing migrationId")
+		}
 		created, err := m.engineMgr.CreateMigration(migration.CreateMigrationConfig{Name: "migration"})
 		if err != nil {
 			return corebridge.SetRootResponse{}, err
@@ -52,13 +62,13 @@ func (m *Manager) SetRoot(ctx context.Context, req corebridge.SetRootRequest) (c
 			return corebridge.SetRootResponse{}, err
 		}
 		// Per-migration flow: create folder and materialize the migration (DB + row) so Start and polling never race on pending→persist.
-		migrationDir := filepath.Join(m.cfg.Runtime.DataDir, migrationID)
+		migrationDir := migrationfiles.MigrationDir(m.cfg.Runtime.MigrationDBStorageDir, migrationID)
 		_ = os.MkdirAll(migrationDir, 0755)
 		if _, err := m.GetMigration(ctx, migrationID); err != nil {
 			return corebridge.SetRootResponse{}, err
 		}
 	} else {
-		migrationDir := filepath.Join(m.cfg.Runtime.DataDir, migrationID)
+		migrationDir := migrationfiles.MigrationDir(m.cfg.Runtime.MigrationDBStorageDir, migrationID)
 		if err := os.MkdirAll(migrationDir, 0o755); err != nil {
 			return corebridge.SetRootResponse{}, err
 		}
@@ -71,6 +81,9 @@ func (m *Manager) SetRoot(ctx context.Context, req corebridge.SetRootRequest) (c
 			return corebridge.SetRootResponse{}, err
 		}
 		if engMig == nil {
+			if quiet {
+				return corebridge.SetRootResponse{}, fmt.Errorf("reauth migration %q not found", migrationID)
+			}
 			if _, keyErr := m.apiDB.EnsureMigrationKey(migrationID); keyErr != nil {
 				return corebridge.SetRootResponse{}, keyErr
 			}
@@ -87,6 +100,23 @@ func (m *Manager) SetRoot(ctx context.Context, req corebridge.SetRootRequest) (c
 		}
 	}
 
+	if quiet {
+		if err := m.validateQuietReauthRoot(migrationID, req.Role, req.ServiceID, req.Root.ID); err != nil {
+			return corebridge.SetRootResponse{}, err
+		}
+	}
+
+	phaseBefore := ""
+	prevConnectionID := ""
+	if quiet {
+		if mig, err := m.GetMigration(ctx, migrationID); err == nil && mig != nil {
+			phaseBefore = mig.Phase()
+			if binding, bErr := mig.GetFSCredentialBinding(req.Role); bErr == nil && binding != nil {
+				prevConnectionID = strings.TrimSpace(binding.ConnectionID)
+			}
+		}
+	}
+
 	rootsReq.MigrationID = migrationID
 	resp, err := m.rootsMgr.SetRoot(ctx, rootsReq)
 	if err != nil {
@@ -94,12 +124,30 @@ func (m *Manager) SetRoot(ctx context.Context, req corebridge.SetRootRequest) (c
 	}
 
 	if err := m.persistFSCredentialBinding(resp.MigrationID, req.Role); err != nil {
+		if quiet {
+			return corebridge.SetRootResponse{}, fmt.Errorf("persist reauth credentials: %w", err)
+		}
 		m.logger.Warn().Err(err).Str("migration_id", resp.MigrationID).Msg("persist fs credential binding")
+	}
+	if quiet {
+		newConnectionID := strings.TrimSpace(req.ConnectionID)
+		if newConnectionID == "" {
+			if req.Role == "destination" {
+				newConnectionID = strings.TrimSpace(resp.DestinationConnectionID)
+			} else {
+				newConnectionID = strings.TrimSpace(resp.SourceConnectionID)
+			}
+		}
+		if prevConnectionID != "" && newConnectionID != "" && prevConnectionID != newConnectionID {
+			m.retireReplacedConnection(resp.MigrationID, prevConnectionID)
+		}
 	}
 	if err := m.initializePlanAdapters(resp.MigrationID); err != nil {
 		m.logger.Warn().Err(err).Str("migration_id", resp.MigrationID).Msg("initialize fs adapters")
 	}
-	m.refreshDefaultMigrationName(ctx, resp.MigrationID)
+	if !quiet {
+		m.refreshDefaultMigrationName(ctx, resp.MigrationID)
+	}
 
 	existingMeta, err := m.getMigrationRecord(resp.MigrationID)
 	isNewMigration := true
@@ -118,7 +166,9 @@ func (m *Manager) SetRoot(ctx context.Context, req corebridge.SetRootRequest) (c
 	rec := existingMeta
 	rec.ID = resp.MigrationID
 	rec.Name = recName
-	rec.DatabasePath = resp.DatabasePath
+	if !quiet || strings.TrimSpace(resp.DatabasePath) != "" {
+		rec.DatabasePath = resp.DatabasePath
+	}
 	rec.IsNewMigration = isNewMigration
 	if source, destination, ok := m.cachedMigrationRoots(resp.MigrationID); ok {
 		if source != nil {
@@ -132,6 +182,18 @@ func (m *Manager) SetRoot(ctx context.Context, req corebridge.SetRootRequest) (c
 		m.logger.Warn().Err(err).Str("migration_id", resp.MigrationID).Msg("failed to update migration metadata when setting root")
 	}
 
+	if quiet && phaseBefore != "" {
+		if mig, err := m.GetMigration(ctx, resp.MigrationID); err == nil && mig != nil {
+			if got := mig.Phase(); got != phaseBefore {
+				m.logger.Warn().
+					Str("migration_id", resp.MigrationID).
+					Str("phase_before", phaseBefore).
+					Str("phase_after", got).
+					Msg("quiet set-root changed engine phase unexpectedly")
+			}
+		}
+	}
+
 	return corebridge.SetRootResponse{
 		MigrationID:             resp.MigrationID,
 		Role:                    resp.Role,
@@ -143,6 +205,52 @@ func (m *Manager) SetRoot(ctx context.Context, req corebridge.SetRootRequest) (c
 		SourceRootPrepared:      resp.SourceRootPrepared,
 		DestinationRootPrepared: resp.DestinationRootPrepared,
 	}, nil
+}
+
+// retireReplacedConnection drops oauth + in-memory session for a connection id that
+// is no longer the FS binding after reauth minted a replacement id.
+func (m *Manager) retireReplacedConnection(migrationID, oldConnectionID string) {
+	oldConnectionID = strings.TrimSpace(oldConnectionID)
+	if oldConnectionID == "" {
+		return
+	}
+	if mig, err := m.GetMigration(context.Background(), migrationID); err == nil && mig != nil {
+		_ = mig.RunStore(func(s *migration.Store) error {
+			return s.DeleteOAuthCredentials(oldConnectionID)
+		})
+	}
+	m.connMgr.Delete(oldConnectionID)
+	if m.serviceMgr != nil && m.serviceMgr.FS != nil {
+		_ = m.serviceMgr.FS.RevokeCloudConnection(oldConnectionID, "")
+	}
+}
+
+// validateQuietReauthRoot requires the same service and native root id as the stored binding.
+func (m *Manager) validateQuietReauthRoot(migrationID, role, serviceID, rootID string) error {
+	mig, err := m.GetMigration(context.Background(), migrationID)
+	if err != nil || mig == nil {
+		return err
+	}
+	role = strings.ToLower(strings.TrimSpace(role))
+	binding, err := mig.GetFSCredentialBinding(role)
+	if err != nil {
+		// No binding yet (incomplete import metadata): allow quiet bind.
+		return nil
+	}
+	if binding == nil {
+		return nil
+	}
+	if binding.ServiceID != "" && serviceID != "" && binding.ServiceID != serviceID {
+		return fmt.Errorf("reauth must use the same %s provider (%s)", role, binding.ServiceID)
+	}
+	folder, ok := parseBindingFolder(binding.RootFolderJSON)
+	if !ok || strings.TrimSpace(folder.ServiceID) == "" {
+		return nil
+	}
+	if strings.TrimSpace(rootID) != "" && folder.ServiceID != rootID {
+		return fmt.Errorf("reauth must confirm the same %s root", role)
+	}
+	return nil
 }
 
 func mapRootChildPlans(in []corebridge.RootChildPlan) []roots.RootChildPlan {

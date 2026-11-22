@@ -140,6 +140,11 @@ func (c *Context) Response(status int, payload any) {
 
 // Error writes a JSON error response and records the underlying error for logging.
 func (c *Context) Error(status int, message string, err error) {
+	c.ErrorWithDetails(status, message, "", err)
+}
+
+// ErrorWithDetails is Error plus an optional details string for the client (e.g. OAuth provider body).
+func (c *Context) ErrorWithDetails(status int, message, details string, err error) {
 	if c.wrote {
 		return
 	}
@@ -158,7 +163,11 @@ func (c *Context) Error(status int, message string, err error) {
 		c.mw.logger.Warn().Err(err).Str("path", c.r.URL.Path).Msg(message)
 	}
 
-	c.Response(status, map[string]string{"error": message})
+	payload := map[string]string{"error": message}
+	if strings.TrimSpace(details) != "" {
+		payload["details"] = details
+	}
+	c.Response(status, payload)
 }
 
 // MultipartForm wraps a handler expecting a multipart form upload.

@@ -48,7 +48,7 @@ func (h handler) listProviders(ctx *middleware.Context) {
 
 func (h handler) createConnection(ctx *middleware.Context, req corebridge.CreateConnectionRequest) {
 	providerID := chi.URLParam(ctx.Request(), "providerID")
-	resp, err := h.mgr.CreateProviderConnection(ctx.Request().Context(), providerID, req.MigrationID)
+	resp, err := h.mgr.CreateProviderConnection(ctx.Request().Context(), providerID, req.MigrationID, req.ConnectionID)
 	if err != nil {
 		ctx.Error(http.StatusBadRequest, "failed to create connection", err)
 		return
@@ -97,7 +97,8 @@ func (h handler) exchangeOAuth(ctx *middleware.Context, req corebridge.OAuthExch
 	connectionID := chi.URLParam(ctx.Request(), "connectionID")
 	status, err := h.mgr.ExchangeProviderOAuthCode(ctx.Request().Context(), providerID, connectionID, req)
 	if err != nil {
-		ctx.Error(http.StatusBadRequest, "failed to exchange oauth code", err)
+		// Include provider token body (e.g. Dropbox invalid_grant) so the UI can explain it.
+		ctx.ErrorWithDetails(http.StatusBadRequest, "failed to exchange oauth code", err.Error(), err)
 		return
 	}
 	ctx.Response(http.StatusOK, status)

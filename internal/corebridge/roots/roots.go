@@ -40,6 +40,8 @@ type SetRootRequest struct {
 	Children []RootChildPlan
 	// ExcludedIDs marks source children to exclude; ids not in Children are ignored.
 	ExcludedIDs []string
+	// Quiet keeps Seeded/prep/DB path (credential re-auth); does not reset plan progress.
+	Quiet bool
 }
 
 // SetRootResponse represents a response from setting a root
@@ -349,8 +351,13 @@ func (m *Manager) SetRoot(ctx context.Context, req SetRootRequest) (SetRootRespo
 		plan.SourceConnectionID = sessionID
 		plan.SourceAdapter = adapter
 		plan.SourceAdapterRelease = release
-		plan.SourceChildren = reviewedChildren
-		plan.SourceRootPrepared = len(reviewedChildren) > 0
+		if hasChildPayload {
+			plan.SourceChildren = reviewedChildren
+			plan.SourceRootPrepared = len(reviewedChildren) > 0
+		} else if !req.Quiet {
+			plan.SourceChildren = nil
+			plan.SourceRootPrepared = false
+		}
 	} else {
 		oldRelease = plan.DestinationAdapterRelease
 		plan.HasDestination = true
@@ -359,23 +366,30 @@ func (m *Manager) SetRoot(ctx context.Context, req SetRootRequest) (SetRootRespo
 		plan.DestinationConnectionID = sessionID
 		plan.DestinationAdapter = adapter
 		plan.DestinationAdapterRelease = release
-		plan.DestinationChildren = reviewedChildren
-		plan.DestinationRootPrepared = len(reviewedChildren) > 0
+		if hasChildPayload {
+			plan.DestinationChildren = reviewedChildren
+			plan.DestinationRootPrepared = len(reviewedChildren) > 0
+		} else if !req.Quiet {
+			plan.DestinationChildren = nil
+			plan.DestinationRootPrepared = false
+		}
 	}
 
-	plan.Seeded = false
-	plan.Seeding = false
-	plan.DatabasePath = ""
-	plan.RootSummary = migration.RootSeedSummary{}
 	planReady := plan.HasSource && plan.HasDestination
-	_ = m.savePreparationLocked(migrationID, plan)
+	if !req.Quiet {
+		plan.Seeded = false
+		plan.Seeding = false
+		plan.DatabasePath = ""
+		plan.RootSummary = migration.RootSeedSummary{}
+		_ = m.savePreparationLocked(migrationID, plan)
+	}
 	m.mu.Unlock()
 
 	if oldRelease != nil {
 		oldRelease()
 	}
 
-	if planReady {
+	if planReady && !req.Quiet {
 		m.mu.Lock()
 		if latestPlan := m.plans[migrationID]; latestPlan != nil {
 			latestPlan.Seeded = true

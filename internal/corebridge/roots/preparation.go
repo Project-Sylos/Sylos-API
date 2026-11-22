@@ -33,10 +33,11 @@ type PersistedPreparation struct {
 
 // NormalizeRootChildren keeps named entries; recurses into Children for sparse source trees.
 // ExcludedIds that are not among children are ignored (uncle/aunt / off-path marks).
+// Child IDs are FS ServiceIDs (local absolute paths or cloud ids): do not TrimSpace them.
+// Local basenames may end in spaces; trimming the id breaks later Lstat/Open.
 func NormalizeRootChildren(children []RootChildPlan, excludedIDs []string, allowExclude bool) ([]RootChildPlan, error) {
 	excluded := make(map[string]struct{}, len(excludedIDs))
 	for _, id := range excludedIDs {
-		id = strings.TrimSpace(id)
 		if id == "" {
 			continue
 		}
@@ -51,7 +52,7 @@ func NormalizeRootChildren(children []RootChildPlan, excludedIDs []string, allow
 			if c.Name == "" {
 				continue
 			}
-			id := strings.TrimSpace(c.ID)
+			id := c.ID
 			child := RootChildPlan{
 				ID:          id,
 				Name:        c.Name,

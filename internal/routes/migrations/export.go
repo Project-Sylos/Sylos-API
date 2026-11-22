@@ -18,7 +18,7 @@ func (h handler) exportOps(ctx *middleware.Context) {
 	}
 
 	id := migrationfiles.NormalizeMigrationID(migrationID)
-	if !migrationfiles.OpsDirExists(h.mgr.DataDir(), id) {
+	if !migrationfiles.OpsDirExists(h.mgr.MigrationDBStorageDir(), id) {
 		ctx.Error(http.StatusNotFound, fmt.Sprintf("ops directory not found for migration %q", id), nil)
 		return
 	}
@@ -30,7 +30,7 @@ func (h handler) exportOps(ctx *middleware.Context) {
 	w.WriteHeader(http.StatusOK)
 	ctx.MarkWritten(http.StatusOK)
 
-	if _, err := migrationfiles.ExportMigrationOpsZip(h.mgr.DataDir(), id, w); err != nil {
+	if _, err := migrationfiles.ExportMigrationOpsZip(h.mgr.MigrationDBStorageDir(), id, w); err != nil {
 		h.logger.Error().Err(err).Str("migration_id", id).Msg("failed while streaming ops export zip")
 	}
 }

@@ -17,6 +17,8 @@ type ListChildrenDiffsRequest struct {
 	Sort        *SortOption `json:"sort,omitempty"` // Sort options (field and direction); keyset uses path order
 	// IncludeDestinationOnly when false hides destination-only rows. Nil means include.
 	IncludeDestinationOnly *bool `json:"includeDestinationOnly,omitempty"`
+	// Side: ""|"both" merged, "src", "dst" for dual-tree panes.
+	Side string `json:"side,omitempty"`
 }
 
 // RuleExclusion attributes a path review node to a filter rule exclusion.
@@ -51,6 +53,8 @@ type PathNodeItem struct {
 	// CopyExcludedFromFailed reports a copy-excluded node whose exclusion
 	// started from a retry-marked failure; unexcluding restores failed.
 	CopyExcludedFromFailed bool `json:"copyExcludedFromFailed,omitempty"`
+	// TraversalAckFromFailed reports traversal excluded from acknowledging a failure.
+	TraversalAckFromFailed bool `json:"traversalAckFromFailed,omitempty"`
 	// CopyForceReplaceMarked reports pending prefer-source overwrite from already_existed.
 	CopyForceReplaceMarked bool           `json:"copyForceReplaceMarked,omitempty"`
 	FailureLogID           string         `json:"failureLogId,omitempty"`
@@ -64,6 +68,8 @@ type PathNodes struct {
 	Dst *PathNodeItem `json:"dst,omitempty"`
 	// ResolvedDstName is the accepted/committed destination basename when it differs from the source name.
 	ResolvedDstName string `json:"resolvedDstName,omitempty"`
+	// PathDstAction is gpl dst_action when accepted (rename; legacy merge rows may still appear).
+	PathDstAction string `json:"pathDstAction,omitempty"`
 }
 
 type FileSizeStats struct {
@@ -154,10 +160,9 @@ type SweepConfigRequest struct {
 	LogLevel           string `json:"logLevel,omitempty"`
 	SkipListener       *bool  `json:"skipListener,omitempty"`
 	StartupDelaySec    int    `json:"startupDelaySeconds,omitempty"`
-	ProgressTickMillis int    `json:"progressTickMillis,omitempty"`
-	// Used when resuming *-finalize-failed (index/checkpoint retry).
-	MemoryLimitGB int `json:"memoryLimitGB,omitempty"` // 0 = default 2GB for index build
-	Threads       int `json:"threads,omitempty"`       // 0 = default 1; max 4
+	ProgressTickMillis int `json:"progressTickMillis,omitempty"`
+	// Refold recomputes all folder sizes from the catalog during finalize retry (no re-traversal).
+	Refold bool `json:"refold,omitempty"`
 }
 
 // SweepResponse represents the response from triggering a sweep
@@ -166,6 +171,8 @@ type SweepResponse struct {
 	Message        string `json:"message,omitempty"`
 	Error          string `json:"error,omitempty"`
 	AlreadyRunning bool   `json:"alreadyRunning,omitempty"`
+	// FsHealth is set when resume/retry was blocked by a failed FS health probe.
+	FsHealth *FSHealthReport `json:"fsHealth,omitempty"`
 }
 
 // PendingWorkResponse represents the response for checking pending work
@@ -210,7 +217,7 @@ type SearchCondition struct {
 }
 
 // SearchRequest represents a request to search path review items.
-// At least one narrowing filter is required (see migrationops.SearchRequestHasFilter); empty global search is rejected.
+// Empty (unfiltered) search is allowed; the UI warns on very large migrations.
 type SearchRequest struct {
 	Conditions       []SearchCondition `json:"conditions,omitempty"`       // Search conditions
 	Sort             *SortOption       `json:"sort,omitempty"`             // Sort options (field and direction)
@@ -223,6 +230,8 @@ type SearchRequest struct {
 	// IncludeDestinationOnly when false hides destination-only rows. Nil means include.
 	// Explicitly false counts as a search filter (matches engine ExcludeDestinationOnly).
 	IncludeDestinationOnly *bool `json:"includeDestinationOnly,omitempty"`
+	// Side: ""|"both" merged, "src", "dst" for dual-list search.
+	Side string `json:"side,omitempty"`
 	// Ruleset is an optional filter-rules predicate compiled to SQL and ANDed into search.
 	Ruleset *filter.Ruleset `json:"ruleset,omitempty"`
 }
@@ -252,6 +261,12 @@ type PathIssue struct {
 	Messages     []PathIssueMessage `json:"messages,omitempty"`
 	// Ignored is true when the warning is dismissed (original name kept).
 	Ignored bool `json:"ignored,omitempty"`
+	// DstAction is rename when accepted (legacy merge may still appear); empty for open issues.
+	DstAction string `json:"dstAction,omitempty"`
+	// CollisionSibling is the colliding destination basename when status is manual_review.
+	CollisionSibling string `json:"collisionSibling,omitempty"`
+	// SuggestedUniqueName is a free sibling basename for Accept unique (e.g. "Reports (1)").
+	SuggestedUniqueName string `json:"suggestedUniqueName,omitempty"`
 }
 
 // PathIssueMessage is a short user-facing validation finding.
@@ -294,6 +309,18 @@ type PathIssuesListResponse struct {
 	PathChecksEnabled bool        `json:"pathChecksEnabled"`
 }
 
+// PathRenameProgressResponse is live cascade progress for Path Review Accept/remap.
+type PathRenameProgressResponse struct {
+	Active      bool   `json:"active"`
+	Phase       string `json:"phase,omitempty"`
+	Done        int64  `json:"done"`
+	Total       int64  `json:"total"`
+	NodeID      string `json:"nodeId,omitempty"`
+	Message     string `json:"message,omitempty"`
+	CanSoftStop bool   `json:"canSoftStop"`
+	CanHardStop bool   `json:"canHardStop"`
+}
+
 // PathIssuesMutationResponse is returned after accept / remap / accept-all / ignore.
 type PathIssuesMutationResponse struct {
 	Success           bool        `json:"success"`
@@ -303,6 +330,52 @@ type PathIssuesMutationResponse struct {
 	Count             int         `json:"count"`
 	Message           string      `json:"message,omitempty"`
 	PathChecksEnabled bool        `json:"pathChecksEnabled"`
+}
+
+// PathCascadeFolderCollision is one nested folder (or cleaned-name) conflict from cascade preview.
+type PathCascadeFolderCollision struct {
+	SrcID   string `json:"srcId"`
+	SrcName string `json:"srcName"`
+	SrcPath string `json:"srcPath,omitempty"`
+	DstID   string `json:"dstId,omitempty"`
+	DstName string `json:"dstName"`
+	DstPath string `json:"dstPath,omitempty"`
+}
+
+// PathCascadeFileOverwrite is one exact-name file pair with mtime default winner.
+type PathCascadeFileOverwrite struct {
+	SrcID         string `json:"srcId"`
+	SrcName       string `json:"srcName"`
+	SrcPath       string `json:"srcPath,omitempty"`
+	SrcSize       int64  `json:"srcSize,omitempty"`
+	SrcMTime      string `json:"srcMTime,omitempty"`
+	DstID         string `json:"dstId"`
+	DstName       string `json:"dstName"`
+	DstPath       string `json:"dstPath,omitempty"`
+	DstSize       int64  `json:"dstSize,omitempty"`
+	DstMTime      string `json:"dstMTime,omitempty"`
+	DefaultWinner string `json:"defaultWinner"`
+}
+
+// PreviewPathCascadeRequest is the body for cascade dry-run.
+type PreviewPathCascadeRequest struct {
+	Action       string `json:"action"`
+	ProposedName string `json:"proposedName,omitempty"`
+}
+
+// PathResolutionCascadePreview is POST .../path-issues/{nodeID}/preview-cascade.
+type PathResolutionCascadePreview struct {
+	Action               string                       `json:"action"`
+	SrcFolderID          string                       `json:"srcFolderId"`
+	DstFolderID          string                       `json:"dstFolderId,omitempty"`
+	FolderCollisionCount int                          `json:"folderCollisionCount"`
+	FileOverwriteCount   int                          `json:"fileOverwriteCount"`
+	FolderCollisions     []PathCascadeFolderCollision `json:"folderCollisions,omitempty"`
+	FileOverwrites       []PathCascadeFileOverwrite   `json:"fileOverwrites,omitempty"`
+	DstSubtreeListed     bool                         `json:"dstSubtreeListed"`
+	PathChecksEnabled    bool                         `json:"pathChecksEnabled"`
+	Success              bool                         `json:"success"`
+	Message              string                       `json:"message,omitempty"`
 }
 
 // PathIssuesRemainingError is returned when Start Copy is blocked by active path issues.

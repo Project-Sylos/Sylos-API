@@ -14,7 +14,7 @@ import (
 )
 
 // search handles POST /api/migrations/{migrationID}/search
-// Requires at least one narrowing filter (see migrationops.SearchRequestHasFilter).
+// Empty (unfiltered) search is allowed; the UI warns on very large migrations.
 // Search results are path-joined (same format as diff endpoint). Pagination HasMore comes from the engine;
 // Total is omitted when unknown.
 func (h handler) search(ctx *middleware.Context, payload corebridge.SearchRequest) {
@@ -25,10 +25,6 @@ func (h handler) search(ctx *middleware.Context, payload corebridge.SearchReques
 	}
 
 	normalizeSearchPayload(&payload)
-	if !migrationops.SearchRequestHasFilter(payload) {
-		ctx.Error(http.StatusBadRequest, "search requires at least one filter", migrationops.ErrSearchRequiresFilter)
-		return
-	}
 
 	// Parse pagination parameters from query string (similar to diff endpoint)
 	offset := 0
@@ -97,10 +93,6 @@ func (h handler) searchCount(ctx *middleware.Context, payload corebridge.SearchR
 	}
 
 	normalizeSearchPayload(&payload)
-	if !migrationops.SearchRequestHasFilter(payload) {
-		ctx.Error(http.StatusBadRequest, "search requires at least one filter", migrationops.ErrSearchRequiresFilter)
-		return
-	}
 
 	mig, err := h.mgr.GetMigration(ctx.Request().Context(), migrationID)
 	if err != nil {

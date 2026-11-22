@@ -2,7 +2,7 @@
 
 Public REST layer for Sylos that sits between the browser UI (Sylos-UI / embedded Sylos binary) and the Migration Engine SDK. It authenticates UI requests, exposes filesystem browsing helpers, and orchestrates migrations by delegating to `codeberg.org/Sylos/Migration-Engine` and Sylos-FS adapters.
 
-**Migration Engine boundary:** almost all engine access goes through `pkg/migration` (`internal/corebridge`). Exceptions: `apidb` opens DuckDB via `pkg/db` (blank-imports `pkg/db/seal`), path-check target resolution uses `pkg/queue/gpl`, and metrics DTO mapping uses `pkg/convert`. Queue observe/worker/mode and scaling loop/profile internals are not API dependencies.
+**Migration Engine boundary:** almost all engine access goes through `pkg/migration` (`internal/corebridge`). Exceptions: `apidb` opens the DB via `pkg/db` (blank-imports `pkg/db/seal`), path-check target resolution uses `pkg/queue/gpl`, and metrics DTO mapping uses `pkg/convert`. Queue observe/worker/mode and scaling loop/profile internals are not API dependencies.
 
 ---
 
@@ -119,7 +119,7 @@ Important notes:
 - **Spectra services**: each entry identifies a config file and world; the API spawns a temporary Spectra SDK client per request.
 - **Runtime data**: migration databases and log buffers are written under `${runtime.data_dir}/${migrationID}/`. The directory is created automatically.
 - **Logging terminal**: set `runtime.enable_logging_terminal=true` and `runtime.log_address` to automatically spawn a log terminal process when starting migrations. The terminal displays live UDP logs from the migration engine. You can also toggle it mid-run via `POST /api/migrations/log-terminal`.
-- **Encryption**: see [`docs/ENCRYPTION.md`](docs/ENCRYPTION.md) for install master key and per-migration DuckDB encryption.
+- **Encryption**: see [`docs/ENCRYPTION.md`](docs/ENCRYPTION.md) for install master key and per-migration DB encryption.
 
 ---
 
@@ -241,7 +241,7 @@ The codebase assumes the Go version in `go.mod`. If you use `gorr` or other tool
 - Authentication uses the users store (roles, first-run admin). Before exposing the API publicly, enforce strong passwords and network controls.
 - Local filesystem connectors should point to dedicated allow-listed roots; the service prevents escaping those roots but you are responsible for which directories you expose.
 - HTTPS termination is out-of-scope for this repo—run behind a reverse proxy (nginx, Caddy, etc.) or load balancer that enforces TLS.
-- Long-running migrations store DuckDB files under `runtime.data_dir`; see [`docs/ENCRYPTION.md`](docs/ENCRYPTION.md) for key handling and backup policy.
+- Long-running migrations store DB files under `runtime.data_dir`; see [`docs/ENCRYPTION.md`](docs/ENCRYPTION.md) for key handling and backup policy.
 
 ---
 

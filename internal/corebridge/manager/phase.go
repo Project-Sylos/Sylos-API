@@ -33,6 +33,10 @@ func (m *Manager) getMigrationPhase(migrationID string) (string, error) {
 func (m *Manager) checkPhaseLock(migrationID string, operation string) error {
 	switch operation {
 	case "setRoot":
+		// Import attention re-auth is allowed past roots; quiet SetRoot preserves phase.
+		if m.migrationNeedsAttention(migrationID) {
+			return nil
+		}
 		plan := m.rootsMgr.GetPlan(migrationID)
 		if plan != nil && plan.HasSource && plan.HasDestination {
 			phase, err := m.getMigrationPhase(migrationID)

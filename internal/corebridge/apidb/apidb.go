@@ -101,6 +101,21 @@ type MigrationRootSnapshot struct {
 	ParentID     string `json:"parentId,omitempty"`
 }
 
+// Attention reason codes persisted after ops import scan or live FS health failure.
+const (
+	AttentionCredentialsUndecryptable = "credentials_undecryptable"
+	AttentionCredentialsMissing       = "credentials_missing"
+	AttentionCredentialsInvalid       = "credentials_invalid"
+)
+
+// LocalRootProbe is a hint from import scanning (path may or may not exist on this host).
+type LocalRootProbe struct {
+	Role             string `json:"role"`
+	NativePath       string `json:"nativePath,omitempty"`
+	PathExistsOnHost bool   `json:"pathExistsOnHost"`
+	ServiceID        string `json:"serviceId,omitempty"`
+}
+
 // MigrationRecord mirrors metadata.MigrationMetadata for API DB storage.
 type MigrationRecord struct {
 	ID                   string    `json:"id"`
@@ -112,9 +127,19 @@ type MigrationRecord struct {
 	// Phase is the last lifecycle phase observed via a full status read.
 	// It lets migration lists render without opening the per-migration ops DB.
 	Phase string `json:"phase,omitempty"`
+	// UncleanInterrupt mirrors ops unclean_interrupt for cold Resume lists.
+	UncleanInterrupt bool `json:"uncleanInterrupt,omitempty"`
 	// SourceRoot / DestinationRoot feed sidebar route glyphs and labels for cold lists.
 	SourceRoot      *MigrationRootSnapshot `json:"sourceRoot,omitempty"`
 	DestinationRoot *MigrationRootSnapshot `json:"destinationRoot,omitempty"`
+	// NeedsAttention blocks resume until cloud/SFTP credentials are re-bound after import.
+	NeedsAttention   bool             `json:"needsAttention,omitempty"`
+	AttentionReasons []string         `json:"attentionReasons,omitempty"`
+	LocalRoots       []LocalRootProbe `json:"localRoots,omitempty"`
+	// Last successful FS health probe (list + write/delete under bound roots).
+	LastFsHealthAt    time.Time `json:"lastFsHealthAt,omitempty"`
+	LastFsHealthSides string    `json:"lastFsHealthSides,omitempty"` // src | dst | both
+	LastFsHealthOK    bool      `json:"lastFsHealthOK,omitempty"`
 }
 
 func (d *DB) UpsertMigration(rec MigrationRecord) error {

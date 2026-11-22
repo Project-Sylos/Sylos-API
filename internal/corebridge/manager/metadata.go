@@ -162,6 +162,8 @@ func (m *Manager) coldMigrationStatus(rec apidb.MigrationRecord) corebridge.Stat
 	if status.DestinationRoot != nil {
 		status.DestinationID = status.DestinationRoot.ServiceID
 	}
+	applyAttentionToStatus(&status, rec)
+	status.UncleanInterrupt = rec.UncleanInterrupt
 	return status
 }
 
@@ -169,15 +171,16 @@ func (m *Manager) coldMigrationStatus(rec apidb.MigrationRecord) corebridge.Stat
 // registry record so migration lists can show it without opening the
 // migration's ops DB. Writes only when the phase actually changed.
 func (m *Manager) persistLastKnownPhase(migrationID, phase string) {
-	m.persistMigrationListHints(migrationID, phase, nil, nil)
+	m.persistMigrationListHints(migrationID, phase, nil, nil, nil)
 }
 
 // persistMigrationListHints stores phase and/or root snapshots on the registry
 // so cold lists keep sidebar glyphs after restart. Nil roots leave existing
-// snapshots unchanged; non-nil replaces that side.
+// snapshots unchanged; non-nil replaces that side. unclean nil leaves the flag unchanged.
 func (m *Manager) persistMigrationListHints(
 	migrationID, phase string,
 	source, destination *corebridge.RootInfo,
+	unclean *bool,
 ) {
 	if m.apiDB == nil {
 		return
@@ -189,6 +192,10 @@ func (m *Manager) persistMigrationListHints(
 	changed := false
 	if phase != "" && rec.Phase != phase {
 		rec.Phase = phase
+		changed = true
+	}
+	if unclean != nil && rec.UncleanInterrupt != *unclean {
+		rec.UncleanInterrupt = *unclean
 		changed = true
 	}
 	if source != nil {

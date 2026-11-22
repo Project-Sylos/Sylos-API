@@ -42,7 +42,7 @@ func (h handler) forceStop(ctx *middleware.Context) {
 	if status.AlreadyStopped {
 		response["message"] = "Migration is already stopped."
 	} else {
-		response["message"] = "Migration force-stopped. It may not be resumable."
+		response["message"] = "Migration hard-stopped without a clean checkpoint. Resume runs a recovery sweep."
 	}
 
 	ctx.Response(http.StatusOK, response)

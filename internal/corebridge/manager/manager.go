@@ -63,10 +63,10 @@ func NewManager(logger zerolog.Logger, cfg config.Config, apiDB *apidb.DB) (*Man
 	}
 
 	resolveDBPath := func(path, migrationID string) (string, error) {
-		return migrationfiles.ResolveDatabasePath(cfg.Runtime.DataDir, path, migrationID)
+		return migrationfiles.ResolveDatabasePath(cfg.Runtime.MigrationDBStorageDir, path, migrationID)
 	}
 
-	rootsMgr := roots.NewManager(logger, cfg.Runtime.DataDir, serviceMgr, resolveDBPath)
+	rootsMgr := roots.NewManager(logger, cfg.Runtime.MigrationDBStorageDir, serviceMgr, resolveDBPath)
 	engineMgr := migration.NewMigrationManager()
 	terminalMgr := terminal.NewManager(logger, cfg)
 	bgTaskMgr := corebridge.NewBackgroundTaskManager(logger)
@@ -88,11 +88,11 @@ func NewManager(logger zerolog.Logger, cfg config.Config, apiDB *apidb.DB) (*Man
 		mgr.migAccess = &migrationaccess.Opener{
 			APIDB:   apiDB,
 			Engine:  engineMgr,
-			DataDir: cfg.Runtime.DataDir,
+			DataDir: cfg.Runtime.MigrationDBStorageDir,
 		}
 	}
 
-	mgr.ApplyStoredDuckDBMemoryLimit()
+	mgr.ReconcileOrphanedMigrations(context.Background())
 
 	return mgr, nil
 }
@@ -169,7 +169,7 @@ func (m *Manager) oauthProviderCredentials(providerID string) (oauthcreds.Provid
 	}
 }
 
-// DataDir returns the configured runtime data directory.
+// DataDir returns the configured runtime data directory (install DB, api-runtime.log).
 func (m *Manager) DataDir() string {
 	if m == nil {
 		return ""
@@ -177,9 +177,18 @@ func (m *Manager) DataDir() string {
 	return m.cfg.Runtime.DataDir
 }
 
-// migrationDirFor returns the absolute path to the folder for the given migration (e.g. dataDir/{id}).
+// MigrationDBStorageDir returns the directory that holds per-migration folders.
+func (m *Manager) MigrationDBStorageDir() string {
+	if m == nil {
+		return ""
+	}
+	return m.cfg.Runtime.MigrationDBStorageDir
+}
+
+// migrationDirFor returns the absolute path to the folder for the given migration
+// (e.g. migration-dbs/{id}).
 func (m *Manager) migrationDirFor(migrationID string) (string, error) {
-	dir := filepath.Join(m.cfg.Runtime.DataDir, migrationID)
+	dir := migrationfiles.MigrationDir(m.cfg.Runtime.MigrationDBStorageDir, migrationID)
 	return filepath.Abs(dir)
 }
 

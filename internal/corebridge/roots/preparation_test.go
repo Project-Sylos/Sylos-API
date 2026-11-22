@@ -56,8 +56,9 @@ func TestNormalizeRootChildren_destNeverExclude(t *testing.T) {
 }
 
 func TestNormalizeRootChildren_preservesTrailingSpace(t *testing.T) {
+	spaceID := "/home/loganm/testing-gpl/Extra Space "
 	out, err := NormalizeRootChildren([]RootChildPlan{
-		{ID: "a", Name: "Extra Space ", Type: "folder"},
+		{ID: spaceID, Name: "Extra Space ", Type: "folder"},
 		{ID: "b", Name: "Invalid Chars*", Type: "folder"},
 	}, nil, true)
 	if err != nil {
@@ -65,6 +66,9 @@ func TestNormalizeRootChildren_preservesTrailingSpace(t *testing.T) {
 	}
 	if len(out) != 2 {
 		t.Fatalf("len=%d", len(out))
+	}
+	if out[0].ID != spaceID {
+		t.Fatalf("id=%q want trailing space preserved on ServiceID", out[0].ID)
 	}
 	if out[0].Name != "Extra Space " {
 		t.Fatalf("name=%q want trailing space preserved", out[0].Name)

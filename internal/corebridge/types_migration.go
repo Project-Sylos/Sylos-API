@@ -29,7 +29,8 @@ type MigrationOptions struct {
 	CoordinatorLead         int                 `json:"coordinatorLead,omitempty"`
 	LogAddress              string              `json:"logAddress,omitempty"`
 	LogLevel                string              `json:"logLevel,omitempty"`
-	SkipListener            *bool               `json:"skipListener,omitempty"` // If nil, defaults to true (skip listener)
+	PersistLogLevel         string              `json:"persistLogLevel,omitempty"` // disk threshold; default trace
+	SkipListener            *bool               `json:"skipListener,omitempty"`    // If nil, defaults to true (skip listener)
 	StartupDelaySec         int                 `json:"startupDelaySeconds,omitempty"`
 	ProgressTickMillis      int                 `json:"progressTickMillis,omitempty"`
 	Verification            VerificationOptions `json:"verification,omitempty"`
@@ -37,6 +38,10 @@ type MigrationOptions struct {
 	PathCheckTarget string `json:"pathCheckTarget,omitempty"`
 	// WindowsCompat enables Windows desktop-sync overlays on soft cloud destinations.
 	WindowsCompat bool `json:"windowsCompat,omitempty"`
+	// OverwritePolicy: newest_mtime (default) | decide | source_wins.
+	OverwritePolicy string `json:"overwritePolicy,omitempty"`
+	// HashVerify enables dual-stream SHA-256 compare for name-matched files during discovery.
+	HashVerify bool `json:"hashVerify,omitempty"`
 }
 
 type StartMigrationRequest struct {
@@ -64,10 +69,12 @@ type SetRootRequest struct {
 	ConnectionID string           `json:"connectionId,omitempty"`
 	Root         FolderDescriptor `json:"root"`
 	Config       map[string]any   `json:"config,omitempty"` // Optional service-specific config (e.g., Spectra config JSON)
-	// Children are immediate children listed during root-pick review (no DuckDB write until Start).
+	// Children are immediate children listed during root-pick review (no ops write until Start).
 	Children []RootChildPlan `json:"children,omitempty"`
 	// ExcludedIds are source child ids to exclude; ids not in children are ignored.
 	ExcludedIds []string `json:"excludedIds,omitempty"`
+	// Reauth is a quiet credential rebind (import attention): keep phase/prep, clear attention.
+	Reauth bool `json:"reauth,omitempty"`
 }
 
 type SetRootResponse struct {
@@ -139,9 +146,31 @@ type Status struct {
 	PossibleStall bool `json:"possibleStall,omitempty"`
 	// StopProgress is the live soft/force stop checklist for the UI (empty when not stopping).
 	StopProgress *StopProgressView `json:"stopProgress,omitempty"`
-	// DbActivity is a human-readable DuckDB wait label (index rebuild, checkpoint) while finalizing.
+	// DbActivity is a human-readable ops-store wait label (seal, folder-size fold, checkpoint) while finalizing.
 	DbActivity string `json:"dbActivity,omitempty"`
+	// NeedsAttention is set after ops import when cloud/SFTP credentials must be re-bound.
+	NeedsAttention   bool             `json:"needsAttention,omitempty"`
+	AttentionReasons []string         `json:"attentionReasons,omitempty"`
+	LocalRoots       []LocalRootProbe `json:"localRoots,omitempty"`
+	// UncleanInterrupt is true after crash heal or hard stop; Resume runs a recovery sweep.
+	UncleanInterrupt     bool   `json:"uncleanInterrupt,omitempty"`
+	UncleanInterruptKind string `json:"uncleanInterruptKind,omitempty"`
 	// Status field in Migration is the lifecycle phase (engine lowercase-with-hyphens, e.g. traversal-in-progress, traversal-suspended).
+}
+
+// LocalRootProbe mirrors apidb.LocalRootProbe for API responses.
+type LocalRootProbe struct {
+	Role             string `json:"role"`
+	NativePath       string `json:"nativePath,omitempty"`
+	PathExistsOnHost bool   `json:"pathExistsOnHost"`
+	ServiceID        string `json:"serviceId,omitempty"`
+}
+
+// ImportScanReport is returned from ops upload after credential strip + local path probes.
+type ImportScanReport struct {
+	NeedsAttention   bool             `json:"needsAttention"`
+	AttentionReasons []string         `json:"attentionReasons,omitempty"`
+	LocalRoots       []LocalRootProbe `json:"localRoots,omitempty"`
 }
 
 // StopProgressView mirrors engine stop progress for API/UI.
@@ -295,17 +324,34 @@ type ExternalQueueMetrics struct {
 	// Engine-owned remaining-time estimate (UI renders only).
 	EtaSeconds *float64 `json:"eta_seconds,omitempty"`
 	EtaBasis   string   `json:"eta_basis,omitempty"` // "items" | "bytes"
+
+	// ActiveTasks is a live leased-task snapshot from the queue observer (not durable).
+	ActiveTasks []InFlightTask `json:"activeTasks,omitempty"`
+}
+
+// InFlightTask is one leased worker task for live Progress Monitor display.
+type InFlightTask struct {
+	NodeID     string `json:"nodeId,omitempty"`
+	Path       string `json:"path,omitempty"`
+	WorkerID   string `json:"workerId,omitempty"`
+	TaskType   string `json:"taskType,omitempty"`
+	ItemKind   string `json:"itemKind,omitempty"`
+	Round      int    `json:"round,omitempty"`
+	CopyPass   int    `json:"copyPass,omitempty"`
+	LeaseAgeMs int64  `json:"leaseAgeMs,omitempty"`
+	BytesDone  int64  `json:"bytesDone,omitempty"`
+	BytesTotal int64  `json:"bytesTotal,omitempty"`
 }
 
 // QueueMetricsResponse represents all queue metrics for a migration
 type QueueMetricsResponse struct {
-	Success       bool                  `json:"success"`             // Whether the operation succeeded
-	ErrorCode     string                `json:"errorCode,omitempty"` // Error code if success is false (e.g., "DATABASE_NOT_AVAILABLE")
-	Error         string                `json:"error,omitempty"`     // Human-readable error message if success is false
-	SrcTraversal  *ExternalQueueMetrics `json:"srcTraversal,omitempty"`
-	DstTraversal  *ExternalQueueMetrics `json:"dstTraversal,omitempty"`
-	Copy          *ExternalQueueMetrics `json:"copy,omitempty"`
-	Delete        *ExternalQueueMetrics `json:"delete,omitempty"`
+	Success      bool                  `json:"success"`             // Whether the operation succeeded
+	ErrorCode    string                `json:"errorCode,omitempty"` // Error code if success is false (e.g., "DATABASE_NOT_AVAILABLE")
+	Error        string                `json:"error,omitempty"`     // Human-readable error message if success is false
+	SrcTraversal *ExternalQueueMetrics `json:"srcTraversal,omitempty"`
+	DstTraversal *ExternalQueueMetrics `json:"dstTraversal,omitempty"`
+	Copy         *ExternalQueueMetrics `json:"copy,omitempty"`
+	Delete       *ExternalQueueMetrics `json:"delete,omitempty"`
 	// SizeFold is set while finalizing computes folder identity sizes.
 	SizeFold      *ExternalQueueMetrics `json:"sizeFold,omitempty"`
 	PossibleStall bool                  `json:"possibleStall,omitempty"`
@@ -320,7 +366,13 @@ type LogEntry struct {
 
 // GetLogsRequest represents a request to get logs for a migration
 type GetLogsRequest struct {
-	// No fields - always returns up to 1K logs per level (newest first)
+	// Optional search (history / node lookup). Empty = live recent window.
+	TextExact string `json:"textExact,omitempty"`
+	Action    string `json:"action,omitempty"`
+	NodeID    string `json:"nodeId,omitempty"`
+	From      string `json:"from,omitempty"` // RFC3339
+	To        string `json:"to,omitempty"`
+	Limit     int    `json:"limit,omitempty"`
 }
 
 // GetLogsResponse represents the response containing logs for all levels
@@ -348,6 +400,8 @@ type UploadMigrationDBResponse struct {
 	Success bool   `json:"success"`
 	Error   string `json:"error,omitempty"`
 	Path    string `json:"path,omitempty"`
+	// ImportReport is set for ops uploads after credential strip / attention scan.
+	ImportReport *ImportScanReport `json:"importReport,omitempty"`
 }
 
 type MigrationDBInfo struct {

@@ -10,9 +10,9 @@ import (
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/apidb"
 )
 
-// Opener resolves per-migration keys from the API database and opens plaintext migration DuckDBs.
+// Opener resolves per-migration keys from the API database and opens migration ops stores.
 // Per-migration keys are stored encrypted in sylos.api/ (wrapped by the install master key from the OS keyring).
-// Token encryption inside migration DBs uses the decrypted per-migration key via the engine.
+// Field-level OAuth sealing inside ops Badger uses the decrypted per-migration key via the engine.
 type Opener struct {
 	APIDB   *apidb.DB
 	Engine  *migration.MigrationManager

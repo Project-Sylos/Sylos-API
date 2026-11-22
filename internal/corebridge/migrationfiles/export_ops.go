@@ -7,16 +7,19 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"codeberg.org/Sylos/Migration-Engine/pkg/opsdb"
 )
 
 // ExportMigrationOpsZip writes a zip of dataDir/{id}/{id}.ops/ contents (files at zip root)
-// plus a small sylos-export.json marker. Caller owns closing w after return... actually we write fully.
+// plus a small sylos-export.json marker. OAuth credential rows are stripped from a temp
+// copy so exports never ship usable tokens. The live ops directory is left unchanged.
 func ExportMigrationOpsZip(dataDir, migrationID string, w io.Writer) (filename string, err error) {
 	migrationID = NormalizeMigrationID(migrationID)
 	if migrationID == "" {
 		return "", fmt.Errorf("migration ID is required")
 	}
-	opsDir := filepath.Join(dataDir, migrationID, migrationID+".ops")
+	opsDir := filepath.Join(MigrationDir(dataDir, migrationID), migrationID+".ops")
 	info, err := os.Stat(opsDir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -26,6 +29,58 @@ func ExportMigrationOpsZip(dataDir, migrationID string, w io.Writer) (filename s
 	}
 	if !info.IsDir() {
 		return "", fmt.Errorf("ops path is not a directory")
+	}
+
+	tmpRoot, err := os.MkdirTemp("", "sylos-ops-export-*")
+	if err != nil {
+		return "", fmt.Errorf("create export temp dir: %w", err)
+	}
+	defer os.RemoveAll(tmpRoot)
+
+	tmpOps := filepath.Join(tmpRoot, migrationID+".ops")
+	if err := filepath.Walk(opsDir, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		rel, err := filepath.Rel(opsDir, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(tmpOps, rel)
+		if info.IsDir() {
+			return os.MkdirAll(target, 0o755)
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return err
+		}
+		in, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer in.Close()
+		out, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, info.Mode().Perm())
+		if err != nil {
+			return err
+		}
+		_, copyErr := io.Copy(out, in)
+		closeErr := out.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+		return closeErr
+	}); err != nil {
+		return "", fmt.Errorf("copy ops for export: %w", err)
+	}
+	store, err := opsdb.Open(opsdb.Options{Dir: tmpOps})
+	if err != nil {
+		return "", fmt.Errorf("open export ops copy: %w", err)
+	}
+	if _, err := store.DeleteAllOAuthCreds(); err != nil {
+		_ = store.Close()
+		return "", fmt.Errorf("strip oauth from export: %w", err)
+	}
+	if err := store.Close(); err != nil {
+		return "", fmt.Errorf("close export ops copy: %w", err)
 	}
 
 	zw := zip.NewWriter(w)
@@ -44,11 +99,11 @@ func ExportMigrationOpsZip(dataDir, migrationID string, w io.Writer) (filename s
 		return "", err
 	}
 
-	err = filepath.Walk(opsDir, func(path string, fi os.FileInfo, walkErr error) error {
+	err = filepath.Walk(tmpOps, func(path string, fi os.FileInfo, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
-		rel, err := filepath.Rel(opsDir, path)
+		rel, err := filepath.Rel(tmpOps, path)
 		if err != nil {
 			return err
 		}

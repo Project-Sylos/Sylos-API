@@ -55,6 +55,7 @@ func Run(ctx context.Context, opts Options) error {
 		return fmt.Errorf("failed to open API database: %w", err)
 	}
 	defer apiDB.Close()
+	log = logger.WithAPIPersist(log, apiDB)
 
 	userStore, err := users.Open(apiDB, cfg.Auth.BcryptCost)
 	if err != nil {
