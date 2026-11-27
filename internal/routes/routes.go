@@ -73,7 +73,7 @@ func New(deps Dependencies) chi.Router {
 	migrationroutes.RegisterWithUsers(apiRouter, deps.Logger, deps.Manager, deps.UserStore, mw)
 	rulesetsroutes.Register(apiRouter, deps.Logger, deps.Manager, mw)
 	scalingroutes.Register(apiRouter, deps.Logger, deps.Manager, mw)
-	preferencesroutes.Register(apiRouter, deps.Logger, deps.UserStore, mw)
+	preferencesroutes.Register(apiRouter, deps.Logger, deps.UserStore, deps.Manager, mw)
 
 	router.Mount("/api", apiRouter)
 

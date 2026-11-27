@@ -80,7 +80,7 @@ Set the source or destination root folder for a migration.
 
 ### Filesystem health check
 
-Live probe of bound source/destination roots (list + create/delete permission test). Used by the UI before Start/Resume and enforced again by those hot paths if the last successful check is older than 10 minutes.
+Live probe of bound source/destination roots (rehydrate + list). Confirms the root still resolves and surfaces auth / rate-limit / missing-mount failures. Write permission is not probed. Used by the UI before Start/Resume and enforced again by those hot paths if the last successful check is older than 10 minutes.
 
 **Endpoint:** `POST /migrations/{migrationID}/fs-health?side=src|dst|both`
 
@@ -101,10 +101,7 @@ Live probe of bound source/destination roots (list + create/delete permission te
     "classification": "ok",
     "steps": {
       "rehydrate": { "ok": true },
-      "listRoot": { "ok": true },
-      "createFolder": { "ok": true },
-      "createFile": { "ok": true },
-      "delete": { "ok": true }
+      "listRoot": { "ok": true }
     }
   },
   "destination": { "ok": true }

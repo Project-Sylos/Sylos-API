@@ -86,7 +86,7 @@ func (h handler) handleBulkRetry(ctx *middleware.Context, payload corebridge.Mar
 			return
 		}
 		errMsg := err.Error()
-		if isMarkRetryBenignError(kind, errMsg) || isUnmarkRetryBenignError(kind, errMsg) {
+		if isNodeStatusBenignError(errMsg) {
 			ctx.Response(http.StatusOK, &corebridge.MarkRetryResponse{
 				Success: false,
 				Error:   errMsg,
@@ -94,7 +94,11 @@ func (h handler) handleBulkRetry(ctx *middleware.Context, payload corebridge.Mar
 			})
 			return
 		}
-		ctx.Error(http.StatusInternalServerError, markRetryErrorLabel(kind), err)
+		label := "failed to unmark nodes for retry"
+		if mark && !payload.MarkAsFailed {
+			label = "failed to mark nodes for retry"
+		}
+		ctx.Error(http.StatusInternalServerError, label, err)
 		return
 	}
 	if result != nil && result.Success {
@@ -133,9 +137,23 @@ func (h handler) handleForceReplaceCopy(ctx *middleware.Context, mark bool) {
 	ctx.Response(http.StatusOK, result)
 }
 
-func (h handler) handleMarkNodeForRetry(ctx *middleware.Context, kind migrationops.RetryKind) {
+func (h handler) handleSetNodeStatus(ctx *middleware.Context, payload corebridge.NodeStatusRequest) {
 	migrationID, unescapedNodeID, ok := h.loadMigrationNode(ctx)
 	if !ok {
+		return
+	}
+	axis := strings.TrimSpace(strings.ToLower(payload.Axis))
+	status := strings.TrimSpace(strings.ToLower(payload.Status))
+	switch axis {
+	case "discovery", "copy", "delete":
+	default:
+		ctx.Error(http.StatusBadRequest, "axis must be discovery, copy, or delete", nil)
+		return
+	}
+	switch status {
+	case "failed", "pending", "excluded":
+	default:
+		ctx.Error(http.StatusBadRequest, "status must be failed, pending, or excluded", nil)
 		return
 	}
 
@@ -145,15 +163,16 @@ func (h handler) handleMarkNodeForRetry(ctx *middleware.Context, kind migrationo
 		return
 	}
 
-	result, err := migrationops.MarkNodesForRetry(mig, kind, corebridge.MarkRetryRequest{
-		NodeIDs: []string{unescapedNodeID},
+	result, err := migrationops.SetNodeStatus(mig, unescapedNodeID, corebridge.NodeStatusRequest{
+		Axis:   axis,
+		Status: status,
 	})
 	if err != nil {
 		if writeReviewOpBusy(ctx, err) {
 			return
 		}
 		errMsg := err.Error()
-		if isMarkRetryBenignError(kind, errMsg) {
+		if isNodeStatusBenignError(errMsg) {
 			ctx.Response(http.StatusOK, &corebridge.MarkRetryResponse{
 				Success: false,
 				Error:   errMsg,
@@ -161,45 +180,10 @@ func (h handler) handleMarkNodeForRetry(ctx *middleware.Context, kind migrationo
 			})
 			return
 		}
-		ctx.Error(http.StatusInternalServerError, markRetryErrorLabel(kind), err)
+		ctx.Error(http.StatusInternalServerError, "failed to set node status", err)
 		return
 	}
-	if result.Success {
-		_ = h.mgr.MarkPathReviewChanges(ctx.Request().Context(), migrationID, true)
-	}
-	ctx.Response(http.StatusOK, result)
-}
-
-func (h handler) handleUnmarkNodeForRetry(ctx *middleware.Context, kind migrationops.RetryKind) {
-	migrationID, unescapedNodeID, ok := h.loadMigrationNode(ctx)
-	if !ok {
-		return
-	}
-
-	mig, err := h.mgr.GetMigration(ctx.Request().Context(), migrationID)
-	if err != nil {
-		h.writeMigrationLoadError(ctx, err)
-		return
-	}
-
-	result, err := migrationops.UnmarkNodeForRetry(mig, kind, unescapedNodeID)
-	if err != nil {
-		if writeReviewOpBusy(ctx, err) {
-			return
-		}
-		errMsg := err.Error()
-		if isUnmarkRetryBenignError(kind, errMsg) {
-			ctx.Response(http.StatusOK, &corebridge.MarkRetryResponse{
-				Success: false,
-				Error:   errMsg,
-				Deltas:  map[string]int64{},
-			})
-			return
-		}
-		ctx.Error(http.StatusInternalServerError, unmarkRetryErrorLabel(kind), err)
-		return
-	}
-	if result.Success {
+	if result != nil && result.Success {
 		_ = h.mgr.MarkPathReviewChanges(ctx.Request().Context(), migrationID, true)
 	}
 	ctx.Response(http.StatusOK, result)
@@ -239,32 +223,11 @@ func (h handler) writeMigrationLoadError(ctx *middleware.Context, err error) {
 	ctx.Error(http.StatusInternalServerError, "failed to get migration", err)
 }
 
-func isMarkRetryBenignError(kind migrationops.RetryKind, errMsg string) bool {
+func isNodeStatusBenignError(errMsg string) bool {
 	msg := strings.ToLower(errMsg)
-	if strings.Contains(msg, "not found") || strings.Contains(msg, "not in failed status") {
-		return true
-	}
-	return kind == migrationops.RetryKindCopy && strings.Contains(msg, "copy retry only applies to src nodes")
-}
-
-func isUnmarkRetryBenignError(kind migrationops.RetryKind, errMsg string) bool {
-	msg := strings.ToLower(errMsg)
-	if strings.Contains(msg, "not found") || strings.Contains(msg, "not in pending status") {
-		return true
-	}
-	return kind == migrationops.RetryKindCopy && strings.Contains(msg, "copy retry only applies to src nodes")
-}
-
-func markRetryErrorLabel(kind migrationops.RetryKind) string {
-	if kind == migrationops.RetryKindCopy {
-		return "failed to mark node for copy retry"
-	}
-	return "failed to mark node for discovery retry"
-}
-
-func unmarkRetryErrorLabel(kind migrationops.RetryKind) string {
-	if kind == migrationops.RetryKindCopy {
-		return "failed to unmark node for copy retry"
-	}
-	return "failed to unmark node for discovery retry"
+	return strings.Contains(msg, "not found") ||
+		strings.Contains(msg, "not in failed status") ||
+		strings.Contains(msg, "not in pending status") ||
+		strings.Contains(msg, "requires") ||
+		strings.Contains(msg, "unsupported")
 }

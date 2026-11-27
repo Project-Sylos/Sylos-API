@@ -132,6 +132,7 @@ func (m *Manager) buildTraversalConfig(opts corebridge.MigrationOptions, plan *r
 		skipListener = *opts.SkipListener
 	}
 
+	travStall, delStall, copyStall := m.fsStallTimeoutsLocked()
 	return migration.Config{
 		Source:          migrationService(plan.SourceDefinition, plan.SourceAdapter, plan.SourceRoot, plan.SourceConnectionID),
 		Destination:     migrationService(plan.DestinationDefinition, plan.DestinationAdapter, plan.DestinationRoot, plan.DestinationConnectionID),
@@ -155,6 +156,10 @@ func (m *Manager) buildTraversalConfig(opts corebridge.MigrationOptions, plan *r
 		Autoscaler: migration.AutoscalerConfig{
 			WorkerCapOverrides: m.resolveOverridesForPlan(plan),
 		},
+		StallTimeoutsSet:      true,
+		StallTimeoutTraversal: travStall,
+		StallTimeoutDelete:    delStall,
+		StallTimeoutCopy:      copyStall,
 	}
 }
 

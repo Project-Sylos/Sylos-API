@@ -90,7 +90,7 @@ func TestStampFSHealthFreshness(t *testing.T) {
 	}
 }
 
-func TestProbeFSHealthSideLocalOKAndCleanup(t *testing.T) {
+func TestProbeFSHealthSideLocalListOK(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
 	adapter, err := local.NewLocalFS(root)
@@ -115,18 +115,17 @@ func TestProbeFSHealthSideLocalOKAndCleanup(t *testing.T) {
 	if !rep.OK {
 		t.Fatalf("expected ok, got %+v", rep)
 	}
-	entries, err := os.ReadDir(root)
-	if err != nil {
-		t.Fatal(err)
+	if !rep.Steps[corebridge.FSHealthStepListRoot].OK {
+		t.Fatalf("expected listRoot ok, got %+v", rep.Steps[corebridge.FSHealthStepListRoot])
 	}
-	for _, e := range entries {
-		if len(e.Name()) >= len(".sylos-fs-health-") && e.Name()[:len(".sylos-fs-health-")] == ".sylos-fs-health-" {
-			t.Fatalf("probe artifact left behind: %s", e.Name())
+	for name := range rep.Steps {
+		if name != corebridge.FSHealthStepRehydrate && name != corebridge.FSHealthStepListRoot {
+			t.Fatalf("unexpected health step %q", name)
 		}
 	}
 }
 
-func TestProbeFSHealthSideLocalReadOnlyFailsWrite(t *testing.T) {
+func TestProbeFSHealthSideLocalReadOnlyStillLists(t *testing.T) {
 	t.Parallel()
 	parent := t.TempDir()
 	root := filepath.Join(parent, "ro")
@@ -153,15 +152,11 @@ func TestProbeFSHealthSideLocalReadOnlyFailsWrite(t *testing.T) {
 		DestinationAdapter: adapter,
 	}
 	rep := mgr.probeFSHealthSide(context.Background(), plan, migration.FSCredentialRoleDestination)
-	if rep.OK {
-		t.Fatal("expected write probe failure on read-only root")
+	if !rep.OK {
+		t.Fatalf("read-only root should pass list-only health, got %+v", rep)
 	}
-	if rep.Steps[corebridge.FSHealthStepListRoot].OK == false {
-		// list may succeed on empty read-only dir
-		t.Logf("listRoot=%+v", rep.Steps[corebridge.FSHealthStepListRoot])
-	}
-	if rep.Steps[corebridge.FSHealthStepCreateFolder].OK {
-		t.Fatal("expected createFolder to fail")
+	if !rep.Steps[corebridge.FSHealthStepListRoot].OK {
+		t.Fatalf("expected listRoot ok, got %+v", rep.Steps[corebridge.FSHealthStepListRoot])
 	}
 }
 

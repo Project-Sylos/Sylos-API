@@ -33,7 +33,7 @@ Do not ship or re-wrap the install master key or `migkey:` blobs as part of a po
 
 ## Live FS health
 
-`POST /api/migrations/{id}/fs-health?side=src|dst|both` rehydrates adapters, lists each bound root, then creates and deletes a temporary `.sylos-fs-health-{uuid}/` folder (with an empty file) to verify permissions. A successful probe stamps `lastFsHealthAt` / `lastFsHealthSides` on the migration registry. Resume, start discovery, phase-change, and retry-sweep require a successful check covering the required sides within the last 10 minutes; otherwise they run the same probe synchronously and return the health report instead of starting work. Auth failures may set `needsAttention` with reason `credentials_invalid` (same reconnect path as import).
+`POST /api/migrations/{id}/fs-health?side=src|dst|both` rehydrates adapters and lists each bound root so the endpoint still resolves (auth, missing mount, 429s). Write permission is not probed; create/copy/delete failures surface on the real work path. A successful probe stamps `lastFsHealthAt` / `lastFsHealthSides` on the migration registry. Resume, start discovery, phase-change, and retry-sweep require a successful check covering the required sides within the last 10 minutes; otherwise they run the same probe synchronously and return the health report instead of starting work. Auth failures may set `needsAttention` with reason `credentials_invalid` (same reconnect path as import).
 
 ## Backup and recovery
 

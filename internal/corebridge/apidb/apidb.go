@@ -142,7 +142,7 @@ type MigrationRecord struct {
 	NeedsAttention   bool             `json:"needsAttention,omitempty"`
 	AttentionReasons []string         `json:"attentionReasons,omitempty"`
 	LocalRoots       []LocalRootProbe `json:"localRoots,omitempty"`
-	// Last successful FS health probe (list + write/delete under bound roots).
+	// Last successful FS health probe (rehydrate + list under bound roots).
 	LastFsHealthAt    time.Time `json:"lastFsHealthAt,omitempty"`
 	LastFsHealthSides string    `json:"lastFsHealthSides,omitempty"` // src | dst | both
 	LastFsHealthOK    bool      `json:"lastFsHealthOK,omitempty"`

@@ -327,6 +327,8 @@ type ExternalQueueMetrics struct {
 
 	// ActiveTasks is a live leased-task snapshot from the queue observer (not durable).
 	ActiveTasks []InFlightTask `json:"activeTasks,omitempty"`
+	// RecentlySettled is a one-poll flash of tasks that left the prior active snapshot.
+	RecentlySettled []SettledInFlightTask `json:"recentlySettled,omitempty"`
 }
 
 // InFlightTask is one leased worker task for live Progress Monitor display.
@@ -341,6 +343,24 @@ type InFlightTask struct {
 	LeaseAgeMs int64  `json:"leaseAgeMs,omitempty"`
 	BytesDone  int64  `json:"bytesDone,omitempty"`
 	BytesTotal int64  `json:"bytesTotal,omitempty"`
+}
+
+// SettledInFlightTask is a one-poll outcome flash for a task that left Working on.
+type SettledInFlightTask struct {
+	NodeID     string `json:"nodeId,omitempty"`
+	Path       string `json:"path,omitempty"`
+	TaskType   string `json:"taskType,omitempty"`
+	ItemKind   string `json:"itemKind,omitempty"`
+	Success    bool   `json:"success"`
+	BytesDone  int64  `json:"bytesDone,omitempty"`
+	BytesTotal int64  `json:"bytesTotal,omitempty"`
+}
+
+// CancelInFlightResponse is the Progress Monitor soft-cancel result.
+type CancelInFlightResponse struct {
+	OK      bool   `json:"ok"`
+	Result  string `json:"result"`
+	Message string `json:"message,omitempty"`
 }
 
 // QueueMetricsResponse represents all queue metrics for a migration

@@ -8,11 +8,8 @@ const (
 	FSHealthSideDestination = "dst"
 	FSHealthSideBoth        = "both"
 
-	FSHealthStepRehydrate    = "rehydrate"
-	FSHealthStepListRoot     = "listRoot"
-	FSHealthStepCreateFolder = "createFolder"
-	FSHealthStepCreateFile   = "createFile"
-	FSHealthStepDelete       = "delete"
+	FSHealthStepRehydrate = "rehydrate"
+	FSHealthStepListRoot  = "listRoot"
 
 	FSHealthClassOK               = "ok"
 	FSHealthClassAuthFailed       = "auth_failed"

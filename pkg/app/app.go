@@ -17,6 +17,7 @@ import (
 	"codeberg.org/Sylos/Sylos-API/internal/oauthbuiltin"
 	"codeberg.org/Sylos/Sylos-API/internal/routes"
 	"codeberg.org/Sylos/Sylos-API/internal/routes/middleware"
+	preferencesroutes "codeberg.org/Sylos/Sylos-API/internal/routes/preferences"
 	"codeberg.org/Sylos/Sylos-API/internal/server"
 	"codeberg.org/Sylos/Sylos-API/pkg/config"
 	"codeberg.org/Sylos/Sylos-API/pkg/logger"
@@ -93,6 +94,7 @@ func Run(ctx context.Context, opts Options) error {
 	if err != nil {
 		return fmt.Errorf("failed to initialize core bridge: %w", err)
 	}
+	preferencesroutes.SyncFSStallTimeoutsFromUsers(coreBridge, userStore)
 
 	oauthCfg, err := loadOAuthConfigFromDB(apiDB)
 	if err != nil {

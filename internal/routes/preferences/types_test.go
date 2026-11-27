@@ -2,6 +2,25 @@ package preferences
 
 import "testing"
 
+func TestDevPrefsStallTimeoutSecs(t *testing.T) {
+	zero := 0
+	custom := 120
+	d := DevPrefs{
+		StallTimeoutTraversalSec: &zero,
+		StallTimeoutDeleteSec:    &custom,
+	}
+	trav, del, copySec := d.StallTimeoutSecs()
+	if trav != 0 {
+		t.Fatalf("traversal unlimited: got %d", trav)
+	}
+	if del != 120 {
+		t.Fatalf("delete custom: got %d", del)
+	}
+	if copySec != defaultFSStallTimeoutSec {
+		t.Fatalf("copy default: got %d", copySec)
+	}
+}
+
 func TestSanitizePreferencesClearsPreSplashForObsidian(t *testing.T) {
 	prefs := Preferences{
 		Theme:            "obsidian",

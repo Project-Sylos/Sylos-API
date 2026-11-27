@@ -191,6 +191,14 @@ type MarkRetryRequest struct {
 	Kind string `json:"kind,omitempty"`
 }
 
+// NodeStatusRequest sets one node's review-axis status (failed / pending / excluded).
+type NodeStatusRequest struct {
+	// Axis is discovery | copy | delete.
+	Axis string `json:"axis"`
+	// Status is failed | pending | excluded.
+	Status string `json:"status"`
+}
+
 // MarkRetryResponse represents the response from marking/unmarking a node for retry.
 // AffectedCount and Deltas come from the engine's PathReviewActionResult so the UI can update local stats without refetching.
 // Delta keys depend on action:

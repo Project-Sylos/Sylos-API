@@ -7,7 +7,6 @@ import (
 	"codeberg.org/Sylos/Sylos-API/internal/auth/users"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge/manager"
-	"codeberg.org/Sylos/Sylos-API/internal/corebridge/migrationops"
 	"codeberg.org/Sylos/Sylos-API/internal/routes/middleware"
 )
 
@@ -52,6 +51,7 @@ func RegisterWithUsers(router chi.Router, logger zerolog.Logger, mgr *manager.Ma
 	router.Get("/migrations/{migrationID}", middleware.NoBody(mw, h.status))
 	router.Get("/migrations/{migrationID}/inspect", middleware.NoBody(mw, h.inspect))
 	router.Get("/migrations/{migrationID}/queue-metrics", middleware.NoBody(mw, h.queueMetrics))
+	router.Post("/migrations/{migrationID}/inflight/{nodeID}/cancel", middleware.NoBody(mw, h.cancelInFlight))
 	router.Get("/migrations/{migrationID}/db-ops", middleware.NoBody(mw, h.dbOps))
 	router.Post("/migrations/{migrationID}/logs", middleware.JSON(mw, h.getLogs))
 	router.Get("/migrations/{migrationID}/diffs/stats", middleware.NoBody(mw, h.diffsStats))
@@ -65,24 +65,7 @@ func RegisterWithUsers(router chi.Router, logger zerolog.Logger, mgr *manager.Ma
 	router.Post("/migrations/{migrationID}/unmark-retry", middleware.JSON(mw, func(ctx *middleware.Context, payload corebridge.MarkRetryRequest) {
 		h.handleBulkRetry(ctx, payload, false)
 	}))
-	router.Post("/migrations/{migrationID}/node/{nodeID}/mark-retry-discovery", middleware.NoBody(mw, func(ctx *middleware.Context) {
-		h.handleMarkNodeForRetry(ctx, migrationops.RetryKindDiscovery)
-	}))
-	router.Post("/migrations/{migrationID}/node/{nodeID}/mark-retry-copy", middleware.NoBody(mw, func(ctx *middleware.Context) {
-		h.handleMarkNodeForRetry(ctx, migrationops.RetryKindCopy)
-	}))
-	router.Post("/migrations/{migrationID}/node/{nodeID}/unmark-retry-discovery", middleware.NoBody(mw, func(ctx *middleware.Context) {
-		h.handleUnmarkNodeForRetry(ctx, migrationops.RetryKindDiscovery)
-	}))
-	router.Post("/migrations/{migrationID}/node/{nodeID}/unmark-retry-copy", middleware.NoBody(mw, func(ctx *middleware.Context) {
-		h.handleUnmarkNodeForRetry(ctx, migrationops.RetryKindCopy)
-	}))
-	router.Post("/migrations/{migrationID}/node/{nodeID}/mark-retry-delete", middleware.NoBody(mw, func(ctx *middleware.Context) {
-		h.handleMarkNodeForRetry(ctx, migrationops.RetryKindDelete)
-	}))
-	router.Post("/migrations/{migrationID}/node/{nodeID}/unmark-retry-delete", middleware.NoBody(mw, func(ctx *middleware.Context) {
-		h.handleUnmarkNodeForRetry(ctx, migrationops.RetryKindDelete)
-	}))
+	router.Put("/migrations/{migrationID}/node/{nodeID}/status", middleware.JSON(mw, h.handleSetNodeStatus))
 	router.Post("/migrations/{migrationID}/node/{nodeID}/force-replace-copy", middleware.NoBody(mw, func(ctx *middleware.Context) {
 		h.handleForceReplaceCopy(ctx, true)
 	}))

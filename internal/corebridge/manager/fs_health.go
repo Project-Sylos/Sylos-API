@@ -4,12 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"strings"
 	"time"
-
-	"github.com/google/uuid"
 
 	"codeberg.org/Sylos/Migration-Engine/pkg/migration"
 	"codeberg.org/Sylos/Sylos-API/internal/corebridge"
@@ -34,8 +31,9 @@ func (e *FSHealthFailedError) Error() string {
 	return "filesystem health check failed"
 }
 
-// ProbeMigrationFSHealth lists each requested bound root and runs a create/delete
-// permission probe. On full success it stamps lastFsHealthAt on the migration registry.
+// ProbeMigrationFSHealth rehydrates adapters and lists each requested bound root.
+// Write permission is not probed; real create/copy/delete failures surface on the
+// hot path. On full success it stamps lastFsHealthAt on the migration registry.
 func (m *Manager) ProbeMigrationFSHealth(ctx context.Context, migrationID, side string) (corebridge.FSHealthReport, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -290,46 +288,6 @@ func (m *Manager) probeFSHealthSide(ctx context.Context, plan *roots.RootPlan, r
 		return rep
 	}
 
-	probeName := ".sylos-fs-health-" + uuid.New().String()
-	folder, folderErr := adapter.CreateFolder(ctx, root.ServiceID, probeName, nil)
-	rep.Steps[corebridge.FSHealthStepCreateFolder] = stepFromErr(folderErr)
-	if folderErr != nil {
-		rep.Classification = classifyHealthErr(folderErr)
-		return rep
-	}
-
-	fileName := "probe.txt"
-	file, fileErr := adapter.CreateFile(ctx, folder.ServiceID, fileName, 0, nil)
-	if fileErr == nil {
-		wc, openErr := adapter.OpenWrite(ctx, file.ServiceID)
-		if openErr != nil {
-			fileErr = openErr
-		} else if wc != nil {
-			closeErr := wc.Close()
-			if closeErr != nil && !errors.Is(closeErr, io.EOF) {
-				fileErr = closeErr
-			}
-		}
-	}
-	rep.Steps[corebridge.FSHealthStepCreateFile] = stepFromErr(fileErr)
-	if fileErr != nil {
-		rep.Classification = classifyHealthErr(fileErr)
-		_ = adapter.DeleteNode(ctx, folder.ServiceID, fstypes.NodeTypeFolder)
-		return rep
-	}
-
-	delFileErr := adapter.DeleteNode(ctx, file.ServiceID, fstypes.NodeTypeFile)
-	delFolderErr := adapter.DeleteNode(ctx, folder.ServiceID, fstypes.NodeTypeFolder)
-	if delFileErr != nil || delFolderErr != nil {
-		err := delFileErr
-		if err == nil {
-			err = delFolderErr
-		}
-		rep.Steps[corebridge.FSHealthStepDelete] = stepFromErr(err)
-		rep.Classification = classifyHealthErr(err)
-		return rep
-	}
-	rep.Steps[corebridge.FSHealthStepDelete] = corebridge.FSHealthStepResult{OK: true}
 	rep.Classification = corebridge.FSHealthClassOK
 	rep.OK = true
 	return rep

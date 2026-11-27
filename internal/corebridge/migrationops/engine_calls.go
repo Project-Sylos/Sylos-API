@@ -433,6 +433,7 @@ func commonQueueState(m *corebridge.ExternalQueueMetrics, name string, q map[str
 	m.RateLimitedRemainingMsDst = convert.ToNumber[int64](q["rate_limited_remaining_ms_dst"])
 	m.InterOpDelayMs = convert.ToNumber[int64](q["inter_op_delay_ms"])
 	m.ActiveTasks = activeTasksFromQueueMap(q)
+	m.RecentlySettled = recentlySettledFromQueueMap(q)
 }
 
 func activeTasksFromQueueMap(q map[string]any) []corebridge.InFlightTask {
@@ -449,6 +450,39 @@ func activeTasksFromQueueMap(q map[string]any) []corebridge.InFlightTask {
 		return nil
 	}
 	return out
+}
+
+func recentlySettledFromQueueMap(q map[string]any) []corebridge.SettledInFlightTask {
+	raw, ok := q["recentlySettled"]
+	if !ok || raw == nil {
+		return nil
+	}
+	b, err := json.Marshal(raw)
+	if err != nil || len(b) == 0 || string(b) == "null" {
+		return nil
+	}
+	var out []corebridge.SettledInFlightTask
+	if err := json.Unmarshal(b, &out); err != nil {
+		return nil
+	}
+	return out
+}
+
+// CancelInFlightCopyFromMigration soft-cancels a live copy-file lease.
+func CancelInFlightCopyFromMigration(mig *migration.Migration, nodeID string) corebridge.CancelInFlightResponse {
+	if mig == nil {
+		return corebridge.CancelInFlightResponse{
+			OK:      false,
+			Result:  migration.CancelInFlightNotInFlight,
+			Message: "No longer in progress",
+		}
+	}
+	r := mig.CancelInFlightCopy(nodeID)
+	return corebridge.CancelInFlightResponse{
+		OK:      r.OK,
+		Result:  r.Result,
+		Message: r.Message,
+	}
 }
 
 func traversalQueueMetrics(name string, q map[string]any) *corebridge.ExternalQueueMetrics {
@@ -785,6 +819,17 @@ func UnexcludeBySearch(mig *migration.Migration, req corebridge.SearchRequest, e
 	return resp, err
 }
 
+// SetNodeStatus sets a node's review status on one axis (discovery / copy / delete)
+// to failed, pending (retry), or excluded. Caller should MarkPathReviewChanges after success.
+func SetNodeStatus(mig *migration.Migration, nodeID string, req corebridge.NodeStatusRequest) (*corebridge.MarkRetryResponse, error) {
+	if mig == nil {
+		return markRetryFromOutcome(nilMigrationOutcome()), nil
+	}
+	res, err := mig.SetNodeReviewStatus(req.Axis, nodeID, req.Status)
+	resp := markRetryFromOutcome(outcomeFromSingle(res, err))
+	return resp, err
+}
+
 // MarkNodesForRetry calls the engine for discovery or copy retry marking.
 // Caller should call MarkPathReviewChanges after success.
 func MarkNodesForRetry(mig *migration.Migration, kind RetryKind, req corebridge.MarkRetryRequest) (*corebridge.MarkRetryResponse, error) {
@@ -817,17 +862,6 @@ func UnmarkNodesForRetry(mig *migration.Migration, kind RetryKind, req corebridg
 	}
 	resp := markRetryFromOutcome(outcomeFromItems(merged, items))
 	return resp, nil
-}
-
-// UnmarkNodeForRetry calls the engine for discovery or copy retry unmarking.
-// Caller should call MarkPathReviewChanges after success.
-func UnmarkNodeForRetry(mig *migration.Migration, kind RetryKind, nodeID string) (*corebridge.MarkRetryResponse, error) {
-	if mig == nil {
-		return markRetryFromOutcome(nilMigrationOutcome()), nil
-	}
-	res, err := retryNode(mig, kind, nodeID, false)
-	resp := markRetryFromOutcome(outcomeFromSingle(res, err))
-	return resp, err
 }
 
 // retryNode dispatches to the engine's mark/unmark retry method for the given kind.
