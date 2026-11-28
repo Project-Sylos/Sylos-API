@@ -281,7 +281,13 @@ func (m *Manager) probeFSHealthSide(ctx context.Context, plan *roots.RootPlan, r
 		return rep
 	}
 
-	_, listErr := adapter.ListChildren(ctx, root.ServiceID, nil, root.LocationPath)
+	// Ephemeral Spectra requires depth + parent path (nothing is persisted to derive them).
+	depth := root.DepthLevel
+	parentPath := root.LocationPath
+	if parentPath == "" {
+		parentPath = "/"
+	}
+	_, listErr := adapter.ListChildren(ctx, root.ServiceID, &depth, parentPath)
 	rep.Steps[corebridge.FSHealthStepListRoot] = stepFromErr(listErr)
 	if listErr != nil {
 		rep.Classification = classifyHealthErr(listErr)

@@ -32,33 +32,7 @@ type DevPrefs struct {
 	Enabled               bool `json:"enabled"`
 	ShowSpectraService    bool `json:"showSpectraService"`
 	DisableDBQueryTimeout bool `json:"disableDbQueryTimeout"`
-	// FS ProgressWatchdog budgets in seconds. 0 = unlimited (no stall abort).
-	// Defaults are 60 when unset in stored JSON (see mergeWithDefaults).
-	StallTimeoutTraversalSec *int `json:"stallTimeoutTraversalSec,omitempty"`
-	StallTimeoutDeleteSec    *int `json:"stallTimeoutDeleteSec,omitempty"`
-	StallTimeoutCopySec      *int `json:"stallTimeoutCopySec,omitempty"`
 }
-
-const defaultFSStallTimeoutSec = 60
-
-// StallTimeoutSecs returns traversal/delete/copy stall seconds (0 = unlimited).
-func (d DevPrefs) StallTimeoutSecs() (traversal, delete, copy int) {
-	return stallSecPtr(d.StallTimeoutTraversalSec),
-		stallSecPtr(d.StallTimeoutDeleteSec),
-		stallSecPtr(d.StallTimeoutCopySec)
-}
-
-func stallSecPtr(p *int) int {
-	if p == nil {
-		return defaultFSStallTimeoutSec
-	}
-	if *p < 0 {
-		return defaultFSStallTimeoutSec
-	}
-	return *p
-}
-
-func intPtr(v int) *int { return &v }
 
 func getDefaultPreferences() Preferences {
 	defaultRulesetID := apidb.DefaultAutoApplyRulesetID
@@ -72,11 +46,8 @@ func getDefaultPreferences() Preferences {
 			Categories: make(map[string]interface{}),
 		},
 		Developer: DevPrefs{
-			Enabled:                  false,
-			ShowSpectraService:       false,
-			StallTimeoutTraversalSec: intPtr(defaultFSStallTimeoutSec),
-			StallTimeoutDeleteSec:    intPtr(defaultFSStallTimeoutSec),
-			StallTimeoutCopySec:      intPtr(defaultFSStallTimeoutSec),
+			Enabled:            false,
+			ShowSpectraService: false,
 		},
 	}
 }
@@ -92,15 +63,6 @@ func mergeWithDefaults(stored Preferences) Preferences {
 	}
 	if stored.DefaultRulesetID == nil {
 		stored.DefaultRulesetID = defaults.DefaultRulesetID
-	}
-	if stored.Developer.StallTimeoutTraversalSec == nil {
-		stored.Developer.StallTimeoutTraversalSec = intPtr(defaultFSStallTimeoutSec)
-	}
-	if stored.Developer.StallTimeoutDeleteSec == nil {
-		stored.Developer.StallTimeoutDeleteSec = intPtr(defaultFSStallTimeoutSec)
-	}
-	if stored.Developer.StallTimeoutCopySec == nil {
-		stored.Developer.StallTimeoutCopySec = intPtr(defaultFSStallTimeoutSec)
 	}
 
 	return stored

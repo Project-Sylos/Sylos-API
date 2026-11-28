@@ -43,8 +43,6 @@ type Manager struct {
 
 	oauthHealthReschedule   func()
 	oauthHealthRescheduleMu sync.Mutex
-
-	fsStall fsStallTimeoutPrefs
 }
 
 type runtimeMigration struct {
@@ -94,7 +92,6 @@ func NewManager(logger zerolog.Logger, cfg config.Config, apiDB *apidb.DB) (*Man
 		}
 	}
 
-	mgr.initFSStallTimeoutPrefs()
 	mgr.ReconcileOrphanedMigrations(context.Background())
 
 	return mgr, nil

@@ -62,4 +62,4 @@ replace codeberg.org/Sylos/Sylos-FS => ../Sylos-FS
 
 replace codeberg.org/Sylos/Spectra => ../Spectra
 
-replace codeberg.org/Sylos/go-path-linter => ../go-path-linter
+replace codeberg.org/Sylos/go-path-linter => ../Go-Path-Linter

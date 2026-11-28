@@ -24,22 +24,16 @@ func (h handler) getPreferences(ctx *middleware.Context) {
 
 	if raw == "" {
 		h.logger.Debug().Str("user_id", claims.Subject).Msg("no saved preferences, returning defaults")
-		out := sanitizePreferences(getDefaultPreferences())
-		applyStallTimeoutPrefs(h.mgr, out)
-		ctx.Response(http.StatusOK, out)
+		ctx.Response(http.StatusOK, sanitizePreferences(getDefaultPreferences()))
 		return
 	}
 
 	var prefs Preferences
 	if err := json.Unmarshal([]byte(raw), &prefs); err != nil {
 		h.logger.Warn().Err(err).Str("user_id", claims.Subject).Msg("invalid preferences JSON, returning defaults")
-		out := sanitizePreferences(getDefaultPreferences())
-		applyStallTimeoutPrefs(h.mgr, out)
-		ctx.Response(http.StatusOK, out)
+		ctx.Response(http.StatusOK, sanitizePreferences(getDefaultPreferences()))
 		return
 	}
 
-	out := sanitizePreferences(prefs)
-	applyStallTimeoutPrefs(h.mgr, out)
-	ctx.Response(http.StatusOK, out)
+	ctx.Response(http.StatusOK, sanitizePreferences(prefs))
 }

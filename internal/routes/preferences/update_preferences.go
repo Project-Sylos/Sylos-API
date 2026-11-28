@@ -36,8 +36,6 @@ func (h handler) updatePreferences(ctx *middleware.Context, prefs Preferences) {
 		return
 	}
 
-	applyStallTimeoutPrefs(h.mgr, normalized)
-
 	h.logger.Info().Str("user_id", claims.Subject).Msg("preferences saved")
 	ctx.Response(http.StatusOK, normalized)
 }

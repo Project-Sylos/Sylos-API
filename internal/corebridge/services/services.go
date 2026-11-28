@@ -2,7 +2,9 @@ package services
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -111,8 +113,22 @@ func (m *ServiceManager) LoadServices(cfg config.Config) error {
 		}
 	}
 
-	spectraServices := make([]fstypes.SpectraServiceConfig, 0, len(cfg.Services.Spectra))
-	for _, svc := range cfg.Services.Spectra {
+	spectraDefs := cfg.Services.Spectra
+	if len(spectraDefs) == 0 {
+		// Shipped product config leaves Spectra out of Defaults; still register the
+		// primary/s1 worlds so developer "Show Spectra" can surface the catalog card.
+		defaultPath, err := ensureDefaultSpectraConfig(cfg.Runtime.DataDir)
+		if err != nil {
+			return err
+		}
+		spectraDefs = []config.SpectraServiceConfig{
+			{ID: "spectra-primary", Name: "Spectra Primary", World: "primary", RootID: "root", ConfigPath: defaultPath},
+			{ID: "spectra-s1", Name: "Spectra Secondary", World: "s1", RootID: "root", ConfigPath: defaultPath},
+		}
+	}
+
+	spectraServices := make([]fstypes.SpectraServiceConfig, 0, len(spectraDefs))
+	for _, svc := range spectraDefs {
 		if svc.ID == "" {
 			return fmt.Errorf("spectra service missing id")
 		}
@@ -216,6 +232,61 @@ func cloneLocalConfig(c fstypes.LocalServiceConfig) *fstypes.LocalServiceConfig 
 func cloneSpectraConfig(c fstypes.SpectraServiceConfig) *fstypes.SpectraServiceConfig {
 	out := c
 	return &out
+}
+
+// ensureDefaultSpectraConfig writes a minimal Spectra config under the app data
+// dir when missing and returns its absolute path. Used as the shared ConfigPath
+// for the auto-registered primary/s1 catalog worlds.
+func ensureDefaultSpectraConfig(dataDir string) (string, error) {
+	if strings.TrimSpace(dataDir) == "" {
+		return "", fmt.Errorf("data dir is required to register default Spectra services")
+	}
+	dir := filepath.Join(dataDir, "spectra")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("create Spectra config dir: %w", err)
+	}
+	path := filepath.Join(dir, "default-config.json")
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve Spectra config path: %w", err)
+	}
+	if _, err := os.Stat(abs); err == nil {
+		return abs, nil
+	} else if !os.IsNotExist(err) {
+		return "", fmt.Errorf("stat Spectra config: %w", err)
+	}
+
+	dbPath := filepath.Join(dir, "spectra.db")
+	payload := map[string]any{
+		"mode": "ephemeral",
+		"seed": map[string]any{
+			"max_depth":                4,
+			"max_folders":              20,
+			"folder_backoff_factor":     0.9,
+			"folder_depth_decay_factor": 0.9,
+			"max_files":                50,
+			"file_backoff_factor":       0.9,
+			"file_depth_decay_factor":   0.9,
+			"seed":                     0,
+			"db_path":                  dbPath,
+			"diverging_tree_mode":      true,
+		},
+		"api": map[string]any{
+			"host": "localhost",
+			"port": 8085,
+		},
+		"secondary_tables": map[string]any{
+			"s1": 0.9,
+		},
+	}
+	data, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("marshal default Spectra config: %w", err)
+	}
+	if err := os.WriteFile(abs, data, 0o644); err != nil {
+		return "", fmt.Errorf("write default Spectra config: %w", err)
+	}
+	return abs, nil
 }
 
 func cloneCloudConfig(c fstypes.CloudServiceConfig) *fstypes.CloudServiceConfig {
